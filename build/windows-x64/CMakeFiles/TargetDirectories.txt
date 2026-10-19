@@ -1,0 +1,5 @@
+D:/bertonwang/TGCapture/build/windows-x64/CMakeFiles/tgcapture.dir
+D:/bertonwang/TGCapture/build/windows-x64/CMakeFiles/tg_capture_demo.dir
+D:/bertonwang/TGCapture/build/windows-x64/CMakeFiles/INSTALL.dir
+D:/bertonwang/TGCapture/build/windows-x64/CMakeFiles/ALL_BUILD.dir
+D:/bertonwang/TGCapture/build/windows-x64/CMakeFiles/ZERO_CHECK.dir
