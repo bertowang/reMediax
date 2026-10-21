@@ -101,7 +101,13 @@ private:
 private:
     GameID m_gameId = GameID::GAME_ID_DEFAULT;
     std::atomic<State> m_state{State::Idle};
-    std::mutex m_mutex;
+    // 生命周期互斥：Prepare / Start / Stop 三个入口串行化，避免快速启停时
+    // "Stop 在 Starting 态跑完、Start 随后才启动线程"导致的野线程。
+    //
+    // 必须用 recursive_mutex：Prepare() 内部要触发 m_onPrepared 回调，
+    // 而宿主的标准用法正是在回调里调 Start()（demo 就是这么写的），
+    // 普通 mutex 会在同线程重入时自死锁。
+    std::recursive_mutex m_lifecycleMutex;
 
     // 参数
     VideoEncoderParams m_videoParams;
@@ -136,6 +142,9 @@ private:
     std::shared_ptr<core::VideoOnlyTimeline> m_videoOnlyTimeline;
     int64_t m_videoIntervalUs = 33333;
     uint64_t m_syncDropped = 0;
+    // 音频主时钟首帧等待：音频未就绪时视频不发帧（避免就绪后 PTS 回退被整段丢弃）
+    int64_t m_audioWaitStartUs = 0;
+    bool m_audioFallbackWarned = false;
 
     // 内核
     std::shared_ptr<codec::VideoEncoder> m_videoEncoder;

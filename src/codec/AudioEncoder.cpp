@@ -1,5 +1,6 @@
 #include "codec/AudioEncoder.h"
 
+#include "core/AvError.h"
 #include "core/Logger.h"
 #include "mux/Muxer.h"
 
@@ -29,6 +30,12 @@ int AudioEncoder::Open(const AudioEncoderParams& params, const core::AudioMediaT
     if (m_opened.load()) {
         return 0;
     }
+    // 重开：队列在 Close() 时被永久关闭，必须显式重开
+    m_queue->Reopen();
+    m_encoded.store(0);
+    // 上一轮没凑满一帧的残留 PCM 不能带进新一轮，否则开头会多出一段错位音频
+    m_pcmBuffer.clear();
+    m_nextPts = 0;
     m_srcType = srcType;
     m_codecName = params.aCodec.empty() ? "libfdk_aac" : params.aCodec;
 
@@ -59,8 +66,10 @@ int AudioEncoder::Open(const AudioEncoderParams& params, const core::AudioMediaT
     m_ctx->time_base = AVRational{1, 1000000};
     m_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
-    if (avcodec_open2(m_ctx, codec, nullptr) < 0) {
-        TG_LOGE("AudioEncoder: avcodec_open2 失败 (%s)", m_codecName.c_str());
+    const int openRet = avcodec_open2(m_ctx, codec, nullptr);
+    if (openRet < 0) {
+        TG_LOGE("AudioEncoder: avcodec_open2 失败 %d (%s) codec=%s", openRet, core::AvErr(openRet),
+                m_codecName.c_str());
         avcodec_free_context(&m_ctx);
         return -3;
     }
@@ -160,6 +169,7 @@ int AudioEncoder::EncodeOne(const core::FramePtr& frame)
 
         ret = avcodec_send_frame(m_ctx, avFrame.get());
         if (ret < 0) {
+            TG_LOGE_THROTTLED(1000000, "AudioEncoder: send_frame 失败 %d (%s)", ret, core::AvErr(ret));
             return -4;
         }
         while (ret >= 0) {
@@ -169,6 +179,7 @@ int AudioEncoder::EncodeOne(const core::FramePtr& frame)
                 break;
             }
             if (ret < 0) {
+                TG_LOGE_THROTTLED(1000000, "AudioEncoder: receive_packet 失败 %d (%s)", ret, core::AvErr(ret));
                 return -5;
             }
             // 音频主时钟由 TGCapturer 的混流器推进（见 TGCapturer::MixLoop），这里不再重复更新

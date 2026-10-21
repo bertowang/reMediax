@@ -155,7 +155,8 @@ void IOSAudioCapture::OnPcm(const int16_t* data, int frames, int64_t ptsUs)
     frame->nbSamples = frames;
     frame->audioData = buffer;
     frame->audioBytes = bytes;
-    frame->ptsUs = ptsUs;
+    frame->captureUs = ptsUs > 0 ? ptsUs : core::MonotonicClock::NowUs();
+    frame->ptsUs = frame->captureUs;
     Emit(std::move(frame));
 }
 

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 
+#include "core/AvError.h"
 #include "core/Logger.h"
 #include "mux/Muxer.h"
 
@@ -78,6 +79,10 @@ int VideoEncoder::Open(const VideoEncoderParams& params, const core::VideoMediaT
     if (m_opened.load()) {
         return 0;
     }
+    // 重开：队列在 Close() 时被永久关闭，必须显式重开，否则这一轮的 Submit 全部失败
+    m_queue->Reopen();
+    m_encoded.store(0);
+    m_dropped.store(0);
     m_srcType = srcType;
     m_codecName = params.vCodec.empty() ? "libopenh264" : params.vCodec;
 
@@ -138,7 +143,8 @@ int VideoEncoder::Open(const VideoEncoderParams& params, const core::VideoMediaT
 
     int ret = avcodec_open2(m_ctx, codec, nullptr);
     if (ret < 0) {
-        TG_LOGE("VideoEncoder: avcodec_open2 失败 %d (%s)", ret, m_codecName.c_str());
+        TG_LOGE("VideoEncoder: avcodec_open2 失败 %d (%s) codec=%s", ret, core::AvErr(ret),
+                m_codecName.c_str());
         avcodec_free_context(&m_ctx);
         return -3;
     }
@@ -264,6 +270,10 @@ void VideoEncoder::Close()
     }
     m_queue->Close();
     m_opened.store(false);
+    // 关键：PTS 单调保护的状态必须随流复位。
+    // 否则 Stop→Start 重开时，新一轮时间轴已从 0 起，而 m_lastPtsUs 还是上一轮的末值，
+    // 所有视频帧都会被判成"PTS 回退"而丢弃，第二个文件只有音频甚至 0 字节。
+    m_lastPtsUs = -1;
 }
 
 bool VideoEncoder::Submit(core::FramePtr frame)
@@ -308,20 +318,27 @@ void VideoEncoder::OnThreadExit()
 int VideoEncoder::EncodeOne(const core::FramePtr& frame)
 {
     if (!m_ctx || !frame) {
+        TG_LOGW_THROTTLED(1000000, "VideoEncoder: 编码器未打开或空帧，丢弃（ctx=%d frame=%d）",
+                          m_ctx ? 1 : 0, frame ? 1 : 0);
         return -1;
     }
 
     // 音画同步：视频落后音频过多则丢弃
     if (m_sync && frame->ptsUs >= 0) {
-        auto decision = m_sync->Judge(frame->ptsUs, 40000, m_maxLagUs, nullptr);
+        // 领先/落后阈值都用同一套配置，不在这里硬编码魔法数字
+        auto decision = m_sync->Judge(frame->ptsUs, m_maxLagUs, m_maxLagUs, nullptr);
         if (decision == core::AVSync::Decision::Drop) {
             m_dropped.fetch_add(1);
+            TG_LOGW_THROTTLED(1000000, "VideoEncoder: 视频落后音频 %lldms 超阈值，丢帧",
+                              static_cast<long long>(m_maxLagUs / 1000));
             return 0;
         }
     }
     // PTS 回退保护：dts 必须单调递增，否则 flv/ts 封装会直接报错写不出文件
     if (frame->ptsUs >= 0 && frame->ptsUs <= m_lastPtsUs) {
         m_dropped.fetch_add(1);
+        TG_LOGW_THROTTLED(1000000, "VideoEncoder: PTS 回退 %lld <= %lld，丢帧",
+                          static_cast<long long>(frame->ptsUs), static_cast<long long>(m_lastPtsUs));
         return 0;
     }
     if (frame->ptsUs >= 0) {
@@ -346,7 +363,7 @@ int VideoEncoder::EncodeOne(const core::FramePtr& frame)
 
     int ret = avcodec_send_frame(m_ctx, avFrame.get());
     if (ret < 0) {
-        TG_LOGW("VideoEncoder: send_frame 失败 ret=%d", ret);
+        TG_LOGE_THROTTLED(1000000, "VideoEncoder: send_frame 失败 %d (%s)", ret, core::AvErr(ret));
         return -3;
     }
     if (trace) {
@@ -360,6 +377,7 @@ int VideoEncoder::EncodeOne(const core::FramePtr& frame)
             break;
         }
         if (ret < 0) {
+            TG_LOGE_THROTTLED(1000000, "VideoEncoder: receive_packet 失败 %d (%s)", ret, core::AvErr(ret));
             return -4;
         }
         packet->flags |= (packet->flags & AV_PKT_FLAG_KEY) ? AV_PKT_FLAG_KEY : 0;
@@ -379,7 +397,11 @@ int VideoEncoder::DrainLocked()
     while (true) {
         core::AVPacketPtr packet = core::MakeAVPacket();
         int ret = avcodec_receive_packet(m_ctx, packet.get());
-        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF || ret < 0) {
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            break;
+        }
+        if (ret < 0) {
+            TG_LOGW("VideoEncoder: drain 收包失败 %d (%s)", ret, core::AvErr(ret));
             break;
         }
         DeliverPacket(std::move(packet));

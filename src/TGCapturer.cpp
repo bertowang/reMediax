@@ -215,6 +215,13 @@ void TGCapturer::StopAudioMixer()
         m_mixThread.request_stop();
         m_mixThread.join();
     }
+    // 混流器与音频主时钟必须一起复位：AudioClock::AdvanceTo 是单向的（只在前进方向生效），
+    // 若只把 mixer 的输出时间轴归零、而 m_audioClock 还停在上一轮的末值，
+    // 新一轮的 AdvanceTo 会被判成"回退"全部忽略，视频 PTS 就会从上一轮时长起算。
+    if (m_audioClock) {
+        m_audioClock->Reset();
+        m_audioClock->SetCompensationUs(m_videoParams.audioCompensationUs);
+    }
     if (m_mixer) {
         m_mixer->Reset();
     }
@@ -226,6 +233,9 @@ void TGCapturer::MixLoop(std::stop_token token)
         std::shared_ptr<uint8_t> data;
         int64_t ptsUs = 0;
         if (!m_mixer->Mix(m_audioFrameSize, data, ptsUs)) {
+            // 全部音频源都取不到数据：限频提示，避免"音频时间轴悄悄停住"却没有任何迹象
+            TG_LOGW_THROTTLED(3000000, "TGCapturer: 混流取不到数据（通道 %zu，帧长 %d）",
+                              m_mixer->ChannelCount(), m_audioFrameSize);
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
         }
@@ -327,11 +337,13 @@ void TGCapturer::SetPrivateData(const std::string& key, void* data)
 // ------------------------------------------------------------------ 生命周期
 int TGCapturer::Prepare()
 {
-    if (m_state.load() != State::Idle) {
+    std::lock_guard<std::recursive_mutex> lock(m_lifecycleMutex);
+    // 检查与置位在同一个临界区内原子完成：并发两次 Prepare 只有一个能进
+    State expected = State::Idle;
+    if (!m_state.compare_exchange_strong(expected, State::Preparing)) {
         TG_LOGW("TGCapturer: Prepare 状态错误 state=%d", static_cast<int>(m_state.load()));
         return -1;
     }
-    m_state.store(State::Preparing);
 
     if (!m_videoParamsSet || !m_audioParamsSet || !m_muxParamsSet) {
         FireError(-1, 0, "encoders or muxer not configured");
@@ -410,7 +422,18 @@ int TGCapturer::Prepare()
     m_videoOnlyTimeline->Reset();
     m_videoIntervalUs = m_videoParams.fps > 0 ? static_cast<int64_t>(1000000.0 / m_videoParams.fps) : 33333;
     m_syncDropped = 0;
-    m_videoEncoder->SetMaxLagUs(m_videoParams.videoMaxLagUs > 0 ? m_videoParams.videoMaxLagUs : 120000);
+    m_audioWaitStartUs = 0;
+    m_audioFallbackWarned = false;
+    // 首帧标志必须复位，否则第二轮不再触发 EsCap_Notify_Fisrt_Frame_OK
+    m_firstFrameSent.store(false);
+    m_lastVideoUs = 0;
+    // 编码器侧的"落后丢帧"只是最后一道兜底：阈值必须落在 VideoPtsGenerator 的
+    // ForceAlign 区间之外（forceSyncFactor × 帧间隔 × 1.5）。
+    // 否则会在 RangeAdapt 正常追赶期间（66~200ms @30fps）白白砍帧率，
+    // 而时间轴并不受影响（PTS 由 Next() 独立推进），等于纯损失。
+    const int64_t autoMaxLagUs = syncParams.forceSyncFactor * m_videoIntervalUs * 3 / 2;
+    m_videoEncoder->SetMaxLagUs(m_videoParams.videoMaxLagUs > 0 ? m_videoParams.videoMaxLagUs
+                                                               : autoMaxLagUs);
     m_muxer->SetInterleaveUs(static_cast<int64_t>(m_muxParams.interleaveMs) * 1000);
 
     core::AudioMediaType audioType;
@@ -473,13 +496,19 @@ int TGCapturer::Prepare()
 
 int TGCapturer::Start()
 {
-    if (m_state.load() != State::Prepared) {
+    std::lock_guard<std::recursive_mutex> lock(m_lifecycleMutex);
+    State expected = State::Prepared;
+    if (!m_state.compare_exchange_strong(expected, State::Starting)) {
+        TG_LOGW("TGCapturer: Start 状态错误 state=%d", static_cast<int>(m_state.load()));
         return -1;
     }
-    m_state.store(State::Starting);
 
-    m_muxer->Start();
-    m_videoEncoder->Start();
+    if (!m_muxer->Start()) {
+        TG_LOGW("TGCapturer: muxer 线程启动异常（可能上一轮未停止干净）");
+    }
+    if (!m_videoEncoder->Start()) {
+        TG_LOGW("TGCapturer: 视频编码线程启动异常（可能上一轮未停止干净）");
+    }
     if (m_audioEnabled) {
         m_audioEncoder->Start();
     }
@@ -505,8 +534,11 @@ int TGCapturer::Start()
 
 void TGCapturer::Stop()
 {
-    const State state = m_state.load();
-    if (state == State::Idle || state == State::Stopping) {
+    // 与 Prepare / Start 共用同一把锁：三者不会交错执行，
+    // 从根上消除"Stop 跑完时 Start 还没启动线程"造成的野线程。
+    std::lock_guard<std::recursive_mutex> lock(m_lifecycleMutex);
+    const State cur = m_state.load();
+    if (cur == State::Idle || cur == State::Stopping) {
         return;
     }
     m_state.store(State::Stopping);
@@ -542,13 +574,16 @@ void TGCapturer::Stop()
 
     m_sync->Reset();
     if (m_videoPtsGen) {
-        const auto& st = m_videoPtsGen->stats();
-        TG_LOGI("TGCapturer: 音画同步 avDiff=%lldms clamp=%llu forceSync=%llu skip=%llu jump=%llu syncDrop=%llu",
+        const auto st = m_videoPtsGen->stats();
+        TG_LOGI("TGCapturer: 音画同步 avDiff=%lldms clamp=%llu forceSync=%llu adapt=%llu stall=%llu skip=%llu jump=%llu staleReset=%llu syncDrop=%llu",
                 static_cast<long long>(st.avDiffUs / 1000),
                 static_cast<unsigned long long>(st.clamped),
                 static_cast<unsigned long long>(st.forceSynced),
+                static_cast<unsigned long long>(st.adapted),
+                static_cast<unsigned long long>(st.stalled),
                 static_cast<unsigned long long>(st.skipped),
                 static_cast<unsigned long long>(st.jumpWarns),
+                static_cast<unsigned long long>(st.staleResets),
                 static_cast<unsigned long long>(m_syncDropped));
     }
     m_state.store(State::Idle);
@@ -560,11 +595,15 @@ void TGCapturer::Stop()
 
 void TGCapturer::ReleaseAll()
 {
+    std::lock_guard<std::recursive_mutex> lock(m_lifecycleMutex);
     m_ownedVideoSources.clear();
     m_ownedAudioSources.clear();
     m_videoSource = nullptr;
     m_audioSource = nullptr;
     m_audioSources.clear();
+    if (m_audioClock) {
+        m_audioClock->Reset();
+    }
     if (m_mixer) {
         m_mixer->Reset();
     }
@@ -583,15 +622,44 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
     // 背压：编码器积压过多则丢帧，保证直播实时性
     constexpr size_t kMaxEncoderPending = 8;
     if (m_videoEncoder->Pending() >= kMaxEncoderPending) {
+        TG_LOGW_THROTTLED(2000000, "TGCapturer: 编码器积压 %zu，丢帧（编码跟不上采集）",
+                          m_videoEncoder->Pending());
         return;
     }
 
     // ---- 音画同步：视频 PTS 由音频时钟反推（不用采集 wall clock）----
-    if (m_audioEnabled && m_audioClock && m_audioClock->Valid()) {
-        const int64_t audioRef = m_audioClock->ReferencePtsUs();
+    // 有音频时"视频等音频"：主时钟尚未产出第一拍就先不发帧。
+    // 若此时改走采集时间轴，等音频就绪后首帧 PTS 会从几秒回退到几十毫秒，
+    // 被编码器的单调保护（m_lastPtsUs）整段丢弃，表现为开头几秒没有画面。
+    int64_t audioRef = core::kInvalidPtsUs;
+    bool useAudioClock = false;
+    if (m_audioEnabled) {
+        if (m_audioClock && m_audioClock->Valid()) {
+            useAudioClock = true;
+            audioRef = m_audioClock->ReferencePtsUs();
+        } else {
+            const int64_t nowUs = core::MonotonicClock::NowUs();
+            if (m_audioWaitStartUs == 0) {
+                m_audioWaitStartUs = nowUs;
+                TG_LOGI("TGCapturer: 等待音频主时钟首帧（最多 %lldms）",
+                        static_cast<long long>(m_audioTimeoutMs));
+            }
+            if (nowUs - m_audioWaitStartUs < m_audioTimeoutMs * 1000) {
+                return;   // 正常等待，不计入丢帧统计
+            }
+            if (!m_audioFallbackWarned) {
+                m_audioFallbackWarned = true;
+                TG_LOGW("TGCapturer: 音频超时未就绪，降级为纯视频时间轴");
+            }
+        }
+    }
+
+    if (useAudioClock) {
         const int64_t pts = m_videoPtsGen->Next(audioRef, m_videoIntervalUs, true);
         if (pts == core::kInvalidPtsUs) {
             ++m_syncDropped;   // 音频停滞且已 clamp 到上限：本帧不编码
+            TG_LOGW_THROTTLED(2000000, "TGCapturer: 音频停滞且视频已到超前上限，丢帧（syncDrop=%llu）",
+                              static_cast<unsigned long long>(m_syncDropped));
             return;
         }
         frame->ptsUs = pts;
@@ -599,7 +667,14 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
             m_sync->UpdateAudioClock(audioRef);   // 供 VideoEncoder 的"落后丢帧"兜底
         }
     } else {
-        // 无音频：走采集时间轴（首帧归零，单调递增）
+        // 无音频 / 音频超时：走采集时间轴（首帧归零，单调递增）
+        //
+        // 关键：音频时钟已作废，必须清掉编码器兜底用的那份旧值。
+        // 否则新时间轴从 0 起、而 m_sync 里还留着超时前的音频 PTS，
+        // 编码器会把降级后的每一帧都判成"落后"并丢弃 —— 文件里只剩音频，没有画面。
+        if (m_sync && m_sync->HasAudioClock()) {
+            m_sync->Reset();
+        }
         const int64_t pts = m_videoOnlyTimeline->Next(frame->captureUs);
         frame->ptsUs = pts >= 0 ? pts : frame->captureUs;
     }

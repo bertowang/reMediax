@@ -42,6 +42,8 @@ struct Options
     bool noBorder = false;    // 窗口采集只取客户区（WGC_No_TBar）
     bool listAudio = false;   // 列出系统麦克风/扬声器设备
     std::string perf = "cpu"; // cpu | gpu（全链路 GPU：采集帧不出显存）
+    int restart = 0;          // 首轮结束后再 Stop→Prepare→Start 多少轮（重开回归）
+    int concur = 0;           // >0 时改跑并发压测：Prepare 与 Stop 交错冲击 n 秒
 };
 
 // 测试用视频源：生成 NV12 测试图案，用于隔离"采集侧"与"编码/封装侧"问题
@@ -115,7 +117,9 @@ void PrintUsage()
            "  --no-border      窗口采集只取客户区\n"
            "  --list-audio     列出系统麦克风/扬声器设备后退出\n"
            "  --perf <cpu|gpu> 性能模式，默认 cpu；gpu = 全链路 GPU（采集帧不出显存，需硬编）\n"
-           "  --gpu            等价 --perf gpu\n");
+           "  --gpu            等价 --perf gpu\n"
+           "  --restart <n>    首轮结束后再 Stop→Prepare→Start 跑 n 轮（重开回归，每轮时长同 --seconds）\n"
+           "  --concur <n>     并发压测：Prepare 与 Stop 两条线程交错冲击 n 秒，验证生命周期互斥\n");
 }
 
 Options ParseArgs(int argc, char** argv)
@@ -176,6 +180,10 @@ Options ParseArgs(int argc, char** argv)
             opt.window = std::stoull(value, nullptr, 16);
         } else if (key == "--perf") {
             opt.perf = value;
+        } else if (key == "--restart") {
+            opt.restart = std::stoi(value);
+        } else if (key == "--concur") {
+            opt.concur = std::stoi(value);
         } else if (key == "--no-audio") {
             opt.audio = false;
         }
@@ -317,6 +325,56 @@ int main(int argc, char** argv)
 
     printf("[demo] 最终统计: %s\n", capturer->GetStatsInfo(TGCapture::StatsInfoType::videoInfo).c_str());
     capturer->Stop();
+
+    // 并发压测：Prepare 与 Stop 交错冲击，验证生命周期互斥（不死锁、不野线程、不崩溃）
+    if (opt.concur > 0) {
+        printf("[demo] 并发压测 %d 秒（Prepare / Stop 交错）\n", opt.concur);
+        std::atomic_bool done{false};
+        std::atomic_int okPrepare{0};
+        std::atomic_int okStop{0};
+        std::jthread tPrepare([&] {
+            while (!done.load()) {
+                if (capturer->Prepare() == 0) {
+                    okPrepare.fetch_add(1);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        });
+        std::jthread tStop([&] {
+            while (!done.load()) {
+                capturer->Stop();
+                okStop.fetch_add(1);
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        });
+        std::this_thread::sleep_for(std::chrono::seconds(opt.concur));
+        done.store(true);
+        tPrepare.join();
+        tStop.join();
+        printf("[demo] 并发结束 prepare_ok=%d stop=%d\n", okPrepare.load(), okStop.load());
+        capturer->Stop();
+        TGCapture::ITGCapturer::Destroy(capturer);
+        TGCapture::ITGCapturerMgr::UnInit();
+        printf("[demo] 并发压测完成\n");
+        return 0;
+    }
+
+    // 重开回归：Stop → Prepare → Start 反复跑，验证队列/时钟/统计都正确复位
+    for (int r = 1; r <= opt.restart; ++r) {
+        printf("[demo] === 重开 #%d ===\n", r);
+        const int pr = capturer->Prepare();
+        printf("[demo] 重开 Prepare=%d\n", pr);
+        if (pr != 0) {
+            printf("[demo] 重开失败，停止后续轮次\n");
+            break;
+        }
+        for (int i = 0; i < opt.seconds * 10; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        printf("[demo] 重开统计: %s\n", capturer->GetStatsInfo(TGCapture::StatsInfoType::videoInfo).c_str());
+        capturer->Stop();
+    }
+
     TGCapture::ITGCapturer::Destroy(capturer);
     TGCapture::ITGCapturerMgr::UnInit();
     printf("[demo] 完成，输出文件: %s\n", opt.output.c_str());

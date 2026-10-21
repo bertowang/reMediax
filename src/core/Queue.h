@@ -98,6 +98,20 @@ public:
         m_notFull.notify_all();
     }
 
+    // 重新开放：Close() 是"永久关闭"语义（用来唤醒阻塞的消费者），
+    // 所以 Stop → Prepare → Start 重开一路流时必须显式 Reopen，
+    // 否则第二轮的 Push 会全部返回 false，输出文件只剩一个头（实测 389 字节、0 个包）。
+    void Reopen()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_queue.clear();     // 清掉上一轮残留，避免跨轮数据（GPU 模式还会滞留纹理 owner）
+            m_closed = false;
+            m_dropped = 0;
+        }
+        m_notFull.notify_all();
+    }
+
     void Clear()
     {
         std::lock_guard<std::mutex> lock(m_mutex);

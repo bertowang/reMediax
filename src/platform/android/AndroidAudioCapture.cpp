@@ -127,7 +127,8 @@ void AndroidAudioCapture::OnPcm(const uint8_t* data, int bytes, int64_t ptsUs)
     frame->nbSamples = bytes / frameSize;
     frame->audioData = buffer;
     frame->audioBytes = static_cast<size_t>(bytes);
-    frame->ptsUs = ptsUs > 0 ? ptsUs : core::MonotonicClock::NowUs();
+    frame->captureUs = ptsUs > 0 ? ptsUs : core::MonotonicClock::NowUs();
+    frame->ptsUs = frame->captureUs;
     Emit(std::move(frame));
 }
 

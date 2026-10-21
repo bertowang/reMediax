@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 
+#include "core/Clock.h"
 #include "core/Logger.h"
 
 namespace TGCapture::core
@@ -132,7 +133,23 @@ int64_t AudioChannelClock::Correct(int64_t rawPts, int64_t refPts, int64_t frame
 
 int64_t AudioChannelClock::NextPts(int nbSamples, int64_t nowUs)
 {
-    const int64_t frameDurUs = FrameDurationUs();
+    // 首帧：raw（采样数累计）与 ref（系统时钟）两个时钟必须同时起算。
+    // 否则"AddChannel 到第一帧到达"之间的设备启动延迟（打开 WASAPI、填充缓冲，实测 ~300ms）
+    // 会被整体算进 drift，首帧就触发 ForceAlign，之后 PI/BURST 的统计也全都偏移。
+    if (m_prevPts < 0 && nowUs > 0) {
+        m_currentPts = 0;
+        m_refStartUs = nowUs;
+        m_lastRefUs = 0;
+        m_prevPts = 0;   // 必须置位：否则下一次调用会再次命中首帧分支，时钟永远停在 0
+        return 0;
+    }
+
+    // 用本帧实际样本数换算帧长，阈值与 PI 步长才和真实节奏匹配
+    const int64_t frameDurUs =
+        (m_sampleRate > 0 && nbSamples > 0)
+            ? (static_cast<int64_t>(nbSamples) * 1000000LL / m_sampleRate)
+            : FrameDurationUs();
+
     // 先按采样数推进（音频时钟的本质）
     m_currentPts += m_sampleRate > 0 ? (static_cast<int64_t>(nbSamples) * 1000000LL / m_sampleRate) : 0;
 
@@ -143,9 +160,9 @@ int64_t AudioChannelClock::NextPts(int nbSamples, int64_t nowUs)
 
     if (m_stats.driftUs < 0 ? -m_stats.driftUs > kJumpWarnFactor * frameDurUs
                             : m_stats.driftUs > kJumpWarnFactor * frameDurUs) {
-        TG_LOGD("AudioChannelClock: drift=%lldms（阈值 %lldms）",
-                static_cast<long long>(m_stats.driftUs / 1000),
-                static_cast<long long>(kJumpWarnFactor * frameDurUs / 1000));
+        TG_LOGW_THROTTLED(3000000, "AudioChannelClock: drift=%lldms（阈值 %lldms）",
+                          static_cast<long long>(m_stats.driftUs / 1000),
+                          static_cast<long long>(kJumpWarnFactor * frameDurUs / 1000));
     }
     return m_currentPts;
 }
@@ -270,7 +287,11 @@ void AudioMixer::Push(int id, const int16_t* data, int frames, int64_t captureUs
     }
 
     // 时间戳：按采样数推进 + 与系统参考时钟比对校正（PI/BURST）
-    ch->clock.NextPts(frames, captureUs > 0 ? captureUs : 0);
+    // 采集端若没填 captureUs（Frame 默认 AV_NOPTS_VALUE），这里兜底用当前单调时钟：
+    // 否则 NextPts 拿到的 nowUs 恒为 0，参考时钟变成常数，drift 会被算成巨量负值，
+    // 每帧都触发 ForceAlign，通道时钟统计全废。
+    const int64_t nowUs = captureUs > 0 ? captureUs : MonotonicClock::NowUs();
+    ch->clock.NextPts(frames, nowUs);
 
     const int srcChannels = ch->channels;
     if (ch->swr) {

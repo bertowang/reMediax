@@ -213,7 +213,7 @@ capturer->PushExternalAudioFrame(TGCapture::TypeOfGameMicphone4Slave, pcm, bytes
 | `threads` | 4 | 软编线程数 |
 | `perfMode` | `Cpu` | `Gpu` = 全链路 GPU（第 7 节） |
 | `videoMaxLeadUs` | 500000 | 音频停滞时视频最多超前多少 |
-| `videoMaxLagUs` | 120000 | 视频落后音频超过多少丢帧 |
+| `videoMaxLagUs` | 0（自动） | 视频落后音频超过多少丢帧（编码器侧兜底）。`0` = 按 `forceSyncFactor × 帧间隔 × 1.5` 推导，保证不落在 RangeAdapt 追赶区间内 |
 | `audioCompensationUs` | 0 | 音频参考时钟额外补偿 |
 
 **`AudioEncoderParams`**
@@ -245,7 +245,37 @@ TGCapture::core::Logger::Instance().SetSink(
     [](TGCapture::core::LogLevel lv, const char* msg) { /* 转发到宿主日志系统 */ });
 ```
 
-默认输出到 `stdout`，格式 `[TGCapture][level] msg`。
+默认输出到 `stdout`，格式 `[TGCapture][D/I/W/E] msg`。
+
+**分级**：只有运行时一档（`Init` 的 `logLevel`），**没有编译期裁剪**——
+Debug 日志在 Release 里也保留，好处是线上能临时打开排查。
+
+| `logLevel` | 级别 | 内容 |
+| - | - | - |
+| 0 | Debug | 每帧级追踪（线程进出、前几帧编码、写包） |
+| 1 | Info（默认） | 生命周期、就绪、收尾统计 |
+| 2 | Warn | 只保留异常与降级 |
+| 3 | Error | 只保留失败 |
+
+**异常可读性**
+
+- FFmpeg 错误一律带可读原因：`core/AvError.h` 的 `AvErr(ret)`
+  （`av_err2str` 在 MSVC 下是 compound literal 编译不过，故手写等价实现）。
+  一条日志里只能用一次 `AvErr()`。
+- FFmpeg 自身日志由 `av_log_set_callback` 接管，转发进 `Logger` 并加 `[ffmpeg]` 前缀
+  （默认走 stderr，Android 上等于丢弃）。
+
+**限频**
+
+高频路径（丢帧、写包失败、混流取不到数据）用 `TG_LOGW_THROTTLED` / `TG_LOGE_THROTTLED`：
+同一调用点在一个时间窗口内最多输出一条，既不静默也不刷屏。
+
+**已补日志的静默路径**：编码器背压丢帧、PTS 回退丢帧、视频落后音频丢帧、
+`send_frame` / `receive_packet` 失败、drain 收包失败、混流取不到数据、音频通道时钟漂移。
+
+**线程安全**：`SetSink` / `Log` 对 sink 加锁，且回调前先拷一份再解锁
+（宿主日志系统反向调回来不会死锁）。`UnInit()` 会复位 level / sink 并摘掉 av_log 回调。
+
 **当前限制**：`Init` 的 `logDir` / `printLog` 尚未实现文件落盘；
 Android / iOS 还没接 `__android_log_print` / `os_log` sink（移动端需先用 `SetSink` 转发）。
 
@@ -269,31 +299,65 @@ Android / iOS 还没接 `__android_log_print` / `os_log` sink（移动端需先�
 
 ### 5.1 视频 PTS 生成规则
 
-| 场景 | 处理 |
-| - | - |
-| 首帧 | 直接取音频 PTS（超过 1 小时视为残留时间轴，从 0 起） |
-| 音频正常 + 真实帧 | 偏离 > 2×帧间隔 → 跳齐音频（**不允许回退**）；否则按帧间隔递增 |
-| 音频正常 + 补帧 | 渐进加速/减速：落后 150/300/500ms → ×1.1/1.2/1.3；超前 → ×0.9/0.8/0.7 |
-| 音频停滞（静音/卡顿） | 视频最多超前 500ms 后 clamp；补帧连续被 clamp 3 次就停产出 |
-| clamp / 跳齐 | 均带单调递增保护（最小步长 = 帧间隔/10，下限 1ms） |
-| **音频不可用** | **不用系统时间顶替**；无音频时走 `VideoOnlyTimeline`（采集时间轴，首帧归零） |
-| 兜底 | 编码器侧再看一次 `videoMaxLagUs`，并丢弃 PTS 回退的帧（防 `non monotonically increasing dts`） |
+`avDiff = 音频 PTS − 视频 PTS`，**>0 表示视频落后**。分档对齐 `VideoPtsManager`：
 
-### 5.2 统计与判读
+| 档位 | 触发条件（30fps 示例） | 处理 |
+| - | - | - |
+| **RangeNormal** | \|avDiff\| ≤ 2×帧间隔（≤66ms） | 按帧间隔正常递增 |
+| **RangeAdapt** | 2× ~ 6×帧间隔（66~200ms） | 渐进追赶 / 减速：落后 150/300/500ms → ×1.1/1.2/1.3；超前 → ×0.9/0.8/0.7 |
+| **ForceAlign** | > 6×帧间隔（>200ms） | 直接跳齐到音频 PTS（**不允许回退**） |
+| **Pause** | 音频连续 2 拍不推进 | 视频按系统时钟继续走，最多超前 `videoMaxLeadUs`（500ms）后钉住；补帧连续被 clamp 3 次则停产出 |
+| 首帧 | — | 取音频 PTS；超过 5s 视为上一轮残留时间轴，从 0 重起 |
+| 音频不可用 | `audioRef < 0` | **不用系统时间顶替**，返回无效 PTS，由调用方决定丢帧或降级 |
+
+单调递增是硬约束：`clamp` / `forceSync` / 采集时钟回退都走 `ClampMonotonic`
+（最小步长 = 帧间隔/10，下限 1ms），编码器侧再兜一次 `m_lastPtsUs`，
+防止封装报 `non monotonically increasing dts`。
+
+### 5.2 兼容场景矩阵
+
+| 分类 | 异常场景 | 处理方式 | 结果 |
+| - | - | - | - |
+| **时钟源** | 无音频（`--no-audio` / `enabled=false`） | 走 `VideoOnlyTimeline` 采集时间轴，首帧归 0，回退时至少 +1ms | 视频时间轴连续 |
+| | 音频已开但首拍未到（设备打开慢） | **视频等音频**，不发帧；超过 `audioTimeoutMs`（3s）才降级为纯视频时间轴 | 不会出现"开头几秒没画面" |
+| | 音频 PTS 回退 | `AudioClock::AdvanceTo` 单向 CAS，只前进不回退 | 主时钟单调 |
+| | 音频 PTS 跳变（>5×帧间隔） | 只计 `jump` 告警，不改写时间轴 | 可观测、不放大故障 |
+| | 系统时钟回退 / 跳变（>10×帧间隔） | `passUs` 退回用帧间隔 | 异常不进时间轴 |
+| | 系统冻结 / 挂起 >2s | `AudioChannelClock::ReferencePtsUs` 限幅吸收，不一次性追赶 | 恢复后不突跳 |
+| **音频侧** | 设备无数据（静音、被占用、拔麦） | `WinAudioCapture::SilenceLoop` 持续出静音 | 时间轴不断 |
+| | 某一路中途掉线 | `AudioMixer::Mix` 按静音补齐，输出时间轴按输出采样率继续推进 | 其余路不受影响 |
+| | 多路采样率 / 声道不一致 | swresample 归一到输出格式 | 正常混流 |
+| | 采样率 / 声道为 0 | 回落到输出格式，不产生除零 | 不崩溃 |
+| | 单路 ↔ 多路切换 | 输出时间轴连续，`AddChannel` 动态建重采样上下文 | 无需重启 |
+| **视频侧** | 帧率 0 / 帧间隔 ≤ 0 | 兜底 33333us（30fps） | 不除零 |
+| | 帧率突变（动态 fps、分辨率切换） | 帧间隔固定 → avDiff 累积 → 先 RangeAdapt 渐进，过大则 ForceAlign | 自动收敛 |
+| | 背压丢帧（编码器 Pending ≥ 8） | PTS 不推进，avDiff 变大后由同步档位纠正 | 追实时性，不累积延迟 |
+| | forceSync / clamp 需要回退 | `ClampMonotonic` + 编码器 `m_lastPtsUs` 双重保护 | 单调，不写坏文件 |
+| | 视频 muted | 直接丢弃，不推进 PTS；恢复时靠 ForceAlign 跳齐 | 不产生空档 |
+| **封装侧** | 某一路领先超过 `interleaveMs`（350ms） | 暂停写该路，等另一路追上 | 交织均衡 |
+| | 某一路彻底不再出包 | 该路超时（3×阈值）未到包则把基准前推（BreakV / BreakA 自愈） | 不会永久卡住 |
+| | 视频或音频完全无包 | 交织基准为 `kNoPts`，跳过保护直接写出 | 单流文件仍可播 |
+| **生命周期** | Stop → Start 重开（同一实例） | `VideoEncoder::Close` 复位 `m_lastPtsUs`；`m_audioClock` 与 `m_mixer` 同步复位 | 第二个文件时间轴从 0 起 |
+| | 首帧命中残留时间轴 | 超过 5s 则从 0 重起，计 `staleReset` | 文件开头不缺帧 |
+
+### 5.3 统计与判读
 
 停止时打印一行，用来判断链路是否健康：
 
 ```
-TGCapturer: 音画同步 avDiff=-16ms clamp=0 forceSync=0 skip=0 jump=0 syncDrop=0
+TGCapturer: 音画同步 avDiff=-13ms clamp=0 forceSync=0 adapt=0 stall=0 skip=0 jump=0 staleReset=0 syncDrop=0
 ```
 
 | 字段 | 含义 | 健康区间 |
 | - | - | - |
 | `avDiff` | 音频 − 视频（>0 视频落后） | 绝对值 < 100ms |
-| `clamp` | 被 clamp 到 audio+500ms 的次数 | 偶发可接受，持续增长说明音频长期停滞 |
-| `forceSync` | 直接跳齐音频的次数 | 少量正常 |
+| `clamp` | 被 clamp 到 audio+maxLead 的次数 | 偶发可接受，持续增长说明音频长期停滞 |
+| `forceSync` | ForceAlign 直接跳齐的次数 | 少量正常，频繁说明音频时钟不稳 |
+| `adapt` | RangeAdapt 渐进追赶 / 减速的次数 | 少量正常；持续增长说明帧率与音频长期不匹配 |
+| `stall` | 判定"音频停滞"的次数 | 纯静音场景会增长，属预期 |
 | `skip` | 建议丢弃的补帧 | 同上 |
-| `jump` | 音频 PTS 跳变告警 | 0 最佳 |
+| `jump` | 音频 PTS 跳变 / 回退告警 | 0 最佳 |
+| `staleReset` | 首帧命中残留时间轴的次数 | 0 最佳 |
 | `syncDrop` | 因音频停滞丢掉的视频帧 | 0 最佳 |
 
 ---
@@ -445,6 +509,8 @@ cd build\windows-x64\Release
 | `--no-audio` | 纯视频 |
 | `--fake-video` | 人造帧（不依赖采集，排查编码/封装链路） |
 | `--list-audio` | 列出系统麦克风/扬声器端点后退出 |
+| `--restart <n>` | 首轮结束后再 `Stop→Prepare→Start` 跑 n 轮（重开回归，每轮时长同 `--seconds`） |
+| `--concur <n>` | 并发压测：`Prepare` 与 `Stop` 两条线程交错冲击 n 秒，验证生命周期互斥 |
 
 取窗口句柄（注意 demo 按 16 进制解析）：
 
@@ -466,11 +532,22 @@ cd build\windows-x64\Release
 | 7 | `--list-audio` | 列出麦克风/扬声器端点（默认项有标记） |
 | 8 | `--fake-video --no-audio` | 不依赖设备也能跑通编码/封装 |
 
+音画同步专项（对应 §5.2 矩阵）：
+
+| # | 场景 | 操作 | 预期 |
+| - | - | - | - |
+| 9 | 音频首拍延迟 | 音频源 `Open` 前 sleep 2~3s | 日志出现 `等待音频主时钟首帧`；视频首帧 PTS 不回退，无开头空档 |
+| 10 | 音频永久失效 | 确认无音频设备后跑带音频用例 | 超时后日志 `音频超时未就绪，降级为纯视频时间轴`；仍有视频流 |
+| 11 | Stop → Start 重开 | `--restart 2` | 每轮 `encoded` 相当、`dropped=0`，首帧回调每轮都触发 |
+| 12 | 高帧率 | `--seconds 10` 且 `fps=60` | `avDiff` 稳定；`stall` 不随帧率线性增长 |
+| 13 | 系统冻结 | 录制中挂起进程 10s | `jump` +1，恢复后视频 PTS 不突跳 |
+| 14 | 并发启停 | `--concur 5` | `prepare_ok` / `stop` 数量接近、进程 `exit=0`、不挂死 |
+
 每次跑完看两处：
 
 ```
 [demo] 最终统计: {"codec":"...","encoded":N,"dropped":0,"pending":0}
-[TGCapturer] 音画同步 avDiff=…ms clamp=0 forceSync=0 skip=0 jump=0 syncDrop=0
+[TGCapturer] 音画同步 avDiff=…ms clamp=0 forceSync=0 adapt=0 stall=0 skip=0 jump=0 staleReset=0 syncDrop=0
 ```
 
 ### 10.3 产物校验
@@ -495,6 +572,7 @@ ffplay out.flv                      # 实际播放确认音画同步
 | 麦克风 + 扬声器 | 两路 WASAPI 就绪，内核启用混流，输出 `h264 + aac` |
 | 设备枚举 | `--list-audio` 正确列出端点 |
 | 音画同步 | `avDiff` 稳定在 ±50ms 内，无 clamp / 跳变 / 丢帧 |
+| Stop → Start 重开 | 第二轮视频帧数正常，时间轴从 0 起，`m_lastPtsUs` 已随流复位 |
 | GPU 全链路 | `h264_nvenc` + D3D11 帧池（fmt=`AV_PIX_FMT_D3D11`, sw=`BGRA`），3 秒 98 帧，文件可解析 |
 | 稳定性 | 同配置连跑 5 次均 `exit=0`、产物有效 |
 

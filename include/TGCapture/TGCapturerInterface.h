@@ -192,7 +192,11 @@ struct VideoEncoderParams
 
     // ---- 音画同步 ----
     int64_t videoMaxLeadUs = 500000;   // 音频停滞时视频最多超前多少（默认 500ms）
-    int64_t videoMaxLagUs = 120000;    // 视频落后音频超过多少就丢帧（默认 120ms）
+    // 视频落后音频超过多少就丢帧（编码器侧最后一道兜底）。
+    // 0 = 自动：由音画同步模块按 forceSyncFactor × 帧间隔 × 1.5 推导，
+    //           保证阈值落在 RangeAdapt 追赶区间之外，不与同步策略互相抵消。
+    // 显式给非 0 值时以宿主配置为准。
+    int64_t videoMaxLagUs = 0;
     int64_t audioCompensationUs = 0;   // 音频参考时钟的额外补偿（抵消编码/封装延迟）
 };
 

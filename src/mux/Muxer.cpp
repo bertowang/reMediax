@@ -1,5 +1,6 @@
 #include "mux/Muxer.h"
 
+#include "core/AvError.h"
 #include "core/Clock.h"
 #include "core/Logger.h"
 
@@ -38,6 +39,18 @@ int Muxer::Open(const MuxerParams& params, AVCodecContext* videoCtx, AVCodecCont
     }
     avformat_network_init();
 
+    // 重开：两条队列在 Close() 时被永久关闭，必须显式重开
+    m_videoQueue->Reopen();
+    m_audioQueue->Reopen();
+    m_packets.store(0);
+    m_bytes.store(0);
+    m_bps.store(0.0f);
+    m_lastStatUs = core::MonotonicClock::NowUs();
+    m_diagStallVideo.store(0);
+    m_diagStallAudio.store(0);
+    m_lastVideoArrivalUs.store(0);
+    m_lastAudioArrivalUs.store(0);
+
     m_lastVideoPtsUs.store(kNoPts);
     m_lastAudioPtsUs.store(kNoPts);
 
@@ -46,7 +59,9 @@ int Muxer::Open(const MuxerParams& params, AVCodecContext* videoCtx, AVCodecCont
 
     int ret = avformat_alloc_output_context2(&m_fmt, nullptr, m_format.c_str(), m_url.c_str());
     if (ret < 0 || !m_fmt) {
-        TG_LOGE("Muxer: 创建输出上下文失败 fmt=%s url=%s", m_format.c_str(), m_url.c_str());
+        TG_LOGE("Muxer: 创建输出上下文失败 fmt=%s url=%s ret=%d (%s)", m_format.c_str(),
+                m_url.c_str(), ret, ret < 0 ? core::AvErr(ret) : "ctx=null");
+        Close();   // 回滚：否则重试 Prepare 会每失败一次泄漏一个 AVFormatContext
         return -1;
     }
 
@@ -74,7 +89,9 @@ int Muxer::Open(const MuxerParams& params, AVCodecContext* videoCtx, AVCodecCont
     if (!(m_fmt->oformat->flags & AVFMT_NOFILE)) {
         ret = avio_open2(&m_fmt->pb, m_url.c_str(), AVIO_FLAG_WRITE, nullptr, nullptr);
         if (ret < 0) {
-            TG_LOGE("Muxer: avio_open 失败 url=%s ret=%d", m_url.c_str(), ret);
+            TG_LOGE("Muxer: avio_open 失败 url=%s ret=%d (%s)", m_url.c_str(), ret,
+                    core::AvErr(ret));
+            Close();
             return -2;
         }
     }
@@ -84,7 +101,8 @@ int Muxer::Open(const MuxerParams& params, AVCodecContext* videoCtx, AVCodecCont
     ret = avformat_write_header(m_fmt, &options);
     av_dict_free(&options);
     if (ret < 0) {
-        TG_LOGE("Muxer: write_header 失败 ret=%d", ret);
+        TG_LOGE("Muxer: write_header 失败 ret=%d (%s) url=%s", ret, core::AvErr(ret), m_url.c_str());
+        Close();
         return -3;
     }
 
@@ -228,7 +246,10 @@ int Muxer::WriteOne(core::AVPacketPtr packet, bool isVideo)
         TG_LOGD("Muxer: 写包返回 ret=%d", ret);
     }
     if (ret < 0) {
-        TG_LOGW("Muxer: 写包失败 ret=%d (video=%d)", ret, isVideo ? 1 : 0);
+        // 写包失败 = 数据丢失（文件截断 / 推流断流），是 Error 不是 Warn；
+        // 但断流时会每包命中，所以限频，避免刷屏淹没其它日志
+        TG_LOGE_THROTTLED(2000000, "Muxer: 写包失败 ret=%d (%s) video=%d pts=%lld", ret,
+                          core::AvErr(ret), isVideo ? 1 : 0, static_cast<long long>(ptsUs));
         return -3;
     }
     UpdateBitrate(static_cast<size_t>(packet->size));

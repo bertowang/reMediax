@@ -255,7 +255,8 @@ void WinAudioCapture::Loop(std::stop_token token)
             auto frame = std::make_shared<core::Frame>();
             Resample(data, static_cast<int>(framesAvailable), frame);
             if (frame->audioData) {
-                frame->ptsUs = core::MonotonicClock::NowUs();
+                frame->captureUs = core::MonotonicClock::NowUs();
+                frame->ptsUs = frame->captureUs;
                 Emit(std::move(frame));
             }
         }
