@@ -5,6 +5,8 @@
 #include <windows.h>
 
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "capture/Source.h"
 
@@ -12,6 +14,22 @@ struct IAudioClient;
 struct IAudioCaptureClient;
 struct IMMDevice;
 struct ISimpleAudioVolume;
+
+namespace TGCapture::platform
+{
+
+// 系统音频设备（WASAPI 端点）：id 可用于 WinAudioCapture::SetDeviceId 精确指定设备
+struct AudioDeviceInfo
+{
+    std::wstring id;
+    std::wstring name;
+    bool isDefault = false;
+};
+
+// capture=true 枚举麦克风（eCapture），false 枚举扬声器（eRender）
+std::vector<AudioDeviceInfo> ListAudioDevices(bool capture);
+
+}  // namespace TGCapture::platform
 
 extern "C"
 {
@@ -34,6 +52,10 @@ public:
     void SetVolume(float gain);
     void SetMuted(bool muted) noexcept { m_muted.store(muted); }
 
+    // 指定端点设备（ListAudioDevices 取到的 id）；空 = 系统默认设备
+    void SetDeviceId(const std::wstring& endpointId) { m_deviceId = endpointId; }
+    [[nodiscard]] const std::wstring& DeviceId() const noexcept { return m_deviceId; }
+
 protected:
     void Loop(std::stop_token token) override;
     void OnThreadExit() override;
@@ -55,6 +77,7 @@ private:
 
     SwrContext* m_swr = nullptr;
     bool m_comInited = false;
+    std::wstring m_deviceId;
 };
 
 }  // namespace TGCapture::platform

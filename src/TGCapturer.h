@@ -6,6 +6,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "TGCapture/ITGCapturer.h"
@@ -26,14 +28,14 @@ public:
     ~TGCapturer() override;
 
     // ---- ITGCapturer ----
-#ifdef _WIN32
+    bool IsSupported(CaptureFeature feature) const override;
+
     int EnableMicrophoneCapture(bool usingGVoice = false) override;
     int EnableSpeakerCapture() override;
     IVideoSource* CreateScreenCapture(int index = 0, VideoCapMode mode = DXGI,
                                       VideoScaleStrategy strategy = VideoScaleStrategy::SCALE_FIT_V0) override;
-    IVideoSource* CreateWindowCapture(void* hwnd, VideoCapMode mode = WGC,
+    IVideoSource* CreateWindowCapture(void* handle, VideoCapMode mode = WGC,
                                       VideoScaleStrategy strategy = VideoScaleStrategy::SCALE_FIT_V0) override;
-#endif
     IVideoSource* CreateLocalFileCapture(int index, const std::string& filePath, bool loopPlay = false) override;
 
     int AddAudioSource(IAudioSource* source) override;
@@ -86,6 +88,12 @@ private:
     void FireNotify(NotifyMsgType type, const std::string& content, int64_t data);
     void ReleaseAll();
 
+    // 多路音频（麦克风 + 扬声器）混音：单路直接透传，多路由混音线程合并成一路
+    void OnAudioFrameFrom(capture::AudioSourceBase* source, core::FramePtr frame);
+    void StartAudioMixer();
+    void StopAudioMixer();
+    void MixLoop(std::stop_token token);
+
 private:
     GameID m_gameId = GameID::GAME_ID_DEFAULT;
     std::atomic<State> m_state{State::Idle};
@@ -104,7 +112,15 @@ private:
     std::vector<std::shared_ptr<capture::VideoSourceBase>> m_ownedVideoSources;
     std::vector<std::shared_ptr<capture::AudioSourceBase>> m_ownedAudioSources;
     capture::VideoSourceBase* m_videoSource = nullptr;  // 非拥有
-    capture::AudioSourceBase* m_audioSource = nullptr;  // 非拥有
+    capture::AudioSourceBase* m_audioSource = nullptr;  // 非拥有（首个/主要音频源）
+    std::vector<capture::AudioSourceBase*> m_audioSources;   // 全部音频源（麦克风 + 扬声器）
+
+    std::mutex m_audioMixMutex;
+    std::unordered_map<capture::AudioSourceBase*, core::FramePtr> m_audioLatest;
+    std::jthread m_mixThread;
+
+    // 平台采集句柄（Android：MediaProjection jobject 全局引用，由 SetPrivateData 传入）
+    void* m_mediaProjection = nullptr;
 
     // 内核
     std::shared_ptr<codec::VideoEncoder> m_videoEncoder;

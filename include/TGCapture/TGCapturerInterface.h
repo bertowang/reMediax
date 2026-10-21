@@ -58,13 +58,24 @@ enum NotifyMsgType
 enum VideoCapMode
 {
     NONE = -1,
-    DXGI = 0,   // Windows 桌面复制
+    DXGI = 0,   // Windows 桌面复制（Desktop Duplication，性能最好）
     D3D = 1,
-    GDI = 2,    // Windows GDI（兼容性兜底）
-    WGC = 4,    // Windows Graphics Capture（窗口）
-    WGC_No_TBar = 5,
-    AndroidSurface = 10,
+    GDI = 2,    // Windows GDI（兼容性兜底，DXGI 不可用/多显示器/远程桌面时回落）
+    WGC = 4,    // Windows 窗口采集（含边框）
+    WGC_No_TBar = 5,  // Windows 窗口采集（仅客户区，去标题栏/边框）
+    AndroidSurface = 10,   // Android MediaProjection（虚拟显示 -> Surface / ImageReader）
+    ReplayKit = 11,        // iOS ReplayKit（应用内录屏）
     LocalVideoFile = 20,
+};
+
+// 采集能力查询：三端能力不对齐（iOS 无"窗口"概念、无系统内录；
+// Android 无"窗口"概念），调用方在 Start 之前用 ITGCapturer::IsSupported 判断。
+enum class CaptureFeature
+{
+    Screen = 0,      // 屏幕录制
+    Window = 1,      // 指定窗口采集
+    Microphone = 2,  // 麦克风
+    Speaker = 3,     // 扬声器 / 系统声音
 };
 
 enum class VideoScaleStrategy

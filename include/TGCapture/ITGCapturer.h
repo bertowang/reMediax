@@ -28,14 +28,20 @@ public:
     virtual ~ITGCapturer() = default;
 
     // ---------------- 采集源（Start 之前配置） ----------------
-#ifdef _WIN32
+    // 三端均为同一组接口；不支持的能力由 IsSupported 提前告知，调用时返回负值。
+    // Windows : Screen / Window / Microphone / Speaker 全支持
+    // Android : Screen（MediaProjection，需先 SetPrivateData 传 token）/ Microphone / Speaker(API 29+)
+    // iOS     : Screen（ReplayKit，应用内）/ Microphone；无窗口、无系统内录
+    virtual bool IsSupported(CaptureFeature feature) const = 0;
+
+    // 麦克风：一律走系统采集（WASAPI / AudioRecord / AVAudioSession），
+    // usingGVoice 仅为兼容老调用方保留，传 true 也按系统麦克风处理。
     virtual int EnableMicrophoneCapture(bool usingGVoice = false) = 0;
-    virtual int EnableSpeakerCapture() = 0;
+    virtual int EnableSpeakerCapture() = 0;   // Windows: WASAPI loopback；Android: AudioPlaybackCapture
     virtual IVideoSource* CreateScreenCapture(int index = 0, VideoCapMode mode = DXGI,
                                               VideoScaleStrategy strategy = VideoScaleStrategy::SCALE_FIT_V0) = 0;
-    virtual IVideoSource* CreateWindowCapture(void* hwnd, VideoCapMode mode = WGC,
+    virtual IVideoSource* CreateWindowCapture(void* handle, VideoCapMode mode = WGC,
                                               VideoScaleStrategy strategy = VideoScaleStrategy::SCALE_FIT_V0) = 0;
-#endif
     virtual IVideoSource* CreateLocalFileCapture(int index, const std::string& filePath, bool loopPlay = false) = 0;
 
     virtual int AddAudioSource(IAudioSource* source) = 0;

@@ -13,6 +13,7 @@
 #include "capture/Source.h"
 #include "core/Clock.h"
 #include "core/MediaTypes.h"
+#include "platform/windows/WinAudioCapture.h"
 
 extern "C"
 {
@@ -33,7 +34,13 @@ struct Options
     int abitrate = 128000;
     int seconds = 10;
     bool audio = true;
+    bool speaker = false;     // 同时采集扬声器（WASAPI loopback）
     bool fakeVideo = false;   // 用人造帧代替屏幕采集（排查用）
+    int monitor = 0;          // 显示器序号（0 = 主显示器）
+    std::string mode = "dxgi";  // dxgi | gdi
+    uint64_t window = 0;      // 窗口句柄（16 进制），非 0 时采集该窗口
+    bool noBorder = false;    // 窗口采集只取客户区（WGC_No_TBar）
+    bool listAudio = false;   // 列出系统麦克风/扬声器设备
 };
 
 // 测试用视频源：生成 NV12 测试图案，用于隔离"采集侧"与"编码/封装侧"问题
@@ -98,7 +105,13 @@ void PrintUsage()
            "  --fps <n>        默认 30\n"
            "  --bitrate <bps>  默认 3000000\n"
            "  --seconds <n>    运行时长（秒），默认 10\n"
-           "  --no-audio       关闭音频\n");
+           "  --no-audio       关闭音频（纯视频）\n"
+           "  --speaker        同时采集扬声器（WASAPI loopback）\n"
+           "  --monitor <n>    显示器序号，默认 0\n"
+           "  --mode <dxgi|gdi>  屏幕采集方式，默认 dxgi（不可用时自动回落 gdi）\n"
+           "  --window <hwnd>  采集指定窗口（16 进制句柄），不给则采集屏幕\n"
+           "  --no-border      窗口采集只取客户区\n"
+           "  --list-audio     列出系统麦克风/扬声器设备后退出\n");
 }
 
 Options ParseArgs(int argc, char** argv)
@@ -112,6 +125,18 @@ Options ParseArgs(int argc, char** argv)
         }
         if (key == "--fake-video") {
             opt.fakeVideo = true;
+            continue;
+        }
+        if (key == "--speaker") {
+            opt.speaker = true;
+            continue;
+        }
+        if (key == "--no-border") {
+            opt.noBorder = true;
+            continue;
+        }
+        if (key == "--list-audio") {
+            opt.listAudio = true;
             continue;
         }
         if (i + 1 >= argc) {
@@ -135,6 +160,12 @@ Options ParseArgs(int argc, char** argv)
             opt.bitrate = std::stoi(value);
         } else if (key == "--seconds") {
             opt.seconds = std::stoi(value);
+        } else if (key == "--monitor") {
+            opt.monitor = std::stoi(value);
+        } else if (key == "--mode") {
+            opt.mode = value;
+        } else if (key == "--window") {
+            opt.window = std::stoull(value, nullptr, 16);
         } else if (key == "--no-audio") {
             opt.audio = false;
         }
@@ -164,14 +195,38 @@ int main(int argc, char** argv)
     }
     static_assert(std::is_same_v<decltype(capturer), TGCapture::ITGCapturer*>);
 
-    // 视频源：屏幕采集（--fake-video 时用人造帧）
+    // --list-audio：列出系统音频设备后退出（不采集）
+    if (opt.listAudio) {
+        printf("麦克风设备:\n");
+        for (const auto& d : TGCapture::platform::ListAudioDevices(true)) {
+            wprintf(L"  %ls %ls\n", d.isDefault ? L"[默认]" : L"      ", d.id.c_str());
+        }
+        printf("扬声器设备:\n");
+        for (const auto& d : TGCapture::platform::ListAudioDevices(false)) {
+            wprintf(L"  %ls %ls\n", d.isDefault ? L"[默认]" : L"      ", d.id.c_str());
+        }
+        TGCapture::ITGCapturer::Destroy(capturer);
+        TGCapture::ITGCapturerMgr::UnInit();
+        return 0;
+    }
+
+    // 视频源：屏幕 / 窗口（--fake-video 时用人造帧）
     TGCapture::IVideoSource* video = nullptr;
     std::shared_ptr<FakeVideoSource> fake;
     if (opt.fakeVideo) {
         fake = std::make_shared<FakeVideoSource>();
         video = fake.get();
+    } else if (opt.window != 0) {
+        if (!capturer->IsSupported(TGCapture::CaptureFeature::Window)) {
+            printf("当前平台不支持窗口采集\n");
+            TGCapture::ITGCapturer::Destroy(capturer);
+            return -2;
+        }
+        video = capturer->CreateWindowCapture(reinterpret_cast<void*>(opt.window),
+                                              opt.noBorder ? TGCapture::WGC_No_TBar : TGCapture::WGC);
     } else {
-        video = capturer->CreateScreenCapture(0, TGCapture::DXGI);
+        video = capturer->CreateScreenCapture(opt.monitor,
+                                              opt.mode == "gdi" ? TGCapture::GDI : TGCapture::DXGI);
     }
     if (!video || capturer->AddVideoSource(video) != 0) {
         printf("添加视频源失败\n");
@@ -179,9 +234,12 @@ int main(int argc, char** argv)
         return -2;
     }
 
-    // 音频源：麦克风
+    // 音频源：系统麦克风（+ 可选的扬声器 loopback，两路会自动混音）
     if (opt.audio) {
-        capturer->EnableMicrophoneCapture(false);
+        capturer->EnableMicrophoneCapture();
+    }
+    if (opt.speaker) {
+        capturer->EnableSpeakerCapture();
     }
 
     TGCapture::VideoEncoderParams vParams;

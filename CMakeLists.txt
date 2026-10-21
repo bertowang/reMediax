@@ -77,18 +77,32 @@ set(TG_PLATFORM_SOURCES "")
 set(TG_PLATFORM_LIBS "")
 
 if(TG_PLATFORM STREQUAL "windows")
+    # 屏幕：DXGI Desktop Duplication（d3d11/dxgi）+ GDI 兜底；窗口：GetWindowDC/PrintWindow
+    # 音频：WASAPI（麦克风 + 扬声器 loopback）
     list(APPEND TG_PLATFORM_SOURCES
         src/platform/windows/WinScreenCapture.cpp
         src/platform/windows/WinAudioCapture.cpp)
     list(APPEND TG_PLATFORM_LIBS
         winmm ole32 user32 gdi32 dsound
+        d3d11 dxgi
         ws2_32 secur32 crypt32 advapi32 bcrypt mfplat mfuuid strmiids vfw32)
 elseif(TG_PLATFORM STREQUAL "android")
+    # 屏幕：MediaProjection；音频：AudioRecord / AudioPlaybackCapture（经 JNI 桥接）
+    list(APPEND TG_PLATFORM_SOURCES
+        src/platform/android/AndroidJni.cpp
+        src/platform/android/AndroidScreenCapture.cpp
+        src/platform/android/AndroidAudioCapture.cpp)
     list(APPEND TG_PLATFORM_LIBS mediandk EGL GLESv3 log android)
 elseif(TG_PLATFORM STREQUAL "ios")
+    enable_language(OBJCXX)
+    # 屏幕：ReplayKit；音频：AVAudioSession + AVAudioEngine（.mm）
+    list(APPEND TG_PLATFORM_SOURCES
+        src/platform/ios/IOSScreenCapture.mm
+        src/platform/ios/IOSAudioCapture.mm)
     list(APPEND TG_PLATFORM_LIBS
         "-framework CoreFoundation" "-framework CoreVideo" "-framework CoreMedia"
-        "-framework VideoToolbox" "-framework AudioToolbox" "-framework AVFoundation")
+        "-framework VideoToolbox" "-framework AudioToolbox" "-framework AVFoundation"
+        "-framework ReplayKit" "-framework UIKit")
 endif()
 
 add_library(tgcapture STATIC ${TG_CORE_SOURCES} ${TG_PLATFORM_SOURCES})

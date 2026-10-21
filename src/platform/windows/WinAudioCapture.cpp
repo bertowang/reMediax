@@ -25,6 +25,66 @@ const IID IID_IAudioCaptureClient = {
     0xC8ADBD64, 0xE71E, 0x48a0, {0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17}};
 }  // namespace
 
+// WASAPI 端点枚举：返回当前可用的麦克风(capture=true) / 扬声器(capture=false) 设备
+std::vector<AudioDeviceInfo> ListAudioDevices(bool capture)
+{
+    std::vector<AudioDeviceInfo> devices;
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool needUninit = SUCCEEDED(hr);
+
+    IMMDeviceEnumerator* enumerator = nullptr;
+    hr = CoCreateInstance(CLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL, IID_IMMDeviceEnumerator,
+                          reinterpret_cast<void**>(&enumerator));
+    if (FAILED(hr) || !enumerator) {
+        if (needUninit) {
+            CoUninitialize();
+        }
+        return devices;
+    }
+
+    // 默认设备 id（用于打 isDefault 标记）
+    std::wstring defaultId;
+    IMMDevice* defaultDevice = nullptr;
+    if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(capture ? eCapture : eRender, eConsole, &defaultDevice))
+        && defaultDevice) {
+        LPWSTR id = nullptr;
+        if (SUCCEEDED(defaultDevice->GetId(&id)) && id) {
+            defaultId = id;
+            CoTaskMemFree(id);
+        }
+        defaultDevice->Release();
+    }
+
+    IMMDeviceCollection* collection = nullptr;
+    if (SUCCEEDED(enumerator->EnumAudioEndpoints(capture ? eCapture : eRender, DEVICE_STATE_ACTIVE, &collection))
+        && collection) {
+        UINT count = 0;
+        collection->GetCount(&count);
+        for (UINT i = 0; i < count; ++i) {
+            IMMDevice* device = nullptr;
+            if (FAILED(collection->Item(i, &device)) || !device) {
+                continue;
+            }
+            LPWSTR id = nullptr;
+            if (SUCCEEDED(device->GetId(&id)) && id) {
+                AudioDeviceInfo info;
+                info.id = id;
+                info.name = id;   // 端点 id 已包含设备标识，调用方按 id 选择
+                info.isDefault = (defaultId == info.id);
+                devices.push_back(std::move(info));
+                CoTaskMemFree(id);
+            }
+            device->Release();
+        }
+        collection->Release();
+    }
+    enumerator->Release();
+    if (needUninit) {
+        CoUninitialize();
+    }
+    return devices;
+}
+
 WinAudioCapture::WinAudioCapture(AudioCapSourceType type, bool loopback)
     : capture::AudioSourceBase(type), m_loopback(loopback)
 {
@@ -60,7 +120,16 @@ bool WinAudioCapture::InitWASAPI()
     }
 
     const EDataFlow flow = m_loopback ? eRender : eCapture;
-    hr = enumerator->GetDefaultAudioEndpoint(flow, eConsole, &m_device);
+    if (!m_deviceId.empty()) {
+        // 指定端点（ListAudioDevices 取到的 id）
+        hr = enumerator->GetDevice(m_deviceId.c_str(), &m_device);
+        if (FAILED(hr) || !m_device) {
+            TG_LOGW("WinAudioCapture: 指定设备不可用，回落默认设备");
+            hr = enumerator->GetDefaultAudioEndpoint(flow, eConsole, &m_device);
+        }
+    } else {
+        hr = enumerator->GetDefaultAudioEndpoint(flow, eConsole, &m_device);
+    }
     enumerator->Release();
     if (FAILED(hr) || !m_device) {
         return false;
