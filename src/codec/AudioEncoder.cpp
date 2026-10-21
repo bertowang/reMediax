@@ -54,7 +54,9 @@ int AudioEncoder::Open(const AudioEncoderParams& params, const core::AudioMediaT
     av_channel_layout_default(&m_ctx->ch_layout, channels);
     m_ctx->sample_fmt = codec->sample_fmts ? codec->sample_fmts[0] : AV_SAMPLE_FMT_S16;
     m_ctx->bit_rate = params.aBitrate > 0 ? params.aBitrate : 128000;
-    m_ctx->time_base = AVRational{1, m_ctx->sample_rate};
+    // 全链路统一微秒时间基：PTS 一律由混流器给的 ptsUs 换算，
+    // 不能用"采样数"当 PTS（封装侧按 1/1000000 解释，单位不一致会让文件时间轴错乱）
+    m_ctx->time_base = AVRational{1, 1000000};
     m_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
     if (avcodec_open2(m_ctx, codec, nullptr) < 0) {
@@ -151,8 +153,10 @@ int AudioEncoder::EncodeOne(const core::FramePtr& frame)
             memcpy(avFrame->data[0], chunk, static_cast<size_t>(frameSize) * channels * sizeof(int16_t));
         }
 
-        avFrame->pts = m_nextPts;
-        m_nextPts += frameSize;
+        avFrame->pts = frame->ptsUs >= 0
+                           ? av_rescale_q(frame->ptsUs, AVRational{1, 1000000}, m_ctx->time_base)
+                           : m_nextPts;
+        m_nextPts += frameSize;   // 仅在没有 ptsUs 时兜底（外部注入未带时间戳）
 
         ret = avcodec_send_frame(m_ctx, avFrame.get());
         if (ret < 0) {
@@ -167,11 +171,7 @@ int AudioEncoder::EncodeOne(const core::FramePtr& frame)
             if (ret < 0) {
                 return -5;
             }
-            // 音频作为主时钟：用输出包的 PTS 推进同步时钟
-            if (m_sync && packet->pts != AV_NOPTS_VALUE) {
-                const int64_t us = av_rescale_q(packet->pts, m_ctx->time_base, AVRational{1, 1000000});
-                m_sync->UpdateAudioClock(us);
-            }
+            // 音频主时钟由 TGCapturer 的混流器推进（见 TGCapturer::MixLoop），这里不再重复更新
             DeliverPacket(std::move(packet));
         }
 

@@ -37,6 +37,14 @@ public:
     // 当前实际使用的采集路径（Open 之后有效），便于排查"为什么没走 DXGI"
     VideoCapMode ActiveMode() const noexcept { return m_activeMode; }
 
+    // GPU 模式：帧留在显存（ID3D11Texture2D），不再 GPU→CPU 回读、不再分配系统内存位图
+    void SetGpuMode(bool gpu) noexcept { m_gpuMode = gpu; }
+    [[nodiscard]] bool GpuMode() const noexcept { return m_gpuMode; }
+    // 建好 D3D11 设备与桌面复制通道并返回设备（幂等）。
+    // 编码器要用同一个设备，才能在显存内直拷（跨设备无法 CopyResource）。
+    void* EnsureD3D11Device();
+    [[nodiscard]] void* D3D11Device() const noexcept { return m_device; }
+
 protected:
     void Loop(std::stop_token token) override;
 
@@ -45,6 +53,9 @@ private:
     bool InitDXGI(int width, int height);
     void ReleaseDXGI();
     bool GrabDXGI(std::shared_ptr<uint8_t>& bgra, int& width, int& height);
+    bool AcquireDesktopTexture();                 // 取一帧桌面纹理到 m_desktopTex（GPU 路径用）
+    bool GrabGpu(ID3D11Texture2D** tex, std::shared_ptr<void>& owner, int& width, int& height);
+    std::shared_ptr<void> MakeTextureOwner(ID3D11Texture2D* tex);
     bool GrabGDI(std::shared_ptr<uint8_t>& bgra, int& width, int& height);
     bool GrabBGRA(std::shared_ptr<uint8_t>& bgra, int& width, int& height);
     void ConvertToNV12(const uint8_t* bgra, int width, int height, core::FramePtr& out);
@@ -76,6 +87,12 @@ private:
     std::shared_ptr<uint8_t> m_lastBgra;
     int m_lastWidth = 0;
     int m_lastHeight = 0;
+
+    bool m_gpuMode = false;
+    ID3D11Texture2D* m_lastTex = nullptr;   // 采集自留的一张纹理（GPU 路径：桌面静止时复用）
+    bool m_lastTexDirty = true;             // 自留纹理是否需要用新帧刷新
+    struct GpuTexturePool;
+    std::shared_ptr<GpuTexturePool> m_gpuPool;
 
     int m_grabFail = 0;
     int m_frameCount = 0;

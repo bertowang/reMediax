@@ -41,6 +41,7 @@ struct Options
     uint64_t window = 0;      // 窗口句柄（16 进制），非 0 时采集该窗口
     bool noBorder = false;    // 窗口采集只取客户区（WGC_No_TBar）
     bool listAudio = false;   // 列出系统麦克风/扬声器设备
+    std::string perf = "cpu"; // cpu | gpu（全链路 GPU：采集帧不出显存）
 };
 
 // 测试用视频源：生成 NV12 测试图案，用于隔离"采集侧"与"编码/封装侧"问题
@@ -106,12 +107,15 @@ void PrintUsage()
            "  --bitrate <bps>  默认 3000000\n"
            "  --seconds <n>    运行时长（秒），默认 10\n"
            "  --no-audio       关闭音频（纯视频）\n"
+           "  --fake-video     用人造帧代替采集（不依赖设备，排查编码/封装链路）\n"
            "  --speaker        同时采集扬声器（WASAPI loopback）\n"
            "  --monitor <n>    显示器序号，默认 0\n"
            "  --mode <dxgi|gdi>  屏幕采集方式，默认 dxgi（不可用时自动回落 gdi）\n"
            "  --window <hwnd>  采集指定窗口（16 进制句柄），不给则采集屏幕\n"
            "  --no-border      窗口采集只取客户区\n"
-           "  --list-audio     列出系统麦克风/扬声器设备后退出\n");
+           "  --list-audio     列出系统麦克风/扬声器设备后退出\n"
+           "  --perf <cpu|gpu> 性能模式，默认 cpu；gpu = 全链路 GPU（采集帧不出显存，需硬编）\n"
+           "  --gpu            等价 --perf gpu\n");
 }
 
 Options ParseArgs(int argc, char** argv)
@@ -137,6 +141,10 @@ Options ParseArgs(int argc, char** argv)
         }
         if (key == "--list-audio") {
             opt.listAudio = true;
+            continue;
+        }
+        if (key == "--gpu") {
+            opt.perf = "gpu";
             continue;
         }
         if (i + 1 >= argc) {
@@ -166,6 +174,8 @@ Options ParseArgs(int argc, char** argv)
             opt.mode = value;
         } else if (key == "--window") {
             opt.window = std::stoull(value, nullptr, 16);
+        } else if (key == "--perf") {
+            opt.perf = value;
         } else if (key == "--no-audio") {
             opt.audio = false;
         }
@@ -250,6 +260,14 @@ int main(int argc, char** argv)
     vParams.gop = opt.fps * 2;
     vParams.vCodec = opt.vcodec;
     vParams.vEncoderType = (opt.vcodec == "h264_nvenc") ? TGCapture::h264_nvenc : TGCapture::libopenh264;
+    // 性能模式：gpu = 采集帧留在显存直送硬编（自动选择编码器时同样生效）
+    vParams.perfMode = (opt.perf == "gpu") ? TGCapture::PerformanceMode::Gpu : TGCapture::PerformanceMode::Cpu;
+    if (vParams.perfMode == TGCapture::PerformanceMode::Gpu && opt.vcodec == "libopenh264") {
+        printf("[demo] GPU 模式需要硬编，自动改用 h264_nvenc\n");
+        vParams.vCodec = "h264_nvenc";
+        vParams.vEncoderType = TGCapture::h264_nvenc;
+    }
+    printf("[demo] 性能模式: %s  编码器: %s\n", opt.perf.c_str(), vParams.vCodec.c_str());
     capturer->SetupVideoEncoder(vParams);
 
     TGCapture::AudioEncoderParams aParams;

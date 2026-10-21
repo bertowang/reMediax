@@ -70,6 +70,8 @@ set(TG_CORE_SOURCES
     src/TGCapturer.cpp
     src/codec/VideoEncoder.cpp
     src/codec/AudioEncoder.cpp
+    src/core/AVSyncClock.cpp
+    src/core/AudioMixer.cpp
     src/mux/Muxer.cpp
 )
 

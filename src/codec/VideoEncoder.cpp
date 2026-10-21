@@ -6,10 +6,17 @@
 #include "core/Logger.h"
 #include "mux/Muxer.h"
 
+#ifdef _WIN32
+#include <d3d11.h>
+#endif
+
 extern "C"
 {
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+#ifdef _WIN32
+#include <libavutil/hwcontext_d3d11va.h>
+#endif
 }
 
 namespace TGCapture::codec
@@ -30,6 +37,12 @@ AVPixelFormat HwInputFormat(const std::string& name)
         return AV_PIX_FMT_MEDIACODEC;
     }
     return AV_PIX_FMT_NONE;
+}
+
+// 编码器是否接受 BGRA 硬件帧（决定 D3D11 帧池的 sw_format，避免多余的格式转换）
+bool CodecAcceptsBgra(const std::string& name)
+{
+    return name == "h264_nvenc" || name == "hevc_nvenc";
 }
 
 AVHWDeviceType HwDeviceType(AVPixelFormat fmt)
@@ -93,10 +106,13 @@ int VideoEncoder::Open(const VideoEncoderParams& params, const core::VideoMediaT
     m_ctx->thread_count = params.threads > 0 ? params.threads : 4;
     m_ctx->pix_fmt = AV_PIX_FMT_NONE;
 
-    AVPixelFormat hwFmt = HwInputFormat(m_codecName);
-    if (hwFmt != AV_PIX_FMT_NONE && InitHardwareContext(hwFmt)) {
+    // GPU 模式：采集帧留在显存，直接喂硬编（CPU 不做像素搬运）
+    // CPU 模式：一律走系统内存帧（NV12），保留既有链路
+    AVPixelFormat hwFmt = (m_perfMode == PerformanceMode::Gpu) ? HwInputFormat(m_codecName) : AV_PIX_FMT_NONE;
+    if (hwFmt != AV_PIX_FMT_NONE && InitHardwareContext(hwFmt) && InitHardwareFrames(hwFmt)) {
         m_ctx->pix_fmt = hwFmt;
         m_useHwFrame = true;
+        TG_LOGI("VideoEncoder: GPU 链路就绪（硬件帧直通，pix_fmt=%d）", static_cast<int>(hwFmt));
     } else {
         // 软编或硬编降级：优先 NV12（硬编友好），否则 YUV420P
         m_ctx->pix_fmt = AV_PIX_FMT_NV12;
@@ -107,8 +123,12 @@ int VideoEncoder::Open(const VideoEncoderParams& params, const core::VideoMediaT
     }
 
     // 低延迟/实时参数
-    av_opt_set(m_ctx->priv_data, "preset", m_useHwFrame ? "p1" : "veryfast", 0);
-    av_opt_set(m_ctx->priv_data, "tune", "zerolatency", 0);
+    const bool isNvenc = m_codecName.find("nvenc") != std::string::npos;
+    av_opt_set(m_ctx->priv_data, "preset", isNvenc ? "p1" : "veryfast", 0);
+    // nvenc 没有 tune 选项，强行设置会打 "Unable to parse option value" 告警
+    if (!isNvenc) {
+        av_opt_set(m_ctx->priv_data, "tune", "zerolatency", 0);
+    }
     av_opt_set(m_ctx->priv_data, "rc", "cbr", 0);
     if (!params.vExtParams.empty()) {
         av_opt_set(m_ctx->priv_data, "x264-params", params.vExtParams.c_str(), 0);
@@ -140,8 +160,31 @@ bool VideoEncoder::InitHardwareContext(AVPixelFormat srcFmt)
     if (type == AV_HWDEVICE_TYPE_NONE) {
         return false;
     }
-    if (av_hwdevice_ctx_create(&m_hwDeviceCtx, type, nullptr, nullptr, 0) < 0) {
-        TG_LOGW("VideoEncoder: hwdevice 创建失败，回退软编路径");
+
+#ifdef _WIN32
+    // Windows GPU 链路：复用采集侧的 D3D11 设备，这样采集纹理可以只在显存里拷贝，
+    // 既不需要 GPU→CPU 回读，也不会出现跨设备纹理无法 CopyResource 的问题。
+    if (type == AV_HWDEVICE_TYPE_D3D11VA && m_externalDevice) {
+        auto* device = static_cast<ID3D11Device*>(m_externalDevice);
+        m_hwDeviceCtx = av_hwdevice_ctx_alloc(type);
+        if (m_hwDeviceCtx) {
+            auto* deviceCtx = reinterpret_cast<AVHWDeviceContext*>(m_hwDeviceCtx->data);
+            auto* d3d11Ctx = static_cast<AVD3D11VADeviceContext*>(deviceCtx->hwctx);
+            d3d11Ctx->device = device;
+            device->AddRef();
+            device->GetImmediateContext(&d3d11Ctx->device_context);
+            m_d3dContext = d3d11Ctx->device_context;
+            if (av_hwdevice_ctx_init(m_hwDeviceCtx) < 0) {
+                TG_LOGW("VideoEncoder: 复用采集 D3D11 设备失败，改用独立设备");
+                av_buffer_unref(&m_hwDeviceCtx);
+                m_d3dContext = nullptr;
+            }
+        }
+    }
+#endif
+
+    if (!m_hwDeviceCtx && av_hwdevice_ctx_create(&m_hwDeviceCtx, type, nullptr, nullptr, 0) < 0) {
+        TG_LOGW("VideoEncoder: hwdevice 创建失败，回退 CPU 路径");
         m_hwDeviceCtx = nullptr;
         return false;
     }
@@ -149,6 +192,58 @@ bool VideoEncoder::InitHardwareContext(AVPixelFormat srcFmt)
     TG_LOGI("VideoEncoder: 硬件上下文就绪 type=%d", static_cast<int>(type));
     return true;
 }
+
+bool VideoEncoder::InitHardwareFrames(AVPixelFormat hwFmt)
+{
+    if (!m_hwDeviceCtx) {
+        return false;
+    }
+    AVBufferRef* frames = av_hwframe_ctx_alloc(m_hwDeviceCtx);
+    if (!frames) {
+        return false;
+    }
+    auto* framesCtx = reinterpret_cast<AVHWFramesContext*>(frames->data);
+    framesCtx->format = hwFmt;
+    // D3D11 链路：采集纹理是 BGRA，硬件帧也按 BGRA 分配，显存内 CopySubresourceRegion 才能直拷；
+    // 若编码器不接受 BGRA（如 AMF 只吃 nv12），则按 NV12 分配，由采集侧转好格式再拷。
+    framesCtx->sw_format = (hwFmt == AV_PIX_FMT_D3D11 && m_ctx->pix_fmt != AV_PIX_FMT_NV12 &&
+                            CodecAcceptsBgra(m_codecName))
+                               ? AV_PIX_FMT_BGRA
+                               : AV_PIX_FMT_NV12;
+    framesCtx->width = m_ctx->width;
+    framesCtx->height = m_ctx->height;
+    framesCtx->initial_pool_size = 16;
+
+    if (av_hwframe_ctx_init(frames) < 0) {
+        TG_LOGW("VideoEncoder: hw_frames_ctx 初始化失败，回退 CPU 路径");
+        av_buffer_unref(&frames);
+        return false;
+    }
+    m_hwFramesCtx = frames;
+    m_ctx->hw_frames_ctx = av_buffer_ref(frames);
+    TG_LOGI("VideoEncoder: 硬件帧池就绪 fmt=%d sw=%d %dx%d",
+            static_cast<int>(framesCtx->format), static_cast<int>(framesCtx->sw_format),
+            framesCtx->width, framesCtx->height);
+    return true;
+}
+
+#ifdef _WIN32
+bool VideoEncoder::CopyFromD3D11Texture(const core::FramePtr& frame, AVFrame* dst)
+{
+    if (!dst || !m_d3dContext || !frame || !frame->hwHandle) {
+        return false;
+    }
+    auto* src = static_cast<ID3D11Texture2D*>(frame->hwHandle);
+    auto* dstTex = reinterpret_cast<ID3D11Texture2D*>(dst->data[0]);
+    if (!dstTex) {
+        return false;
+    }
+    const UINT subResource = static_cast<UINT>(reinterpret_cast<uintptr_t>(dst->data[1]));
+    // 纯显存拷贝：无 CPU 回读、无像素搬运
+    m_d3dContext->CopySubresourceRegion(dstTex, subResource, 0, 0, 0, src, 0, nullptr);
+    return true;
+}
+#endif
 
 void VideoEncoder::Close()
 {
@@ -223,6 +318,14 @@ int VideoEncoder::EncodeOne(const core::FramePtr& frame)
             m_dropped.fetch_add(1);
             return 0;
         }
+    }
+    // PTS 回退保护：dts 必须单调递增，否则 flv/ts 封装会直接报错写不出文件
+    if (frame->ptsUs >= 0 && frame->ptsUs <= m_lastPtsUs) {
+        m_dropped.fetch_add(1);
+        return 0;
+    }
+    if (frame->ptsUs >= 0) {
+        m_lastPtsUs = frame->ptsUs;
     }
 
     const uint64_t frameNo = m_encoded.load();
@@ -303,20 +406,39 @@ core::AVFramePtr VideoEncoder::BuildAVFrame(const core::FramePtr& frame)
                        : AV_NOPTS_VALUE;
     avFrame->pkt_dts = AV_NOPTS_VALUE;
 
-    // 零拷贝：硬件帧直接引用采集侧句柄
+    // ---- 硬件直连（GPU 模式）----
     if (m_useHwFrame && frame->hwHandle != nullptr) {
-        // 由平台实现把 native handle 填入 AVFrame 的 data[3]/hw_frames_ctx
-        avFrame->format = m_ctx->pix_fmt;
-        avFrame->hw_frames_ctx = m_hwFramesCtx ? av_buffer_ref(m_hwFramesCtx) : nullptr;
-        // 约定：data[3] 存放 native handle 指针（与 ffmpeg 的 d3d11/videotoolbox 用法一致）
-        avFrame->data[3] = reinterpret_cast<uint8_t*>(frame->hwHandle);
-        avFrame->buf[0] = nullptr;
-        if (!avFrame->hw_frames_ctx) {
-            TG_LOGW("VideoEncoder: 缺少 hw_frames_ctx，回退系统内存帧");
-            m_useHwFrame = false;
-        } else {
+#ifdef _WIN32
+        // Windows：D3D11 纹理。从帧池取一个硬件帧，把采集纹理在显存里拷进去（无 CPU 回读）
+        if (m_ctx->pix_fmt == AV_PIX_FMT_D3D11 && m_hwFramesCtx &&
+            frame->hwKind == core::HwKind::D3D11Texture) {
+            if (av_hwframe_get_buffer(m_hwFramesCtx, avFrame.get(), 0) < 0) {
+                TG_LOGW("VideoEncoder: 硬件帧分配失败，本帧走系统内存");
+            } else if (!CopyFromD3D11Texture(frame, avFrame.get())) {
+                TG_LOGW("VideoEncoder: 显存拷贝失败，本帧走系统内存");
+            } else {
+                return avFrame;
+            }
+        }
+#endif
+        // iOS VideoToolbox / Android MediaCodec：data[3] 存 native handle（零拷贝直通）
+        if (m_ctx->pix_fmt == AV_PIX_FMT_VIDEOTOOLBOX &&
+            frame->hwKind == core::HwKind::CVPixelBuffer) {
+            avFrame->format = m_ctx->pix_fmt;
+            avFrame->data[3] = reinterpret_cast<uint8_t*>(frame->hwHandle);
+            avFrame->buf[0] = nullptr;
             return avFrame;
         }
+        if (m_ctx->hw_frames_ctx) {
+            avFrame->hw_frames_ctx = av_buffer_ref(m_ctx->hw_frames_ctx);
+        }
+        if (avFrame->hw_frames_ctx) {
+            avFrame->format = m_ctx->pix_fmt;
+            avFrame->data[3] = reinterpret_cast<uint8_t*>(frame->hwHandle);
+            avFrame->buf[0] = nullptr;
+            return avFrame;
+        }
+        TG_LOGW("VideoEncoder: 硬件帧不可用，本帧走系统内存");
     }
 
     // 系统内存帧：经 sws_scale 归一到编码器的尺寸与像素格式

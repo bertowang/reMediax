@@ -219,21 +219,7 @@ void WinAudioCapture::ReleaseWASAPI()
 void WinAudioCapture::Loop(std::stop_token token)
 {
     if (!m_captureClient) {
-        // 兜底：产生静音，保证下游时钟推进
-        const int frames = m_sampleRate / 100;  // 10ms
-        while (!token.stop_requested()) {
-            auto frame = std::make_shared<core::Frame>();
-            frame->kind = core::MediaKind::Audio;
-            frame->sampleRate = m_sampleRate;
-            frame->channels = m_channels;
-            frame->sampleFmt = AV_SAMPLE_FMT_S16;
-            frame->nbSamples = frames;
-            frame->audioBytes = static_cast<size_t>(frames) * m_channels * sizeof(int16_t);
-            frame->audioData = std::shared_ptr<uint8_t>(new uint8_t[frame->audioBytes](), std::default_delete<uint8_t[]>());
-            frame->ptsUs = core::MonotonicClock::NowUs();
-            Emit(std::move(frame));
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
+        SilenceLoop(token);
         return;
     }
 
@@ -241,6 +227,8 @@ void WinAudioCapture::Loop(std::stop_token token)
         UINT32 packetLength = 0;
         HRESULT hr = m_captureClient->GetNextPacketSize(&packetLength);
         if (FAILED(hr)) {
+            // 设备被拔掉/独占/失效：不能让音频时间轴断掉，转静音兜底
+            TG_LOGW("WinAudioCapture: 采集失败 hr=0x%08X，转静音兜底", static_cast<unsigned>(hr));
             break;
         }
         if (packetLength == 0) {
@@ -255,6 +243,7 @@ void WinAudioCapture::Loop(std::stop_token token)
         UINT64 qpcPosition = 0;
         hr = m_captureClient->GetBuffer(&data, &framesAvailable, &flags, &devicePosition, &qpcPosition);
         if (FAILED(hr)) {
+            TG_LOGW("WinAudioCapture: GetBuffer 失败 hr=0x%08X，转静音兜底", static_cast<unsigned>(hr));
             break;
         }
 
@@ -271,6 +260,29 @@ void WinAudioCapture::Loop(std::stop_token token)
             }
         }
         m_captureClient->ReleaseBuffer(framesAvailable);
+    }
+
+    SilenceLoop(token);
+}
+
+// 设备不可用/无数据时持续出静音：保证音频时间轴连续，
+// 否则视频会因为"音频停滞"被 clamp，封装也会卡在交织等待上。
+void WinAudioCapture::SilenceLoop(std::stop_token token)
+{
+    const int frames = m_sampleRate > 0 ? m_sampleRate / 100 : 441;   // 10ms
+    const size_t bytes = static_cast<size_t>(frames) * static_cast<size_t>(m_channels) * sizeof(int16_t);
+    while (!token.stop_requested()) {
+        auto frame = std::make_shared<core::Frame>();
+        frame->kind = core::MediaKind::Audio;
+        frame->sampleRate = m_sampleRate;
+        frame->channels = m_channels;
+        frame->sampleFmt = AV_SAMPLE_FMT_S16;
+        frame->nbSamples = frames;
+        frame->audioBytes = bytes;
+        frame->audioData = std::shared_ptr<uint8_t>(new uint8_t[bytes](), std::default_delete<uint8_t[]>());
+        frame->ptsUs = core::MonotonicClock::NowUs();
+        Emit(std::move(frame));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 }
 

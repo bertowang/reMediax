@@ -12,6 +12,12 @@ extern "C"
 namespace TGCapture
 {
 
+namespace
+{
+// 还没写出过任何包时的哨兵值
+constexpr int64_t kNoPts = INT64_MIN / 4;
+}  // namespace
+
 Muxer::Muxer(size_t queueCapacity)
     : core::Worker("muxer"),
       m_videoQueue(std::make_unique<core::BoundedQueue<core::AVPacketPtr>>(queueCapacity, core::DropPolicy::DropOldest)),
@@ -31,6 +37,9 @@ int Muxer::Open(const MuxerParams& params, AVCodecContext* videoCtx, AVCodecCont
         return 0;
     }
     avformat_network_init();
+
+    m_lastVideoPtsUs.store(kNoPts);
+    m_lastAudioPtsUs.store(kNoPts);
 
     m_url = params.muxerOutput;
     m_format = params.muxer.empty() ? "flv" : params.muxer;
@@ -109,6 +118,7 @@ void Muxer::SubmitVideoPacket(core::AVPacketPtr packet)
     if (!m_opened.load() || !packet) {
         return;
     }
+    m_lastVideoArrivalUs.store(core::MonotonicClock::NowUs());
     m_videoQueue->Push(std::move(packet));
 }
 
@@ -117,6 +127,7 @@ void Muxer::SubmitAudioPacket(core::AVPacketPtr packet)
     if (!m_opened.load() || !packet) {
         return;
     }
+    m_lastAudioArrivalUs.store(core::MonotonicClock::NowUs());
     m_audioQueue->Push(std::move(packet));
 }
 
@@ -133,14 +144,48 @@ size_t Muxer::AudioPending() const
 void Muxer::Loop(std::stop_token token)
 {
     while (!token.stop_requested()) {
-        // 音频优先（主时钟），再处理视频，保证交织平稳
-        if (auto packet = m_audioQueue->TryPop(std::chrono::milliseconds(10))) {
-            WriteOne(std::move(*packet), false);
-            continue;
+        // 交织控制：哪一路领先太多就先不写它，等落后的一路追上（阈值默认 350ms）
+        const int64_t threshold = m_interleaveUs.load();
+        const int64_t lastV = m_lastVideoPtsUs.load();
+        const int64_t lastA = m_lastAudioPtsUs.load();
+        const bool videoTooFar = threshold > 0 && lastV != kNoPts && lastA != kNoPts && (lastV - lastA) > threshold;
+        const bool audioTooFar = threshold > 0 && lastV != kNoPts && lastA != kNoPts && (lastA - lastV) > threshold;
+
+        // 某一路不再产出时（设备失效、该路关闭、编码器卡住），不能让另一路永远等下去：
+        // 该路"超时未到包"就把它的基准往前推，保证封装继续出包（MediaX 的 BreakA/BreakV 自愈）
+        const int64_t nowUs = core::MonotonicClock::NowUs();
+        const int64_t stallUs = threshold > 0 ? (threshold * 3) : 0;
+        if (threshold > 0 && audioTooFar) {
+            const int64_t lastArrival = m_lastAudioArrivalUs.load();
+            if (m_audioQueue->Size() == 0 ||
+                (lastArrival > 0 && nowUs - lastArrival > stallUs)) {
+                m_lastAudioPtsUs.store(m_lastVideoPtsUs.load() - threshold / 2);
+                m_diagStallAudio.fetch_add(1);
+            }
         }
-        if (auto packet = m_videoQueue->TryPop(std::chrono::milliseconds(10))) {
-            WriteOne(std::move(*packet), true);
+        if (threshold > 0 && videoTooFar) {
+            const int64_t lastArrival = m_lastVideoArrivalUs.load();
+            if (m_videoQueue->Size() == 0 ||
+                (lastArrival > 0 && nowUs - lastArrival > stallUs)) {
+                m_lastVideoPtsUs.store(m_lastAudioPtsUs.load() - threshold / 2);
+                m_diagStallVideo.fetch_add(1);
+            }
         }
+
+        // 音频是主时钟，正常情况优先写
+        if (!videoTooFar) {
+            if (auto packet = m_audioQueue->TryPop(std::chrono::milliseconds(10))) {
+                WriteOne(std::move(*packet), false);
+                continue;
+            }
+        }
+        if (!audioTooFar || m_videoQueue->Size() == 0) {
+            if (auto packet = m_videoQueue->TryPop(std::chrono::milliseconds(10))) {
+                WriteOne(std::move(*packet), true);
+                continue;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     // 退出前尽量把剩余包写出
     while (auto packet = m_audioQueue->TryPop(std::chrono::milliseconds(1))) {
@@ -163,7 +208,16 @@ int Muxer::WriteOne(core::AVPacketPtr packet, bool isVideo)
     }
 
     packet->stream_index = stream->index;
+    // 交织基准用"统一微秒时间轴"上的 PTS（rescale 之前）
+    const int64_t ptsUs = packet->pts;
     av_packet_rescale_ts(packet.get(), AVRational{1, 1000000}, stream->time_base);
+    if (ptsUs != AV_NOPTS_VALUE) {
+        if (isVideo) {
+            m_lastVideoPtsUs.store(ptsUs);
+        } else {
+            m_lastAudioPtsUs.store(ptsUs);
+        }
+    }
 
     if (m_packets.load() < 3) {
         TG_LOGD("Muxer: 写包 stream=%d pts=%lld size=%d", stream->index,

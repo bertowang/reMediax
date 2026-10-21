@@ -23,6 +23,12 @@ extern "C"
 #include <libswscale/swscale.h>
 }
 
+#ifdef _WIN32
+struct ID3D11Device;
+struct ID3D11DeviceContext;
+struct ID3D11Texture2D;
+#endif
+
 namespace TGCapture
 {
 class Muxer;
@@ -43,6 +49,13 @@ public:
     void SetMuxer(Muxer* muxer) noexcept { m_muxer = muxer; }
     void SetSyncClock(std::shared_ptr<core::AVSync> sync) { m_sync = std::move(sync); }
     void SetMaxLagUs(int64_t us) noexcept { m_maxLagUs = us; }
+
+    // 性能模式：Gpu 时采集帧留在显存直送硬编；不可用时自动回落 Cpu
+    void SetPerformanceMode(PerformanceMode mode) noexcept { m_perfMode = mode; }
+    PerformanceMode GetPerformanceMode() const noexcept { return m_perfMode; }
+    // Windows：复用采集侧的 D3D11 设备（同设备才能做显存内拷贝，避免跨设备/回读）
+    void SetExternalDevice(void* device) noexcept { m_externalDevice = device; }
+    bool IsGpuPath() const noexcept { return m_useHwFrame && m_perfMode == PerformanceMode::Gpu; }
 
     // BusNode
     bool Submit(core::FramePtr frame) override;
@@ -69,6 +82,10 @@ private:
     // 把内部帧转成 AVFrame（系统内存或硬件直连）
     core::AVFramePtr BuildAVFrame(const core::FramePtr& frame);
     bool InitHardwareContext(AVPixelFormat srcFmt);
+    bool InitHardwareFrames(AVPixelFormat hwFmt);
+#ifdef _WIN32
+    bool CopyFromD3D11Texture(const core::FramePtr& frame, AVFrame* dst);
+#endif
     // 尺寸/像素格式归一：采集分辨率与编码器不一致时用 sws_scale 转换
     bool EnsureSwsContext(int srcWidth, int srcHeight, AVPixelFormat srcFmt);
 
@@ -84,6 +101,12 @@ private:
     AVPixelFormat m_swPixFmt = AV_PIX_FMT_NONE;
     bool m_useHwFrame = false;
 
+    PerformanceMode m_perfMode = PerformanceMode::Cpu;
+    void* m_externalDevice = nullptr;   // Windows: ID3D11Device*（采集侧设备）
+#ifdef _WIN32
+    ID3D11DeviceContext* m_d3dContext = nullptr;   // 采集设备的 context，用于显存内拷贝
+#endif
+
     core::VideoMediaType m_srcType;
     core::VideoMediaType m_dstType;
     int m_gop = 15;
@@ -96,6 +119,7 @@ private:
 
     std::atomic<uint64_t> m_encoded{0};
     std::atomic<uint64_t> m_dropped{0};
+    int64_t m_lastPtsUs = -1;   // 上一帧 PTS，用于 PTS 回退保护
     std::atomic_bool m_opened{false};
 };
 

@@ -36,6 +36,10 @@ public:
     [[nodiscard]] size_t AudioPending() const;
     [[nodiscard]] bool IsOpened() const noexcept { return m_opened.load(); }
 
+    // 音视频交织阈值（微秒）：领先的一方暂停写入，等落后的一方追上，0 = 关闭
+    void SetInterleaveUs(int64_t us) noexcept { m_interleaveUs.store(us > 0 ? us : 0); }
+    [[nodiscard]] int64_t InterleaveUs() const noexcept { return m_interleaveUs.load(); }
+
     [[nodiscard]] float TrafficBps() const;
     [[nodiscard]] uint64_t WrittenBytes() const noexcept { return m_bytes.load(); }
     [[nodiscard]] uint64_t WrittenPackets() const noexcept { return m_packets.load(); }
@@ -63,6 +67,15 @@ private:
     std::atomic<float> m_bps{0.0f};
     std::atomic_bool m_opened{false};
     std::atomic_bool m_headerWritten{false};
+
+    // 交织：记录两路各自最后写出的 PTS（微秒）
+    std::atomic<int64_t> m_lastVideoPtsUs{INT64_MIN / 4};
+    std::atomic<int64_t> m_lastAudioPtsUs{INT64_MIN / 4};
+    std::atomic<int64_t> m_lastVideoArrivalUs{0};
+    std::atomic<int64_t> m_lastAudioArrivalUs{0};
+    std::atomic<int64_t> m_interleaveUs{350000};
+    std::atomic<uint64_t> m_diagStallVideo{0};
+    std::atomic<uint64_t> m_diagStallAudio{0};
     int64_t m_lastStatUs = 0;
 };
 

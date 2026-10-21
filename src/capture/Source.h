@@ -34,6 +34,10 @@ public:
 
     [[nodiscard]] bool IsCapturing() const noexcept { return IsRunning(); }
 
+    // 采集实际输出的尺寸（Open 之后有效）
+    [[nodiscard]] int FrameWidth() const noexcept { return m_width; }
+    [[nodiscard]] int FrameHeight() const noexcept { return m_height; }
+
 protected:
     void Emit(core::FramePtr frame)
     {

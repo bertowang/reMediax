@@ -14,6 +14,8 @@
 #include "capture/Source.h"
 #include "codec/AudioEncoder.h"
 #include "codec/VideoEncoder.h"
+#include "core/AVSyncClock.h"
+#include "core/AudioMixer.h"
 #include "core/Bus.h"
 #include "core/Clock.h"
 #include "mux/Muxer.h"
@@ -83,16 +85,18 @@ private:
     };
 
     void OnVideoFrame(core::FramePtr frame);
+    // 外部注入的音频（PushExternalAudioFrame）也进混流器
     void OnAudioFrame(core::FramePtr frame);
     void FireError(int32_t what, int32_t extra, const std::string& msg);
     void FireNotify(NotifyMsgType type, const std::string& content, int64_t data);
     void ReleaseAll();
 
-    // 多路音频（麦克风 + 扬声器）混音：单路直接透传，多路由混音线程合并成一路
+    // 多路音频（麦克风 + 扬声器 …）：统一进 AudioMixer，由混音线程产出一路
     void OnAudioFrameFrom(capture::AudioSourceBase* source, core::FramePtr frame);
     void StartAudioMixer();
     void StopAudioMixer();
     void MixLoop(std::stop_token token);
+    int ChannelIdOf(capture::AudioSourceBase* source) const;
 
 private:
     GameID m_gameId = GameID::GAME_ID_DEFAULT;
@@ -115,12 +119,23 @@ private:
     capture::AudioSourceBase* m_audioSource = nullptr;  // 非拥有（首个/主要音频源）
     std::vector<capture::AudioSourceBase*> m_audioSources;   // 全部音频源（麦克风 + 扬声器）
 
-    std::mutex m_audioMixMutex;
-    std::unordered_map<capture::AudioSourceBase*, core::FramePtr> m_audioLatest;
+    // 多源混流（core/AudioMixer：按采样点加和 + 每路 PI/BURST 时钟校正）
+    std::unique_ptr<core::AudioMixer> m_mixer;
+    int m_audioFrameSize = 1024;
     std::jthread m_mixThread;
 
     // 平台采集句柄（Android：MediaProjection jobject 全局引用，由 SetPrivateData 传入）
     void* m_mediaProjection = nullptr;
+
+    // 性能模式（Cpu / Gpu）：影响采集是否保留硬件帧、编码器是否走硬件直连
+    PerformanceMode m_perfMode = PerformanceMode::Cpu;
+
+    // 音画同步（独立模块，见 core/AVSyncClock.h）
+    std::shared_ptr<core::AudioClock> m_audioClock;
+    std::shared_ptr<core::VideoPtsGenerator> m_videoPtsGen;
+    std::shared_ptr<core::VideoOnlyTimeline> m_videoOnlyTimeline;
+    int64_t m_videoIntervalUs = 33333;
+    uint64_t m_syncDropped = 0;
 
     // 内核
     std::shared_ptr<codec::VideoEncoder> m_videoEncoder;

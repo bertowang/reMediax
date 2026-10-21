@@ -61,6 +61,9 @@ protected:
     void OnThreadExit() override;
 
 private:
+    void SilenceLoop(std::stop_token token);   // 设备不可用时的静音兜底
+
+private:
     bool InitWASAPI();
     void ReleaseWASAPI();
     void Resample(const uint8_t* src, int frames, core::FramePtr& out);

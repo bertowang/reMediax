@@ -1,6 +1,8 @@
 #include "platform/windows/WinScreenCapture.h"
 
 #include <atomic>
+#include <mutex>
+#include <vector>
 
 #include "core/Clock.h"
 #include "core/Logger.h"
@@ -28,6 +30,63 @@ struct MonitorEnumParam
     int current = 0;
     RECT rect{};
 };
+
+}  // namespace
+
+// 显存纹理池：采集把桌面纹理拷到池里的纹理，交给编码器；
+// 帧被释放（编码完成）时纹理自动归还，避免拷贝与复用打架，也避免每帧新建纹理。
+struct WinScreenCapture::GpuTexturePool
+{
+    ID3D11Device* device = nullptr;
+    UINT width = 0;
+    UINT height = 0;
+    std::mutex mutex;
+    std::vector<ID3D11Texture2D*> idle;
+    std::vector<ID3D11Texture2D*> all;
+
+    ~GpuTexturePool()
+    {
+        for (auto* tex : all) {
+            if (tex) {
+                tex->Release();
+            }
+        }
+    }
+
+    ID3D11Texture2D* Acquire()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!idle.empty()) {
+            auto* tex = idle.back();
+            idle.pop_back();
+            return tex;
+        }
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = width;
+        desc.Height = height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        ID3D11Texture2D* tex = nullptr;
+        if (FAILED(device->CreateTexture2D(&desc, nullptr, &tex)) || !tex) {
+            return nullptr;
+        }
+        all.push_back(tex);
+        return tex;
+    }
+
+    void GiveBack(ID3D11Texture2D* tex)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        idle.push_back(tex);
+    }
+};
+
+namespace
+{
 
 BOOL CALLBACK MonitorEnumProc(HMONITOR monitor, HDC, LPRECT, LPARAM lparam)
 {
@@ -102,9 +161,27 @@ int WinScreenCapture::Open(int width, int height, float fps)
     m_bmpHeight = Even(srcH);
 
     // 屏幕采集优先 DXGI；失败自动回落 GDI
+    // 注意：EnsureD3D11Device() 可能已经建好复制通道，这里必须复用而不是重复 DuplicateOutput
     m_activeMode = GDI;
-    if (!m_isWindow && m_mode == DXGI && InitDXGI(m_bmpWidth, m_bmpHeight)) {
+    if (!m_isWindow && m_duplication) {
         m_activeMode = DXGI;
+        m_bmpWidth = Even(static_cast<int>(m_dupDesc.ModeDesc.Width));
+        m_bmpHeight = Even(static_cast<int>(m_dupDesc.ModeDesc.Height));
+        if (m_gpuMode) {
+            m_width = m_bmpWidth;
+            m_height = m_bmpHeight;
+            TG_LOGI("WinScreenCapture: 屏幕 GPU %dx%d fps=%.1f", m_bmpWidth, m_bmpHeight, m_fps);
+            return 0;
+        }
+    } else if (!m_isWindow && (m_mode == DXGI || m_gpuMode) && InitDXGI(m_bmpWidth, m_bmpHeight)) {
+        m_activeMode = DXGI;
+        if (m_gpuMode) {
+            // GPU 模式：不建系统内存位图（4K 屏能省掉几十 MB，且没有 GPU→CPU 回读）
+            m_width = m_bmpWidth;
+            m_height = m_bmpHeight;
+            TG_LOGI("WinScreenCapture: %s GPU %dx%d fps=%.1f", "屏幕", m_bmpWidth, m_bmpHeight, m_fps);
+            return 0;
+        }
     } else {
         m_windowDC = m_isWindow ? (m_clientOnly ? GetDC(m_hwnd) : GetWindowDC(m_hwnd))
                                 : CreateDCW(L"DISPLAY", nullptr, nullptr, nullptr);
@@ -246,6 +323,9 @@ bool WinScreenCapture::InitDXGI(int width, int height)
     }
     m_duplication->GetDesc(&m_dupDesc);
 
+    m_bmpWidth = Even(static_cast<int>(m_dupDesc.ModeDesc.Width));
+    m_bmpHeight = Even(static_cast<int>(m_dupDesc.ModeDesc.Height));
+
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = m_dupDesc.ModeDesc.Width;
     desc.Height = m_dupDesc.ModeDesc.Height;
@@ -253,11 +333,24 @@ bool WinScreenCapture::InitDXGI(int width, int height)
     desc.ArraySize = 1;
     desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     desc.SampleDesc.Count = 1;
+
+    if (m_gpuMode) {
+        // GPU 模式：不需要 STAGING（那是给 CPU 回读用的），只留一张自留纹理，
+        // 用于桌面静止时复用上一帧维持帧率。
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = 0;
+        hr = m_device->CreateTexture2D(&desc, nullptr, &m_lastTex);
+        if (FAILED(hr) || !m_lastTex) {
+            TG_LOGW("WinScreenCapture: 创建自留纹理失败，回落 GDI");
+            ReleaseDXGI();
+            return false;
+        }
+        m_lastTexDirty = true;
+        return true;
+    }
+
     desc.Usage = D3D11_USAGE_STAGING;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    m_bmpWidth = Even(static_cast<int>(desc.Width));
-    m_bmpHeight = Even(static_cast<int>(desc.Height));
-
     hr = m_device->CreateTexture2D(&desc, nullptr, &m_staging);
     if (FAILED(hr) || !m_staging) {
         TG_LOGW("WinScreenCapture: 创建 staging 纹理失败，回落 GDI");
@@ -267,11 +360,38 @@ bool WinScreenCapture::InitDXGI(int width, int height)
     return true;
 }
 
+void* WinScreenCapture::EnsureD3D11Device()
+{
+    if (m_device && m_duplication) {
+        return m_device;
+    }
+    if (!InitDXGI(0, 0)) {
+        ReleaseDXGI();
+        return nullptr;
+    }
+    m_activeMode = DXGI;
+    m_bmpWidth = Even(static_cast<int>(m_dupDesc.ModeDesc.Width));
+    m_bmpHeight = Even(static_cast<int>(m_dupDesc.ModeDesc.Height));
+
+    // 纹理池 + 自留纹理（GPU 模式专用）
+    m_gpuPool = std::make_shared<GpuTexturePool>();
+    m_gpuPool->device = m_device;
+    m_gpuPool->width = static_cast<UINT>(m_dupDesc.ModeDesc.Width);
+    m_gpuPool->height = static_cast<UINT>(m_dupDesc.ModeDesc.Height);
+    m_lastTexDirty = true;
+    return m_device;
+}
+
 void WinScreenCapture::ReleaseDXGI()
 {
     m_lastBgra.reset();
     m_lastWidth = 0;
     m_lastHeight = 0;
+    if (m_lastTex) {
+        m_lastTex->Release();
+        m_lastTex = nullptr;
+    }
+    m_gpuPool.reset();
     if (m_staging) {
         m_staging->Release();
         m_staging = nullptr;
@@ -405,6 +525,86 @@ bool WinScreenCapture::GrabBGRA(std::shared_ptr<uint8_t>& bgra, int& width, int&
     return GrabGDI(bgra, width, height);
 }
 
+// GPU 路径：桌面纹理 -> 池里的纹理（纯显存拷贝），纹理由帧的 owner 在编码完成后归还
+bool WinScreenCapture::GrabGpu(ID3D11Texture2D** tex, std::shared_ptr<void>& owner, int& width, int& height)
+{
+    if (!tex || !m_duplication || !m_gpuPool) {
+        return false;
+    }
+    *tex = nullptr;
+
+    IDXGIResource* resource = nullptr;
+    DXGI_OUTDUPL_FRAME_INFO info{};
+    ID3D11Texture2D* src = nullptr;
+    HRESULT hr = m_duplication->AcquireNextFrame(0, &info, &resource);
+
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+        // 桌面无变化：复用自留纹理，维持帧率（否则静止画面会断流）
+        if (!m_lastTex) {
+            return false;
+        }
+        ID3D11Texture2D* reuse = m_gpuPool->Acquire();
+        if (!reuse) {
+            return false;
+        }
+        m_context->CopyResource(reuse, m_lastTex);
+        m_lastTexDirty = true;
+        owner = MakeTextureOwner(reuse);
+        *tex = reuse;
+        width = m_bmpWidth;
+        height = m_bmpHeight;
+        return true;
+    }
+    if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_INVALID_CALL) {
+        TG_LOGW("WinScreenCapture: DXGI 失效(0x%08X)，重建复制通道", static_cast<unsigned>(hr));
+        ReleaseDXGI();
+        if (!EnsureD3D11Device()) {
+            m_activeMode = GDI;
+        }
+        return false;
+    }
+    if (FAILED(hr)) {
+        return false;
+    }
+
+    hr = resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&src));
+    resource->Release();
+    if (FAILED(hr) || !src) {
+        m_duplication->ReleaseFrame();
+        return false;
+    }
+
+    ID3D11Texture2D* dst = m_gpuPool->Acquire();
+    if (!dst) {
+        src->Release();
+        m_duplication->ReleaseFrame();
+        return false;
+    }
+    m_context->CopyResource(dst, src);
+    if (m_lastTexDirty && m_lastTex) {
+        m_context->CopyResource(m_lastTex, src);
+        m_lastTexDirty = false;
+    }
+    src->Release();
+    m_duplication->ReleaseFrame();
+
+    owner = MakeTextureOwner(dst);
+    *tex = dst;
+    width = m_bmpWidth;
+    height = m_bmpHeight;
+    return true;
+}
+
+std::shared_ptr<void> WinScreenCapture::MakeTextureOwner(ID3D11Texture2D* tex)
+{
+    std::shared_ptr<GpuTexturePool> pool = m_gpuPool;
+    return std::shared_ptr<void>(tex, [pool](void* p) {
+        if (p) {
+            pool->GiveBack(static_cast<ID3D11Texture2D*>(p));
+        }
+    });
+}
+
 void WinScreenCapture::Loop(std::stop_token token)
 {
     const int64_t intervalUs = static_cast<int64_t>(1000000.0 / (m_fps > 0 ? m_fps : 30.0));
@@ -421,22 +621,42 @@ void WinScreenCapture::Loop(std::stop_token token)
             nextUs = nowUs + intervalUs;   // 落后过多则重新对齐，避免追帧风暴
         }
 
-        std::shared_ptr<uint8_t> bgra;
-        int width = 0, height = 0;
-        if (!GrabBGRA(bgra, width, height)) {
-            if (m_grabFail++ % 60 == 0) {
-                TG_LOGW("WinScreenCapture: 抓取失败 count=%d", m_grabFail);
-            }
-            continue;
-        }
-
         auto frame = std::make_shared<core::Frame>();
         frame->kind = core::MediaKind::Video;
         frame->captureUs = core::MonotonicClock::NowUs();
-        ConvertToNV12(bgra.get(), width, height, frame);
-        if (!frame->planes[0]) {
-            continue;
+
+        if (m_gpuMode && m_activeMode == DXGI) {
+            // GPU 路径：只传纹理句柄，不做像素搬运、不占系统内存
+            ID3D11Texture2D* tex = nullptr;
+            std::shared_ptr<void> owner;
+            int width = 0, height = 0;
+            if (!GrabGpu(&tex, owner, width, height)) {
+                if (m_grabFail++ % 60 == 0) {
+                    TG_LOGW("WinScreenCapture: GPU 抓取失败 count=%d", m_grabFail);
+                }
+                continue;
+            }
+            frame->width = width;
+            frame->height = height;
+            frame->pixFmt = AV_PIX_FMT_NONE;   // 硬件帧，格式由编码器侧帧池决定
+            frame->hwKind = core::HwKind::D3D11Texture;
+            frame->hwHandle = tex;
+            frame->hwOwner = std::move(owner);
+        } else {
+            std::shared_ptr<uint8_t> bgra;
+            int width = 0, height = 0;
+            if (!GrabBGRA(bgra, width, height)) {
+                if (m_grabFail++ % 60 == 0) {
+                    TG_LOGW("WinScreenCapture: 抓取失败 count=%d", m_grabFail);
+                }
+                continue;
+            }
+            ConvertToNV12(bgra.get(), width, height, frame);
+            if (!frame->planes[0]) {
+                continue;
+            }
         }
+
         frame->ptsUs = frame->captureUs;
         m_width = frame->width;
         m_height = frame->height;

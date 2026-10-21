@@ -78,6 +78,15 @@ enum class CaptureFeature
     Speaker = 3,     // 扬声器 / 系统声音
 };
 
+// 性能模式：Cpu = 传统 CPU 链路（采集→内存→软编/硬编）；
+// Gpu  = 全链路 GPU：采集帧留在显存/平台硬件缓冲里，直接喂硬编，CPU 不做像素搬运。
+// Gpu 不可用时（无硬编、无平台 API、采集源不支持）会自动回落 Cpu 并打日志。
+enum class PerformanceMode
+{
+    Cpu = 0,
+    Gpu = 1,
+};
+
 enum class VideoScaleStrategy
 {
     SCALE_FIT_V0 = 0,  // 保持宽高比 + 黑边（默认）
@@ -174,6 +183,17 @@ struct VideoEncoderParams
 
     int vConverterType = -1;
     bool bUseAndroidSurface = false;      // Android Surface 直连硬编
+
+    // ---- 性能模式 ----
+    // Gpu：采集帧留在硬件缓冲，直送硬编（Windows: D3D11 纹理→NVENC/AMF/MF；
+    // iOS: CVPixelBuffer→VideoToolbox；Android: 编码器 Surface→MediaCodec）。
+    // 不可用时自动回落 Cpu；想强制 Cpu 就显式设为 Cpu。
+    PerformanceMode perfMode = PerformanceMode::Cpu;
+
+    // ---- 音画同步 ----
+    int64_t videoMaxLeadUs = 500000;   // 音频停滞时视频最多超前多少（默认 500ms）
+    int64_t videoMaxLagUs = 120000;    // 视频落后音频超过多少就丢帧（默认 120ms）
+    int64_t audioCompensationUs = 0;   // 音频参考时钟的额外补偿（抵消编码/封装延迟）
 };
 
 struct AudioEncoderParams
@@ -192,6 +212,8 @@ struct MuxerParams
     std::string muxer = "flv";        // flv / mpegts
     std::string muxerExtParams;
     std::string muxerOutput;          // rtmp:// srt:// 或文件路径
+    // 音视频交织阈值：领先的一方暂停写入，等落后的一方追上（0 = 关闭）
+    int interleaveMs = 350;
 };
 
 struct PauseParams

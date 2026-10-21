@@ -1,4 +1,4 @@
-#include "TGCapturer.h"
+﻿#include "TGCapturer.h"
 
 #include <algorithm>
 #include <chrono>
@@ -22,6 +22,10 @@ namespace TGCapture
 TGCapturer::TGCapturer(GameID gameId) : m_gameId(gameId)
 {
     m_sync = std::make_shared<core::AVSync>();
+    m_audioClock = std::make_shared<core::AudioClock>();
+    m_videoPtsGen = std::make_shared<core::VideoPtsGenerator>();
+    m_videoOnlyTimeline = std::make_shared<core::VideoOnlyTimeline>();
+    m_mixer = std::make_unique<core::AudioMixer>();
     m_videoEncoder = std::make_shared<codec::VideoEncoder>();
     m_audioEncoder = std::make_shared<codec::AudioEncoder>();
     m_muxer = std::make_shared<Muxer>();
@@ -167,29 +171,41 @@ int TGCapturer::AddAudioSource(IAudioSource* source)
     return 0;
 }
 
+int TGCapturer::ChannelIdOf(capture::AudioSourceBase* source) const
+{
+    for (size_t i = 0; i < m_audioSources.size(); ++i) {
+        if (m_audioSources[i] == source) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
 void TGCapturer::OnAudioFrameFrom(capture::AudioSourceBase* source, core::FramePtr frame)
 {
-    if (!frame || !m_audioEnabled || m_state.load() != State::Running) {
+    if (!frame || !m_audioEnabled || !m_mixer || m_state.load() != State::Running) {
         return;
     }
-    if (m_audioSources.size() <= 1) {
-        OnAudioFrame(std::move(frame));   // 单路：直接透传，零额外延迟
+    if (!frame->audioData || frame->audioBytes == 0 || frame->channels <= 0) {
         return;
     }
-    // 多路：先缓存各源的最新帧，由混音线程合并
-    if (frame->ptsUs < 0) {
-        frame->ptsUs = frame->captureUs;
+    // 统一进混流器：单路也同样走（这样单路也能吃到 PI/BURST 时钟校正）
+    const int id = ChannelIdOf(source);
+    if (id < 0) {
+        return;
     }
-    std::lock_guard<std::mutex> lock(m_audioMixMutex);
-    m_audioLatest[source] = std::move(frame);
+    const int frames = static_cast<int>(frame->audioBytes / (sizeof(int16_t) * static_cast<size_t>(frame->channels)));
+    m_mixer->Push(id, reinterpret_cast<const int16_t*>(frame->audioData.get()), frames,
+                  frame->captureUs);
 }
 
 void TGCapturer::StartAudioMixer()
 {
-    if (m_audioSources.size() <= 1 || m_mixThread.joinable()) {
+    if (!m_audioEnabled || m_mixThread.joinable()) {
         return;
     }
-    TG_LOGI("TGCapturer: 启用 %zu 路音频混音", m_audioSources.size());
+    TG_LOGI("TGCapturer: 启用音频混流（%zu 路，输出 %dHz %dch）",
+            m_audioSources.size(), m_mixer->OutputSampleRate(), m_mixer->OutputChannels());
     m_mixThread = std::jthread([this](std::stop_token st) { MixLoop(st); });
 }
 
@@ -199,68 +215,43 @@ void TGCapturer::StopAudioMixer()
         m_mixThread.request_stop();
         m_mixThread.join();
     }
-    std::lock_guard<std::mutex> lock(m_audioMixMutex);
-    m_audioLatest.clear();
+    if (m_mixer) {
+        m_mixer->Reset();
+    }
 }
 
 void TGCapturer::MixLoop(std::stop_token token)
 {
     while (!token.stop_requested()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-
-        std::vector<core::FramePtr> batch;
-        {
-            std::lock_guard<std::mutex> lock(m_audioMixMutex);
-            if (m_audioLatest.empty()) {
-                continue;
-            }
-            batch.reserve(m_audioLatest.size());
-            for (auto& item : m_audioLatest) {
-                if (item.second) {
-                    batch.push_back(std::move(item.second));
-                }
-            }
-            m_audioLatest.clear();
-        }
-        if (batch.empty()) {
+        std::shared_ptr<uint8_t> data;
+        int64_t ptsUs = 0;
+        if (!m_mixer->Mix(m_audioFrameSize, data, ptsUs)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
         }
 
-        // 以最短的一帧为准做加和混音（S16 交错，饱和截断）
-        const core::FramePtr& first = batch[0];
-        size_t minSamples = first->audioBytes / sizeof(int16_t);
-        for (const auto& f : batch) {
-            minSamples = std::min(minSamples, f->audioBytes / sizeof(int16_t));
-        }
-        if (minSamples == 0) {
-            continue;
-        }
-        const size_t bytes = minSamples * sizeof(int16_t);
-        auto mixed = std::shared_ptr<uint8_t>(new uint8_t[bytes], std::default_delete<uint8_t[]>());
-
-        std::vector<int32_t> acc(minSamples, 0);   // 中间按 32 位累加，避免溢出
-        for (const auto& f : batch) {
-            const auto* src = reinterpret_cast<const int16_t*>(f->audioData.get());
-            for (size_t i = 0; i < minSamples; ++i) {
-                acc[i] += src[i];
-            }
-        }
-        auto* out = reinterpret_cast<int16_t*>(mixed.get());
-        for (size_t i = 0; i < minSamples; ++i) {
-            out[i] = static_cast<int16_t>(std::clamp(acc[i], -32768, 32767));
-        }
+        const int channels = m_mixer->OutputChannels();
+        const int sampleRate = m_mixer->OutputSampleRate();
+        const size_t bytes = static_cast<size_t>(m_audioFrameSize) * static_cast<size_t>(channels) *
+                             sizeof(int16_t);
 
         auto frame = std::make_shared<core::Frame>();
         frame->kind = core::MediaKind::Audio;
-        frame->sampleRate = first->sampleRate;
-        frame->channels = first->channels;
+        frame->sampleRate = sampleRate;
+        frame->channels = channels;
         frame->sampleFmt = AV_SAMPLE_FMT_S16;
         frame->planar = false;
-        frame->nbSamples = static_cast<int>(minSamples / static_cast<size_t>(first->channels > 0 ? first->channels : 1));
-        frame->audioData = mixed;
+        frame->nbSamples = m_audioFrameSize;
+        frame->audioData = data;
         frame->audioBytes = bytes;
-        frame->ptsUs = first->ptsUs;
+        frame->ptsUs = ptsUs;
         frame->captureUs = core::MonotonicClock::NowUs();
+
+        // 音频主时钟跟着混流输出走（视频 PTS 由它反推）
+        if (sampleRate > 0) {
+            m_audioClock->AdvanceTo(ptsUs + static_cast<int64_t>(m_audioFrameSize) * 1000000LL /
+                                                sampleRate);
+        }
         m_bus.Dispatch("audio_encoder", std::move(frame));
     }
 }
@@ -291,6 +282,7 @@ int TGCapturer::SetupVideoEncoder(const VideoEncoderParams& params)
 {
     m_videoParams = params;
     m_videoParamsSet = true;
+    m_perfMode = params.perfMode;
     return 0;
 }
 
@@ -357,6 +349,70 @@ int TGCapturer::Prepare()
     // 纯视频模式：不建音频编码器、封装器也不建音频流
     m_audioEnabled = m_audioParams.enabled && m_audioParams.sampleRate > 0 && m_audioParams.channels > 0;
 
+    // ---- 性能模式：GPU 链路需要采集侧与编码侧共用一个设备 ----
+    void* externalDevice = nullptr;
+#if defined(_WIN32)
+    if (m_perfMode == PerformanceMode::Gpu) {
+        auto* win = dynamic_cast<platform::WinScreenCapture*>(m_videoSource);
+        if (win) {
+            win->SetGpuMode(true);
+            externalDevice = win->EnsureD3D11Device();
+            if (!externalDevice) {
+                TG_LOGW("TGCapturer: GPU 采集不可用，回退 CPU 链路");
+                win->SetGpuMode(false);
+                m_perfMode = PerformanceMode::Cpu;
+            }
+        } else {
+            TG_LOGW("TGCapturer: 当前采集源不支持 GPU 直连，回退 CPU 链路");
+            m_perfMode = PerformanceMode::Cpu;
+        }
+    }
+#endif
+    // ---- 采集源先打开：GPU 模式要确认采集侧真的走的是硬件路径 ----
+    if (m_videoSource
+        && m_videoSource->Open(m_videoParams.width, m_videoParams.height, m_videoParams.fps) < 0) {
+        TG_LOGW("TGCapturer: 视频源打开失败（外部注入模式可忽略）");
+    }
+#if defined(_WIN32)
+    if (m_perfMode == PerformanceMode::Gpu) {
+        auto* win = dynamic_cast<platform::WinScreenCapture*>(m_videoSource);
+        if (win && win->GpuMode() && win->FrameWidth() > 0 && win->FrameHeight() > 0) {
+            // GPU 链路在显存里只做同尺寸拷贝，不做缩放：
+            // 因此采集分辨率即编码分辨率（否则会变成"裁剪"而不是"缩放"）。
+            m_videoParams.width = win->FrameWidth();
+            m_videoParams.height = win->FrameHeight();
+            videoType.SetWidth(win->FrameWidth());
+            videoType.SetHeight(win->FrameHeight());
+            TG_LOGI("TGCapturer: GPU 模式按采集分辨率编码 %dx%d",
+                    win->FrameWidth(), win->FrameHeight());
+        }
+        const bool gpuReady = win && win->GpuMode() && win->ActiveMode() == DXGI && win->D3D11Device();
+        if (!gpuReady) {
+            TG_LOGW("TGCapturer: 采集未走 GPU 路径，编码器一并回退 CPU 链路");
+            m_perfMode = PerformanceMode::Cpu;
+            externalDevice = nullptr;
+            if (win) {
+                win->SetGpuMode(false);
+            }
+        }
+    }
+#endif
+    m_videoEncoder->SetPerformanceMode(m_perfMode);
+    m_videoEncoder->SetExternalDevice(externalDevice);
+
+    // ---- 音画同步初始化 ----
+    core::VideoPtsParams syncParams;
+    syncParams.maxLeadUs = m_videoParams.videoMaxLeadUs > 0 ? m_videoParams.videoMaxLeadUs : 500000;
+    m_videoPtsGen->SetParams(syncParams);
+    m_videoPtsGen->Reset();
+    m_audioClock->Reset();
+    m_audioClock->SetCompensationUs(m_videoParams.audioCompensationUs);
+    m_videoOnlyTimeline->Reset();
+    m_videoIntervalUs = m_videoParams.fps > 0 ? static_cast<int64_t>(1000000.0 / m_videoParams.fps) : 33333;
+    m_syncDropped = 0;
+    m_videoEncoder->SetMaxLagUs(m_videoParams.videoMaxLagUs > 0 ? m_videoParams.videoMaxLagUs : 120000);
+    m_muxer->SetInterleaveUs(static_cast<int64_t>(m_muxParams.interleaveMs) * 1000);
+
     core::AudioMediaType audioType;
     audioType.SetSampleRate(m_audioParams.sampleRate);
     audioType.SetChannels(m_audioParams.channels);
@@ -388,12 +444,24 @@ int TGCapturer::Prepare()
         return -5;
     }
 
-    if (m_videoSource && m_videoSource->Open(m_videoParams.width, m_videoParams.height, m_videoParams.fps) < 0) {
-        TG_LOGW("TGCapturer: 视频源打开失败（外部注入模式可忽略）");
+    if (m_audioEnabled) {
+        for (auto* source : m_audioSources) {
+            if (source && source->Open(m_audioParams.sampleRate, m_audioParams.channels) < 0) {
+                TG_LOGW("TGCapturer: 音频源打开失败（该路按静音处理）");
+            }
+        }
     }
-    if (m_audioEnabled && m_audioSource
-        && m_audioSource->Open(m_audioParams.sampleRate, m_audioParams.channels) < 0) {
-        TG_LOGW("TGCapturer: 音频源打开失败（将使用静音兜底）");
+
+    // 混流通道：每一路音频源一条，输出格式取编码器配置（单路也同样建，以便做时钟校正）
+    if (m_audioEnabled) {
+        m_mixer->Reset();
+        m_mixer->SetOutputFormat(m_audioParams.sampleRate, m_audioParams.channels);
+        const int64_t nowUs = core::MonotonicClock::NowUs();
+        for (size_t i = 0; i < m_audioSources.size(); ++i) {
+            m_mixer->AddChannel(static_cast<int>(i), m_audioParams.sampleRate,
+                                m_audioParams.channels, nowUs);
+        }
+        m_audioFrameSize = audioType.FrameSize() > 0 ? audioType.FrameSize() : 1024;
     }
 
     m_state.store(State::Prepared);
@@ -473,6 +541,16 @@ void TGCapturer::Stop()
     }
 
     m_sync->Reset();
+    if (m_videoPtsGen) {
+        const auto& st = m_videoPtsGen->stats();
+        TG_LOGI("TGCapturer: 音画同步 avDiff=%lldms clamp=%llu forceSync=%llu skip=%llu jump=%llu syncDrop=%llu",
+                static_cast<long long>(st.avDiffUs / 1000),
+                static_cast<unsigned long long>(st.clamped),
+                static_cast<unsigned long long>(st.forceSynced),
+                static_cast<unsigned long long>(st.skipped),
+                static_cast<unsigned long long>(st.jumpWarns),
+                static_cast<unsigned long long>(m_syncDropped));
+    }
     m_state.store(State::Idle);
     if (m_onStop) {
         m_onStop(0);
@@ -487,9 +565,8 @@ void TGCapturer::ReleaseAll()
     m_videoSource = nullptr;
     m_audioSource = nullptr;
     m_audioSources.clear();
-    {
-        std::lock_guard<std::mutex> lock(m_audioMixMutex);
-        m_audioLatest.clear();
+    if (m_mixer) {
+        m_mixer->Reset();
     }
 }
 
@@ -509,8 +586,22 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
         return;
     }
 
-    if (frame->ptsUs < 0) {
-        frame->ptsUs = frame->captureUs;
+    // ---- 音画同步：视频 PTS 由音频时钟反推（不用采集 wall clock）----
+    if (m_audioEnabled && m_audioClock && m_audioClock->Valid()) {
+        const int64_t audioRef = m_audioClock->ReferencePtsUs();
+        const int64_t pts = m_videoPtsGen->Next(audioRef, m_videoIntervalUs, true);
+        if (pts == core::kInvalidPtsUs) {
+            ++m_syncDropped;   // 音频停滞且已 clamp 到上限：本帧不编码
+            return;
+        }
+        frame->ptsUs = pts;
+        if (m_sync) {
+            m_sync->UpdateAudioClock(audioRef);   // 供 VideoEncoder 的"落后丢帧"兜底
+        }
+    } else {
+        // 无音频：走采集时间轴（首帧归零，单调递增）
+        const int64_t pts = m_videoOnlyTimeline->Next(frame->captureUs);
+        frame->ptsUs = pts >= 0 ? pts : frame->captureUs;
     }
 
     // 注意：frame 交给总线后会被移动，之后不可再访问其成员
@@ -529,15 +620,27 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
     m_lastVideoUs = core::MonotonicClock::NowUs();
 }
 
+// 外部注入的音频：同样进混流器（走 0 号通道，没有内部音频源时由它独占）
 void TGCapturer::OnAudioFrame(core::FramePtr frame)
 {
-    if (!frame || !m_audioEnabled || m_state.load() != State::Running) {
+    if (!frame || !m_audioEnabled || !m_mixer || m_state.load() != State::Running) {
         return;
     }
-    if (frame->ptsUs < 0) {
-        frame->ptsUs = frame->captureUs;
+    if (!frame->audioData || frame->audioBytes == 0 || frame->channels <= 0) {
+        return;
     }
-    m_bus.Dispatch("audio_encoder", std::move(frame));
+    if (!m_mixer->BufferedFrames(0) && m_mixer->ChannelCount() == 0) {
+        // 没有任何内部音频源：临时建一条通道给它
+        m_mixer->SetOutputFormat(frame->sampleRate, frame->channels);
+        m_mixer->AddChannel(0, frame->sampleRate, frame->channels, core::MonotonicClock::NowUs());
+    }
+    const int id = m_mixer->ChannelCount() > 0 ? 0 : -1;
+    if (id < 0) {
+        return;
+    }
+    const int frames = static_cast<int>(frame->audioBytes / (sizeof(int16_t) * static_cast<size_t>(frame->channels)));
+    m_mixer->Push(id, reinterpret_cast<const int16_t*>(frame->audioData.get()), frames,
+                  frame->captureUs);
 }
 
 // ------------------------------------------------------------------ 外部注入
