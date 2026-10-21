@@ -101,9 +101,16 @@ bool WinAudioCapture::InitWASAPI()
     // 重采样上下文：设备格式 -> 目标 S16 交错
     // WASAPI 共享模式下缓冲是交错(interleaved)布局：float -> FLT，PCM16 -> S16
     const AVSampleFormat srcFmt = m_deviceFloat ? AV_SAMPLE_FMT_FLT : AV_SAMPLE_FMT_S16;
-    m_swr = swr_alloc_set_opts(nullptr, av_get_default_channel_layout(m_channels), AV_SAMPLE_FMT_S16, m_sampleRate,
-                               av_get_default_channel_layout(m_deviceChannels), srcFmt, m_deviceSampleRate, 0, nullptr);
-    if (!m_swr || swr_init(m_swr) < 0) {
+    // ffmpeg 6.x：用 swr_alloc_set_opts2 + AVChannelLayout（swr_alloc_set_opts / av_get_default_channel_layout 已废弃，7.x 移除）
+    AVChannelLayout outLayout{};
+    AVChannelLayout inLayout{};
+    av_channel_layout_default(&outLayout, m_channels > 0 ? m_channels : 2);
+    av_channel_layout_default(&inLayout, m_deviceChannels > 0 ? m_deviceChannels : 2);
+    const int swrRet = swr_alloc_set_opts2(&m_swr, &outLayout, AV_SAMPLE_FMT_S16, m_sampleRate,
+                                           &inLayout, srcFmt, m_deviceSampleRate, 0, nullptr);
+    av_channel_layout_uninit(&outLayout);
+    av_channel_layout_uninit(&inLayout);
+    if (swrRet < 0 || !m_swr || swr_init(m_swr) < 0) {
         TG_LOGW("WinAudioCapture: swr 初始化失败");
         if (m_swr) {
             swr_free(&m_swr);

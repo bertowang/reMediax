@@ -1,5 +1,8 @@
 #include "codec/VideoEncoder.h"
 
+#include <algorithm>
+#include <limits>
+
 #include "core/Logger.h"
 #include "mux/Muxer.h"
 
@@ -84,7 +87,9 @@ int VideoEncoder::Open(const VideoEncoderParams& params, const core::VideoMediaT
     m_ctx->max_b_frames = 0;  // 直播低延迟（ffmpeg 6.x 字段名为 max_b_frames）
     m_ctx->bit_rate = params.vBitrate;
     m_ctx->rc_max_rate = static_cast<int64_t>(params.vBitrate * (params.vBitrateMaxFactor > 0 ? params.vBitrateMaxFactor : 1.0f));
-    m_ctx->rc_buffer_size = m_ctx->rc_max_rate * 2;
+    // rc_buffer_size 是 int，rc_max_rate 是 int64_t：夹到 int 上界再转，避免 C4244 静默截断
+    m_ctx->rc_buffer_size = static_cast<int>(
+        std::min<int64_t>(m_ctx->rc_max_rate * 2, std::numeric_limits<int>::max()));
     m_ctx->thread_count = params.threads > 0 ? params.threads : 4;
     m_ctx->pix_fmt = AV_PIX_FMT_NONE;
 

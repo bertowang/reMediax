@@ -160,6 +160,9 @@ int TGCapturer::Prepare()
     videoType.SetPixelFormat(AV_PIX_FMT_NV12);
     videoType.SetFrameRate(static_cast<int>(m_videoParams.fps * 1000), 1000);
 
+    // 纯视频模式：不建音频编码器、封装器也不建音频流
+    m_audioEnabled = m_audioParams.enabled && m_audioParams.sampleRate > 0 && m_audioParams.channels > 0;
+
     core::AudioMediaType audioType;
     audioType.SetSampleRate(m_audioParams.sampleRate);
     audioType.SetChannels(m_audioParams.channels);
@@ -171,16 +174,21 @@ int TGCapturer::Prepare()
         m_state.store(State::Idle);
         return -3;
     }
-    if (m_audioEncoder->Open(m_audioParams, audioType) < 0) {
-        FireError(-4, 0, "open audio encoder failed");
-        m_state.store(State::Idle);
-        return -4;
+    if (m_audioEnabled) {
+        if (m_audioEncoder->Open(m_audioParams, audioType) < 0) {
+            FireError(-4, 0, "open audio encoder failed");
+            m_state.store(State::Idle);
+            return -4;
+        }
+    } else {
+        TG_LOGI("TGCapturer: 纯视频模式（audio disabled）");
     }
 
     m_videoEncoder->SetMuxer(m_muxer.get());
     m_audioEncoder->SetMuxer(m_muxer.get());
 
-    if (m_muxer->Open(m_muxParams, m_videoEncoder->CodecContext(), m_audioEncoder->CodecContext()) < 0) {
+    if (m_muxer->Open(m_muxParams, m_videoEncoder->CodecContext(),
+                      m_audioEnabled ? m_audioEncoder->CodecContext() : nullptr) < 0) {
         FireError(-5, 0, "open muxer failed");
         m_state.store(State::Idle);
         return -5;
@@ -189,7 +197,8 @@ int TGCapturer::Prepare()
     if (m_videoSource && m_videoSource->Open(m_videoParams.width, m_videoParams.height, m_videoParams.fps) < 0) {
         TG_LOGW("TGCapturer: 视频源打开失败（外部注入模式可忽略）");
     }
-    if (m_audioSource && m_audioSource->Open(m_audioParams.sampleRate, m_audioParams.channels) < 0) {
+    if (m_audioEnabled && m_audioSource
+        && m_audioSource->Open(m_audioParams.sampleRate, m_audioParams.channels) < 0) {
         TG_LOGW("TGCapturer: 音频源打开失败（将使用静音兜底）");
     }
 
@@ -209,11 +218,13 @@ int TGCapturer::Start()
 
     m_muxer->Start();
     m_videoEncoder->Start();
-    m_audioEncoder->Start();
+    if (m_audioEnabled) {
+        m_audioEncoder->Start();
+    }
     if (m_videoSource) {
         m_videoSource->Start();
     }
-    if (m_audioSource) {
+    if (m_audioEnabled && m_audioSource) {
         m_audioSource->Start();
     }
 
@@ -237,7 +248,7 @@ void TGCapturer::Stop()
     if (m_videoSource) {
         m_videoSource->StopCapture();
     }
-    if (m_audioSource) {
+    if (m_audioEnabled && m_audioSource) {
         m_audioSource->StopCapture();
     }
     if (m_videoEncoder) {
@@ -311,7 +322,7 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
 
 void TGCapturer::OnAudioFrame(core::FramePtr frame)
 {
-    if (!frame || m_state.load() != State::Running) {
+    if (!frame || !m_audioEnabled || m_state.load() != State::Running) {
         return;
     }
     if (frame->ptsUs < 0) {

@@ -2,14 +2,22 @@
 """TGCapture 构建脚本（python 驱动 cmake）。
 
 用法:
-    python scripts/build.py --platform windows [--abi x64] [--clean] [--demo/--no-demo]
+    python scripts/build.py --platform windows [--abi x64] [--clean] [--no-demo] [--3rd <依赖目录>]
     python scripts/build.py --platform android --abi arm64-v8a --ndk <path>
     python scripts/build.py --platform ios
+
+    # 只生成 IDE 工程并打开（VS2022 / Android Studio / Xcode），不编译
+    python scripts/build.py --platform windows --ide
+    python scripts/build.py --platform android --ide
+    python scripts/build.py --platform ios --ide
+
+依赖目录（3rd）不给时由 CMake 解析：环境变量 TG_3RD_ROOT > 工程同级 TGCapture3rd。
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -24,6 +32,9 @@ PLATFORM_ABI = {
     "ios": "fat",
 }
 
+# 依赖根目录不在本脚本里猜：默认值统一由 CMakeLists.txt 解析（--3rd > $TG_3RD_ROOT > 同级探测），
+# 避免出现"脚本和 CMake 两套默认值"的漂移。本脚本只在显式给出 --3rd 时透传。
+
 
 def run(cmd, cwd=None, check=True):
     print("$ " + " ".join(str(c) for c in cmd))
@@ -33,20 +44,47 @@ def run(cmd, cwd=None, check=True):
     return result.returncode
 
 
+def open_in_ide(platform: str, build_dir: Path) -> None:
+    """生成完工程后用对应 IDE 打开（只负责打开，编译交给 IDE）。"""
+    if platform == "windows":
+        sln = build_dir / "TGCapture.sln"
+        if sln.exists():
+            print(f"用 VS2022 打开: {sln}")
+            os.startfile(str(sln))
+        else:
+            print(f"未找到 {sln}，请确认生成器是 Visual Studio 17 2022")
+    elif platform == "ios":
+        xcodeproj = build_dir / "TGCapture.xcodeproj"
+        if xcodeproj.exists():
+            print(f"用 Xcode 打开: {xcodeproj}")
+            subprocess.run(["open", str(xcodeproj)], check=False)
+        else:
+            print(f"未找到 {xcodeproj}，请确认生成器是 Xcode")
+    elif platform == "android":
+        host = PROJECT_ROOT / "ide" / "android"
+        print("用 Android Studio 打开（File > Open）: " + str(host))
+        print("  首次打开按向导配置 Gradle / SDK 即可；Native 构建由 app/build.gradle 驱动。")
+        if sys.platform.startswith("win"):
+            os.startfile(str(host))
+        elif sys.platform == "darwin":
+            subprocess.run(["open", str(host)], check=False)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="构建 TGCapture")
     parser.add_argument("-p", "--platform", required=True, choices=["windows", "android", "ios"])
     parser.add_argument("--abi", default=None, help="ABI（默认按平台）")
-    parser.add_argument("--3rd", dest="third", default=None, help="3rd-rel-Party 根目录")
+    parser.add_argument("--3rd", dest="third", default=None,
+                        help="依赖根目录；不给则由 CMake 解析（环境变量 TG_3RD_ROOT > 同级 TGCapture3rd）")
     parser.add_argument("-t", "--build-type", default="Release")
     parser.add_argument("--clean", action="store_true", help="清理后重新构建")
     parser.add_argument("--no-demo", action="store_true", help="不编译 demo")
     parser.add_argument("--ndk", default=None, help="Android NDK 路径")
     parser.add_argument("--generator", default=None, help="cmake 生成器")
+    parser.add_argument("--ide", action="store_true", help="只生成 IDE 工程并打开，不编译")
     args = parser.parse_args()
 
     abi = args.abi or PLATFORM_ABI[args.platform]
-    third = args.third or str(PROJECT_ROOT.parent / "3rd-rel-Party")
     build_dir = DEFAULT_BUILD_DIR / f"{args.platform}-{abi}"
 
     if args.clean and build_dir.exists():
@@ -62,13 +100,17 @@ def main() -> int:
         f"-DCMAKE_BUILD_TYPE={args.build_type}",
         f"-DTG_PLATFORM={args.platform}",
         f"-DTG_ABI={abi}",
-        f"-DTG_3RD_ROOT={third}",
         f"-DTG_BUILD_DEMO={'OFF' if (args.no_demo or args.platform != 'windows') else 'ON'}",
     ]
+    if args.third:
+        # 显式指定才透传；不给时由 CMakeLists.txt 按 环境变量 > 同级目录 解析
+        configure.append(f"-DTG_3RD_ROOT={args.third}")
     generator = args.generator
     if args.platform == "windows" and not generator:
         # ffmpeg 等依赖由 MSVC 编译，必须使用 MSVC 生成器（ABI 一致）
         generator = "Visual Studio 17 2022"
+    if args.ide and args.platform == "ios" and not generator:
+        generator = "Xcode"   # --ide 时 iOS 用 Xcode 工程，命令行构建仍用默认生成器
     if generator:
         configure += ["-G", generator]
         if generator.startswith("Visual Studio"):
@@ -92,7 +134,16 @@ def main() -> int:
             "-DCMAKE_OSX_DEPLOYMENT_TARGET=12.0",
         ]
 
+    if args.ide and args.platform == "android":
+        # Android Studio 通过 gradle 自己驱动 CMake，这里不重复 configure（也不强求 NDK 就位）
+        open_in_ide("android", build_dir)
+        return 0
+
     run(configure)
+    if args.ide:
+        open_in_ide(args.platform, build_dir)
+        return 0
+
     run(["cmake", "--build", build_dir, "--config", args.build_type, "--parallel"])
 
     print(f"\n构建完成: {build_dir}")

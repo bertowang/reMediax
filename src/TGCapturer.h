@@ -98,6 +98,7 @@ private:
     bool m_videoParamsSet = false;
     bool m_audioParamsSet = false;
     bool m_muxParamsSet = false;
+    bool m_audioEnabled = false;   // Prepare 时按 m_audioParams.enabled 解析，决定是否有音频流
 
     // 源（不拥有：由调用方 Add* 传入；创建型接口由本对象持有）
     std::vector<std::shared_ptr<capture::VideoSourceBase>> m_ownedVideoSources;

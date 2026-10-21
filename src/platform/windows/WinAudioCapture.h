@@ -15,6 +15,7 @@ struct ISimpleAudioVolume;
 
 extern "C"
 {
+#include <libavutil/channel_layout.h>
 #include <libavutil/samplefmt.h>
 #include <libswresample/swresample.h>
 }

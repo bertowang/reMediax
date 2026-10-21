@@ -172,6 +172,8 @@ struct AudioEncoderParams
     int aBitrate = 128000;
     std::string aCodec = "libfdk_aac";
     std::string aExtParams;
+    // false = 纯视频推流：不创建音频编码器、封装器也不建音频流（默认 true，老调用方无感）
+    bool enabled = true;
 };
 
 struct MuxerParams

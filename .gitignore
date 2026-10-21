@@ -1,0 +1,25 @@
+# 构建产物
+build/
+out/
+cmake-build-*/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.opendb
+
+# 其它 IDE
+.idea/
+*.swp
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Android Studio 宿主工程（ide/android 有自己的 .gitignore）
+ide/android/local.properties

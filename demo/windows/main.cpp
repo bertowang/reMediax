@@ -199,6 +199,7 @@ int main(int argc, char** argv)
     aParams.channels = 2;
     aParams.aBitrate = opt.abitrate;
     aParams.aCodec = opt.acodec;
+    aParams.enabled = opt.audio;   // --no-audio：不建音频编码器与音频流
     capturer->SetupAudioEncoder(aParams);
 
     TGCapture::MuxerParams mParams;

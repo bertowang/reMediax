@@ -1,0 +1,8 @@
+// 顶层：只声明插件，不放具体模块配置
+plugins {
+    id 'com.android.library' version '8.5.2' apply false
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.buildDir
+}

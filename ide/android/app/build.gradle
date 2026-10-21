@@ -1,0 +1,52 @@
+// TGCapture native 模块：只产出 libtgcapture.a，不打包 APK（本工程是 SDK 不是 App）。
+// 若要换 ABI：同时改 abiFilters 与下面的 -DTG_ABI。
+plugins {
+    id 'com.android.library'
+}
+
+// 依赖目录（TGCapture3rd）解析：环境变量 TG_3RD_ROOT > 本仓库同级的 TGCapture3rd
+def thirdRoot = System.getenv("TG_3RD_ROOT")
+if (thirdRoot == null || thirdRoot.trim().isEmpty()) {
+    thirdRoot = new File(rootDir, "../../TGCapture3rd").canonicalPath
+}
+
+android {
+    namespace 'com.tencent.tgcapture'
+    compileSdk 34
+
+    // 与 FfmpegCompileShell 默认拉取的 NDK r27c 对齐；按本机实际安装版本调整
+    ndkVersion "27.0.12077973"
+
+    defaultConfig {
+        minSdk 21
+
+        externalNativeBuild {
+            cmake {
+                abiFilters 'arm64-v8a'
+                arguments '-DTG_PLATFORM=android',
+                          '-DTG_ABI=arm64-v8a',
+                          '-DTG_BUILD_DEMO=OFF',
+                          '-DANDROID_PLATFORM=android-21',
+                          '-DANDROID_STL=c++_shared',
+                          "-DTG_3RD_ROOT=${thirdRoot}"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            // 指向仓库根目录的 CMakeLists.txt（ide/android/app -> ../../../）
+            path "../../../CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+afterEvaluate {
+    println "TGCapture: TG_3RD_ROOT=${thirdRoot}"
+}
