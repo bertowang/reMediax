@@ -46,7 +46,8 @@ ffplay out.flv
 | 封装 | `flv`（rtmp/rtmps/文件）、`mpegts`（srt/文件）；协议 file / http(s) / rtmp(s) / tls / srt |
 | 性能模式 | `Cpu`（默认，内存帧 + CPU 缩放）、`Gpu`（全链路 GPU：显存直拷硬编） |
 | 兼容层 | `compat/ESMediaXCapturer.h`：`ESMediaX::ESCapturer::IESMediaXCapturer` 换一行 include 即可 |
-| 日志 | 自带 `core/Logger.h`（零第三方依赖），支持 level 与自定义 sink 转发宿主 |
+| 生命周期 | 状态机 + 回调；`Prepare`/`Start`/`Stop` 并发安全；支持同一实例反复重开（见 4.7） |
+| 日志 | 自带 `core/Logger.h`（零第三方依赖），level 分级、限频、接管 ffmpeg 日志、sink 转发宿主（见 4.6） |
 
 ---
 
@@ -279,6 +280,43 @@ Debug 日志在 Release 里也保留，好处是线上能临时打开排查。
 **当前限制**：`Init` 的 `logDir` / `printLog` 尚未实现文件落盘；
 Android / iOS 还没接 `__android_log_print` / `os_log` sink（移动端需先用 `SetSink` 转发）。
 
+### 4.7 线程模型、并发与重开
+
+**线程清单**（`Start()` 起、`Stop()` 停，均为 `std::jthread` + `stop_token`）
+
+| 线程 | 载体 | 职责 |
+| - | - | - |
+| 视频采集 | `VideoSourceBase`（各平台） | 出视频帧，回调 `OnVideoFrame` |
+| 音频采集 ×N | `AudioSourceBase`（各平台） | 出 PCM，进 `AudioMixer` |
+| 音频混流 | `TGCapturer::MixLoop` | `AudioMixer::Mix` 产一路 PCM，**并推进音频主时钟** |
+| 视频编码 | `VideoEncoder` worker | 编码 + 丢帧保护 |
+| 音频编码 | `AudioEncoder` worker | 编码 |
+| 封装 | `Muxer` worker | 交织写包 / 推流 |
+
+停止严格**逆数据流**：采集 → 混流 → 编码器 → 封装，每一步都 `join`，
+保证不再有回调后才收尾下一步（尾部包不丢）。
+
+**并发约束**
+
+- `Prepare()` / `Start()` / `Stop()` / `ReleaseAll()` 由一把 `std::recursive_mutex` 串行化，
+  状态转换用 `compare_exchange`，并发调用只有一个能生效。
+- **必须用 recursive_mutex**：`Prepare()` 内部会触发 `m_onPrepared` 回调，
+  而宿主的标准用法正是在回调里调 `Start()`（demo 就是这么写的），
+  同线程重入，普通 `std::mutex` 会自死锁。
+- 帧回调（`OnVideoFrame` / `OnAudioFrameFrom`）与 `MixLoop` **不取锁**，
+  只查 `m_state` 原子量 —— 否则停止流程 `join` 时会死锁。
+- 采集/编码/封装之间的队列本身是线程安全的（`BoundedQueue` 内部加锁）。
+
+**重开（Stop → Prepare → Start）**
+
+支持同一实例反复启停，并且每轮都会完整复位：队列重开、编码器统计、音频主时钟、
+混流器、首帧标志、封装交织基准。
+
+> 维护者注意：`BoundedQueue::Close()` 是**永久关闭**语义（用来唤醒阻塞的消费者），
+> 重开必须显式 `Reopen()`。各模块的 `Open()` 已经调用，新增队列时别漏。
+
+验证：`--restart <n>`（重开回归）、`--concur <n>`（Prepare/Stop 并发压测），见 §10。
+
 ---
 
 ## 5. 音画同步
@@ -296,6 +334,18 @@ Android / iOS 还没接 `__android_log_print` / `os_log` sink（移动端需先�
                                                           │
                                           Muxer 交织（领先 350ms 暂停写，超时自愈）
 ```
+
+**与 MediaX 的对齐情况**
+
+| MediaX 模块 / 档位 | 本工程 | 状态 |
+| - | - | - |
+| `AudioTimestampManager`（音频即主时钟，按采样数推进） | `AudioClock` + `AudioMixer` 输出时间轴 | 已对齐 |
+| `ReferenceClockManager`（系统时钟跳变限幅 + PI/BURST） | `AudioChannelClock` | 已对齐 |
+| `VideoPtsManager` · RangeNormal / RangeAdapt / RangeCatchUp | `VideoPtsGenerator` 三档（见 5.1） | 已对齐 |
+| `VideoPtsManager` · ForceAlign | 偏离 > 6×帧间隔时跳齐 | 已对齐（阈值更激进：6 帧 vs MediaX 5 帧量级） |
+| `VideoPtsManager` · Pause | 音频停滞 → 视频封顶 `maxLead` | 已对齐 |
+| BreakV / BreakA 交织自愈 | `Muxer` 交织 + stall 超时推基准 | 已对齐 |
+| 暂停 / 恢复独立档位 | 无，靠 ForceAlign 跳齐兜底 | **差异**（可接受：muted 时不推进 PTS，恢复时跳齐） |
 
 ### 5.1 视频 PTS 生成规则
 
@@ -359,6 +409,21 @@ TGCapturer: 音画同步 avDiff=-13ms clamp=0 forceSync=0 adapt=0 stall=0 skip=0
 | `jump` | 音频 PTS 跳变 / 回退告警 | 0 最佳 |
 | `staleReset` | 首帧命中残留时间轴的次数 | 0 最佳 |
 | `syncDrop` | 因音频停滞丢掉的视频帧 | 0 最佳 |
+
+### 5.4 设计约束：同步只有一个决策点
+
+**视频 PTS 只由 `VideoPtsGenerator` 决定，其它环节不得再参与"追不追、丢不丢"的决策。**
+
+编码器侧的 `AVSync::Judge` 只保留为最后一道兜底，且阈值由
+`forceSyncFactor × 帧间隔 × 1.5` 推导（`videoMaxLagUs = 0` 自动），
+保证它落在 RangeAdapt 正常工作区间**之外**。
+
+原因：丢帧发生在 `Next()` 之后，`m_currentPts` 早已推进，
+所以编码器丢帧**不改变时间轴**，只减少帧数。若阈值落在追赶区间内，
+就会出现"同步模块在渐进追赶、编码器同时砍帧率"的互相抵消 —— 白白丢帧而同步毫无改善。
+
+同理，音频超时降级为纯视频时间轴时必须重置 `m_sync`，
+否则编码器拿失效的音频时钟判"落后"，会把降级后所有视频帧丢弃。
 
 ---
 
@@ -571,8 +636,9 @@ ffplay out.flv                      # 实际播放确认音画同步
 | 窗口整窗 / 客户区 | `2012x2032` / `1990x2022`（`--no-border` 正确去边框） |
 | 麦克风 + 扬声器 | 两路 WASAPI 就绪，内核启用混流，输出 `h264 + aac` |
 | 设备枚举 | `--list-audio` 正确列出端点 |
-| 音画同步 | `avDiff` 稳定在 ±50ms 内，无 clamp / 跳变 / 丢帧 |
-| Stop → Start 重开 | 第二轮视频帧数正常，时间轴从 0 起，`m_lastPtsUs` 已随流复位 |
+| 音画同步 | `avDiff` 稳定在 ±25ms 内，`adapt` 0~5，无 clamp / 跳变 / 丢帧 |
+| Stop → Start 重开 | `--restart 2`：每轮 `encoded` 96~97、`dropped=0`，首帧回调每轮都触发 |
+| 并发启停 | `--concur 5`：5 秒 28~36 次完整启停，`exit=0`，无死锁 / 崩溃 / 挂起 |
 | GPU 全链路 | `h264_nvenc` + D3D11 帧池（fmt=`AV_PIX_FMT_D3D11`, sw=`BGRA`），3 秒 98 帧，文件可解析 |
 | 稳定性 | 同配置连跑 5 次均 `exit=0`、产物有效 |
 
@@ -588,3 +654,21 @@ ffplay out.flv                      # 实际播放确认音画同步
 * **日志**：`Init` 的 `logDir` / `printLog` 未实现；移动端未接 `__android_log_print` / `os_log` sink（见 4.6）。
 * 暂停静帧、水印、本地文件采集为接口占位（返回 0 或告警）。
 * `GetStatsInfo` 当前返回基础 JSON（码率 / 队列 / 编码器统计）。
+* **并发**：`Prepare`/`Start`/`Stop` 已串行化（见 4.7），但 `Prepare()` 失败路径的回滚
+  目前只覆盖 Muxer；新增模块时记得在自己的失败分支里收尾。
+
+---
+
+## 12. 维护者注意事项（易踩的坑）
+
+都是踩过一次才发现的，改这几处时务必留意。
+
+| 坑 | 现象 | 约束 |
+| - | - | - |
+| `AvErr()` 一条日志只能用一次 | 第二次会覆盖第一次的输出 | 它返回 `thread_local` 缓冲；需要两个错误码就分两条日志 |
+| 宏里用 `__LINE__` 拼变量名 | MSVC 传统预处理器在宏的多行展开中取值不一致，报"未声明的标识符" | `TG_LOG*_THROTTLED` 改用 lambda 携带 `static` 局部量，新增限频宏照此写 |
+| 音频采集不填 `captureUs` | 通道时钟的参考时钟退化成常数，每帧触发 ForceAlign，drift 统计全废 | 三端音频采集都要填（`AudioMixer::Push` 有兜底，但采集端应主动填） |
+| `BoundedQueue::Close()` | 是**永久关闭**语义，不 `Reopen()` 的话后续 `Push` 全部失败 | 新增队列时在对应 `Open()` 里 `Reopen()`（见 4.7） |
+| 编码器里再加同步逻辑 | 与 `VideoPtsGenerator` 互相抵消 | 同步只有一个决策点，见 5.4 |
+| `Worker::Loop()` 抛异常 | 直接 `terminate`，不留日志 | 子类 `Loop` 目前没有 try/catch 兜底，新增循环体自己保证不抛 |
+| 改 `VideoEncoder::Close()` | 漏复位 `m_lastPtsUs` 会让重开的全视频帧被判成 PTS 回退丢弃 | 新增"随流状态"时一并考虑复位 |
