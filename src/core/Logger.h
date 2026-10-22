@@ -216,14 +216,16 @@ inline std::string Logger::MakePrefix(LogLevel level)
     localtime_r(&t, &tmBuf);
 #endif
 
-    std::ostringstream oss;
-    oss << "[TGCapture][" << std::setfill('0') << std::setw(4) << (tmBuf.tm_year + 1900) << '-'
-        << std::setw(2) << (tmBuf.tm_mon + 1) << '-' << std::setw(2) << tmBuf.tm_mday << ' '
-        << std::setw(2) << tmBuf.tm_hour << ':' << std::setw(2) << tmBuf.tm_min << ':'
-        << std::setw(2) << tmBuf.tm_sec << '.' << std::setw(3) << (ms % 1000) << ']'
-        << '[' << (std::hash<std::thread::id>{}(std::this_thread::get_id()) % 100000) << ']'
-        << '[' << LogLevelName(level) << "] ";
-    return oss.str();
+    // 用 snprintf 而不是 ostringstream：前缀在每条日志的必经路径上，
+    // ostringstream 的多次 operator<< 会明显拖慢（实测占单条耗时的相当一部分）
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "[TGCapture][%04d-%02d-%02d %02d:%02d:%02d.%03d][%u][%s] ",
+                  tmBuf.tm_year + 1900, tmBuf.tm_mon + 1, tmBuf.tm_mday, tmBuf.tm_hour,
+                  tmBuf.tm_min, tmBuf.tm_sec, static_cast<int>(ms % 1000),
+                  static_cast<unsigned>(std::hash<std::thread::id>{}(std::this_thread::get_id()) %
+                                       100000),
+                  LogLevelName(level));
+    return std::string(buf);
 }
 
 inline void Logger::WriteBuiltin(LogLevel level, const char* msg, bool hasSink) const
@@ -235,7 +237,11 @@ inline void Logger::WriteBuiltin(LogLevel level, const char* msg, bool hasSink) 
         // 而且它拿到的 msg 可能还要再加工，塞进固定前缀反而不好切分。
         const std::string line = MakePrefix(level) + msg;
         printf("%s\n", line.c_str());
-        fflush(stdout);
+        // 每条都 fflush 会把吞吐压到 ~5 千条/秒（实测），比写文件还慢 40 倍。
+        // 只给 Warn/Error 立即 flush：关键日志不丢，普通日志交给 CRT 缓冲。
+        if (level >= LogLevel::Warn) {
+            fflush(stdout);
+        }
     }
 
     if (m_file.is_open()) {

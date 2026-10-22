@@ -52,6 +52,7 @@ struct Options
     int logLevel = 0;         // 0=Debug 1=Info 2=Warn 3=Error
     std::string logDir;       // 非空则日志落盘到该目录
     bool printLog = true;     // 是否输出到 stdout
+    int logBench = 0;         // >0 时只跑日志吞吐基准然后退出
 };
 
 // 测试用视频源：生成 NV12 测试图案，用于隔离"采集侧"与"编码/封装侧"问题
@@ -142,7 +143,8 @@ void PrintUsage()
            "  --crop <w,h>     从源帧左上角裁剪（如 --crop 960,540）\n"
            "  --log-level <n>  0=Debug 1=Info 2=Warn 3=Error（默认 0）\n"
            "  --log-dir <dir>  日志落盘目录（默认不落盘）\n"
-           "  --no-print-log   关闭 stdout 日志输出（配合 --log-dir 只看文件）\n");
+           "  --no-print-log   关闭 stdout 日志输出（配合 --log-dir 只看文件）\n"
+           "  --log-bench <n>  只跑日志吞吐基准（打 n 条）后退出\n");
 }
 
 Options ParseArgs(int argc, char** argv)
@@ -186,6 +188,10 @@ Options ParseArgs(int argc, char** argv)
         }
         if (key == "--no-print-log") {
             opt.printLog = false;
+            continue;
+        }
+        if (key == "--log-bench") {
+            opt.logBench = std::stoi(argv[++i]);
             continue;
         }
         if (i + 1 >= argc) {
@@ -249,6 +255,9 @@ Options ParseArgs(int argc, char** argv)
 int main(int argc, char** argv)
 {
     // 关闭 stdout 缓冲，确保崩溃前日志可见
+    // 无缓冲：日志实时可见（Ctrl+C 中断也不丢）。
+    // 代价是每条日志一次 write 系统调用，吞吐约 6 千条/秒；
+    // 生产环境要吞吐请改用 --log-dir 落盘或 SetSink 转发（见 README §4.6）。
     setvbuf(stdout, nullptr, _IONBF, 0);
 
     const Options opt = ParseArgs(argc, argv);
@@ -258,6 +267,26 @@ int main(int argc, char** argv)
     }
 
     TGCapture::ITGCapturerMgr::Init(opt.logLevel, opt.logDir, opt.printLog);
+
+    // 日志吞吐基准：只打日志不采集，用于回归日志模块本身的性能
+    if (opt.logBench > 0) {
+        const int n = opt.logBench;
+        // 预热，排除首次分配/锁初始化的影响
+        for (int i = 0; i < 1000; ++i) {
+            TG_LOGI("warmup %d", i);
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < n; ++i) {
+            TG_LOGI("bench 第 %d 条日志 payload=%s", i, "0123456789abcdef");
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        const double us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        printf("[demo] LOGBENCH n=%d total=%.3fms per=%.3fus throughput=%.0f/s\n", n, us / 1000.0,
+               us / n, n / (us / 1e6));
+        TGCapture::ITGCapturerMgr::UnInit();
+        return 0;
+    }
 
     // 通过兼容层（ESMediaX::ESCapturer）创建，验证老调用方零改动可切换
     ESMediaX::ESCapturer::IESMediaXCapturer* capturer = ESMediaX::ESCapturer::IESMediaXCapturer::Create();

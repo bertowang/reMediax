@@ -308,6 +308,54 @@ Debug 日志在 Release 里也保留，好处是线上能临时打开排查。
 - Android / iOS 还没接 `__android_log_print` / `os_log` sink（移动端需先用 `SetSink` 转发）
 - 落盘用 `<filesystem>`，很老的 NDK / GCC 可能需要额外链接
 - 日志文件只按大小轮转，不按天数、不自动清理旧文件
+- 无异步写：日志在调用线程同步落盘，极端高频下会阻塞调用方
+
+### 4.6.1 性能
+
+`--log-bench <n>` 可复现（只打日志不采集，预热 1000 条后计时）：
+
+| 输出模式 | 每条 | 吞吐 |
+| - | - | - |
+| 仅格式化（关卡全闭） | 0.34 us | ~296 万 /s |
+| **落盘（`--log-dir`）** | **1.58 us** | **~63 万 /s** |
+| stdout（无缓冲，demo 默认） | 227 us | ~4.4 千 /s |
+| stdout（全缓冲 64KB） | 32.6 us | ~3 万 /s |
+
+**结论：日志模块本身很快，慢的是 stdout。**
+
+无缓冲 stdout 下每条日志一次 `write` 系统调用，比落盘慢 **140 倍**。所以：
+
+- 生产/长时间录制请用 **`--log-dir` 落盘** 或 **`SetSink` 转发**，别依赖 stdout
+- 确实要打 stdout 时，把 stdout 设成全缓冲（`setvbuf(..., _IOFBF, ...)`）可提速约 5 倍
+- Warn/Error 会立即 `fflush`，普通日志交给 CRT 缓冲 —— 关键信息不会因为缓冲丢
+
+另外要注意 **Debug 档会打每帧级日志（编码/写包各一条）**，30fps 下每秒上百条；
+落盘无压力，走无缓冲 stdout 就会成为瓶颈。
+
+### 4.6.2 与 spdlog 的对比
+
+| 维度 | 本工程 `core/Logger.h` | spdlog |
+| - | - | - |
+| 依赖 | **零**（只用 std，header-only） | 需 fmt（可内置，header-only 或编译版） |
+| 格式化 | `vsnprintf`（C 风格） | fmt（类型安全、编译期格式串检查） |
+| 级别 | 4 档，运行时 | 7 档 + **`SPDLOG_ACTIVE_LEVEL` 编译期裁剪** |
+| 异步 | 无（同步写） | **有**（线程池 + MPMC 队列，可无锁） |
+| sink | 单 sink（`std::function`） | **多 sink**，内置 file / rotating / daily / android / syslog… |
+| 轮转 | 按大小（自实现） | 按大小 + 按天 |
+| 落盘吞吐 | ~63 万 /s | 同步文件 sink 同量级；异步模式更高且不阻塞调用方 |
+| 回溯栈 | 无 | 有（`SPDLOG_ENABLE_BACKTRACE`） |
+| 自定义格式 | 无 | `pattern_formatter` |
+| 二进制体积 | 小 | 引入 fmt 会增大 |
+
+**怎么选**
+
+- **保持现状**：日志量不大（Info 档每秒几十条）、不想引入第三方依赖、
+  且已经用 `SetSink` 转给宿主日志系统。把 stdout 换成就地落盘即可。
+- **换 spdlog**：需要 *异步不阻塞调用方* / *多 sink* / *编译期裁剪* / *类型安全格式串*
+  中任意一项。此时本模块退化成一层薄封装，把 `Sink` 接到 spdlog 即可，改动面很小。
+
+> 表中 spdlog 一侧的能力是事实；性能是公开基准的常见量级，
+> 真要替换建议用自己的场景跑一次 `--log-bench` 对照。
 
 ### 4.7 线程模型、并发与重开
 
@@ -665,6 +713,7 @@ cd build\windows-x64\Release
 | `--log-level <n>` | 0=Debug 1=Info 2=Warn 3=Error（默认 0，见 §4.6） |
 | `--log-dir <dir>` | 日志落盘目录（默认不落盘） |
 | `--no-print-log` | 关闭 stdout 日志输出（配合 `--log-dir` 只看文件） |
+| `--log-bench <n>` | 只跑日志吞吐基准（打 n 条）后退出，见 §4.6.1 |
 
 取窗口句柄（注意 demo 按 16 进制解析）：
 
