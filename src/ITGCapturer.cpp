@@ -74,8 +74,17 @@ int ITGCapturerMgr::Init(int logLevel, const std::string& logDir, bool printLog)
             core::Logger::Instance().SetLevel(core::LogLevel::Info);
             break;
     }
-    av_log_set_level(logLevel >= 2 ? AV_LOG_ERROR : AV_LOG_INFO);
+    // ffmpeg 自己的日志级别跟着内核档位走。
+    // 之前是 ">=2 一律 AV_LOG_ERROR"，导致 Warn 档反而看不到 ffmpeg 的 warning。
+    const int avLevel = (logLevel >= 3) ? AV_LOG_ERROR
+                                        : (logLevel == 2) ? AV_LOG_WARNING
+                                                          : AV_LOG_INFO;
+    av_log_set_level(avLevel);
     av_log_set_callback(AvLogCallback);
+    core::Logger::Instance().SetPrintLog(printLog);
+    if (!logDir.empty() && !core::Logger::Instance().OpenLogFile(logDir)) {
+        TG_LOGW("TGCapturerMgr: 日志文件打开失败，仅走 stdout/sink（dir=%s）", logDir.c_str());
+    }
     TG_LOGI("TGCapture 初始化完成 logLevel=%d dir=%s printLog=%d", logLevel, logDir.c_str(),
             printLog ? 1 : 0);
     return 0;
@@ -85,6 +94,7 @@ void ITGCapturerMgr::UnInit()
 {
     avformat_network_deinit();
     TG_LOGI("TGCapture 反初始化完成");
+    core::Logger::Instance().CloseLogFile();
     av_log_set_callback(nullptr);
     core::Logger::Instance().Reset();
 }

@@ -49,6 +49,9 @@ struct Options
     bool flipV = false;       // 垂直翻转
     int cropW = 0;            // 裁剪（源帧左上角为原点）
     int cropH = 0;
+    int logLevel = 0;         // 0=Debug 1=Info 2=Warn 3=Error
+    std::string logDir;       // 非空则日志落盘到该目录
+    bool printLog = true;     // 是否输出到 stdout
 };
 
 // 测试用视频源：生成 NV12 测试图案，用于隔离"采集侧"与"编码/封装侧"问题
@@ -136,7 +139,10 @@ void PrintUsage()
            "  --concur <n>     并发压测：Prepare 与 Stop 两条线程交错冲击 n 秒，验证生命周期互斥\n"
            "  --rotate <deg>   画面旋转，取 0/90/180/270\n"
            "  --flip <h|v|both> 画面翻转：h=水平镜像，v=垂直翻转\n"
-           "  --crop <w,h>     从源帧左上角裁剪（如 --crop 960,540）\n");
+           "  --crop <w,h>     从源帧左上角裁剪（如 --crop 960,540）\n"
+           "  --log-level <n>  0=Debug 1=Info 2=Warn 3=Error（默认 0）\n"
+           "  --log-dir <dir>  日志落盘目录（默认不落盘）\n"
+           "  --no-print-log   关闭 stdout 日志输出（配合 --log-dir 只看文件）\n");
 }
 
 Options ParseArgs(int argc, char** argv)
@@ -164,8 +170,22 @@ Options ParseArgs(int argc, char** argv)
             opt.listAudio = true;
             continue;
         }
+        // 无 value 的开关一律在这里处理掉：不能让它们走到下面的 value 分支，
+        // 否则会误吞下一个参数；放在命令行末尾时还会因为 i+1 越界被整条跳过。
         if (key == "--gpu") {
             opt.perf = "gpu";
+            continue;
+        }
+        if (key == "--no-audio") {
+            opt.audio = false;
+            continue;
+        }
+        if (key == "--fake-video") {
+            opt.fakeVideo = true;
+            continue;
+        }
+        if (key == "--no-print-log") {
+            opt.printLog = false;
             continue;
         }
         if (i + 1 >= argc) {
@@ -206,6 +226,12 @@ Options ParseArgs(int argc, char** argv)
         } else if (key == "--flip") {
             opt.flipH = (value == "h" || value == "both");
             opt.flipV = (value == "v" || value == "both");
+        } else if (key == "--log-level") {
+            opt.logLevel = std::stoi(value);
+        } else if (key == "--log-dir") {
+            opt.logDir = value;
+        } else if (key == "--no-print-log") {
+            opt.printLog = false;
         } else if (key == "--crop") {
             const auto comma = value.find(',');
             if (comma != std::string::npos) {
@@ -231,7 +257,7 @@ int main(int argc, char** argv)
         return 0;
     }
 
-    TGCapture::ITGCapturerMgr::Init(0);  // 0=Debug，便于排查
+    TGCapture::ITGCapturerMgr::Init(opt.logLevel, opt.logDir, opt.printLog);
 
     // 通过兼容层（ESMediaX::ESCapturer）创建，验证老调用方零改动可切换
     ESMediaX::ESCapturer::IESMediaXCapturer* capturer = ESMediaX::ESCapturer::IESMediaXCapturer::Create();

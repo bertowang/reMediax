@@ -246,17 +246,43 @@ TGCapture::core::Logger::Instance().SetSink(
     [](TGCapture::core::LogLevel lv, const char* msg) { /* 转发到宿主日志系统 */ });
 ```
 
-默认输出到 `stdout`，格式 `[TGCapture][D/I/W/E] msg`。
+**输出三路**（可叠加）
 
-**分级**：只有运行时一档（`Init` 的 `logLevel`），**没有编译期裁剪**——
+```cpp
+// logLevel: 0=Debug 1=Info 2=Warn 3=Error
+// logDir:   非空则落盘到该目录（会自动创建）；空则不落盘
+// printLog: 是否输出到 stdout（设了 sink 后自动不再往 stdout 打）
+ITGCapturerMgr::Init(logLevel, logDir, printLog);
+```
+
+| 输出 | 条件 | 格式 |
+| - | - | - |
+| sink | `SetSink()` 设置了 | 宿主收到 `(level, 原始 msg)`，**不带前缀**，由宿主自行格式化 |
+| stdout | `printLog=true` 且未设 sink | `[TGCapture][时间][线程][级别] msg` |
+| 文件 | `logDir` 非空 | 同 stdout 格式，按大小轮转 |
+
+**前缀示例**（时间戳精确到毫秒，线程 id 用于区分采集/编码/封装线程）：
+
+```
+[TGCapture][2026-10-22 14:29:01.696][7184][I] TGCapturer: 已启动
+[TGCapture][2026-10-22 14:29:01.588][60036][D] VideoEncoder[#0]: 编码 1280x720 pts=0
+[TGCapture][2026-10-22 14:29:01.617][64406][D] Muxer: 写包 stream=0 pts=0 size=4255
+```
+
+**日志文件**：`<logDir>/tgcapture_<YYYYMMDD_HHMMSS>.log`，单个超过 32MB 切
+`..._1.log`、`..._2.log`…。`UnInit()` 会关闭文件。
+
+**分级**：只有运行时一档，**没有编译期裁剪**——
 Debug 日志在 Release 里也保留，好处是线上能临时打开排查。
 
-| `logLevel` | 级别 | 内容 |
-| - | - | - |
-| 0 | Debug | 每帧级追踪（线程进出、前几帧编码、写包） |
-| 1 | Info（默认） | 生命周期、就绪、收尾统计 |
-| 2 | Warn | 只保留异常与降级 |
-| 3 | Error | 只保留失败 |
+| `logLevel` | 级别 | 内容 | ffmpeg 侧 |
+| - | - | - | - |
+| 0 | Debug | 每帧级追踪（线程进出、前几帧编码、写包） | `AV_LOG_INFO` |
+| 1 | Info（默认） | 生命周期、就绪、收尾统计 | `AV_LOG_INFO` |
+| 2 | Warn | 只保留异常与降级 | `AV_LOG_WARNING` |
+| 3 | Error | 只保留失败 | `AV_LOG_ERROR` |
+
+实测四档（1 秒录制）：`0 → D27/I10/W2`，`1 → D0/I10/W2`，`2 → D0/I0/W2`，`3 → D0/I0/W0`。
 
 **异常可读性**
 
@@ -274,11 +300,14 @@ Debug 日志在 Release 里也保留，好处是线上能临时打开排查。
 **已补日志的静默路径**：编码器背压丢帧、PTS 回退丢帧、视频落后音频丢帧、
 `send_frame` / `receive_packet` 失败、drain 收包失败、混流取不到数据、音频通道时钟漂移。
 
-**线程安全**：`SetSink` / `Log` 对 sink 加锁，且回调前先拷一份再解锁
-（宿主日志系统反向调回来不会死锁）。`UnInit()` 会复位 level / sink 并摘掉 av_log 回调。
+**线程安全**：`SetSink` / `Log` / 落盘 共用一把锁，且回调前先拷一份再解锁
+（宿主日志系统反向调回来不会死锁）。`UnInit()` 会关闭日志文件、复位 level / sink
+并摘掉 av_log 回调。
 
-**当前限制**：`Init` 的 `logDir` / `printLog` 尚未实现文件落盘；
-Android / iOS 还没接 `__android_log_print` / `os_log` sink（移动端需先用 `SetSink` 转发）。
+**当前限制**：
+- Android / iOS 还没接 `__android_log_print` / `os_log` sink（移动端需先用 `SetSink` 转发）
+- 落盘用 `<filesystem>`，很老的 NDK / GCC 可能需要额外链接
+- 日志文件只按大小轮转，不按天数、不自动清理旧文件
 
 ### 4.7 线程模型、并发与重开
 
@@ -633,6 +662,9 @@ cd build\windows-x64\Release
 | `--rotate <deg>` | 画面旋转 0 / 90 / 180 / 270 |
 | `--flip <h\|v\|both>` | 画面翻转：h=水平镜像，v=垂直翻转 |
 | `--crop <w,h>` | 从源帧左上角裁剪（如 `--crop 960,540`） |
+| `--log-level <n>` | 0=Debug 1=Info 2=Warn 3=Error（默认 0，见 §4.6） |
+| `--log-dir <dir>` | 日志落盘目录（默认不落盘） |
+| `--no-print-log` | 关闭 stdout 日志输出（配合 `--log-dir` 只看文件） |
 
 取窗口句柄（注意 demo 按 16 进制解析）：
 
@@ -668,6 +700,8 @@ cd build\windows-x64\Release
 | 16 | 旋转自洽 | `--rotate 90` vs `--rotate 270` | 两者左上/右下互为交换 |
 | 17 | 翻转自洽 | `--flip both` vs `--rotate 180` | 两者结果**完全一致**（水平+垂直 = 180°） |
 | 18 | 裁剪 | `--crop 640,360 --fake-video` | 画面只剩源左上区域，整体变暗 |
+| 19 | 日志分级 | `--log-level 0/1/2/3` | 依次 `D27/I10/W2`、`D0/I10/W2`、`D0/I0/W2`、`D0/I0/W0` |
+| 20 | 日志落盘 | `--log-dir logs --no-print-log` | stdout 只剩 demo 自己的输出；`logs/tgcapture_*.log` 有完整内容 |
 
 > 15~18 用 `--fake-video` 的人造图案（左暗右亮 + 上暗下亮）验证，
 > 判读方式：`ffprobe -f lavfi -i "movie=v.flv,crop=iw/2:ih/2:0:0,signalstats"` 取左上/右下平均亮度。
