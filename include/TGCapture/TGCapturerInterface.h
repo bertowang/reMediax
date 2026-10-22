@@ -190,6 +190,22 @@ struct VideoEncoderParams
     // 不可用时自动回落 Cpu；想强制 Cpu 就显式设为 Cpu。
     PerformanceMode perfMode = PerformanceMode::Cpu;
 
+    // ---- 画面变换（采集帧 → 编码分辨率之前统一应用）----
+    // 顺序固定为 crop → 翻转 → 旋转 → 缩放 → 像素格式转换。
+    // 全部留默认 = 不做变换，走原有的 sws_scale 路径（零额外开销）。
+    int videoRotation = 0;             // 顺时针，只取 0 / 90 / 180 / 270
+    bool videoFlipHorizontal = false;  // 水平镜像
+    bool videoFlipVertical = false;    // 垂直翻转
+    int videoCropX = 0;                // 裁剪原点（源帧坐标系）
+    int videoCropY = 0;
+    int videoCropWidth = 0;            // <=0 表示不裁剪
+    int videoCropHeight = 0;
+
+    // GPU 模式下，若需要变换或采集分辨率与编码分辨率不一致，
+    // 是否允许把纹理回读到内存用 libyuv 处理（否则该帧直接丢弃）。
+    // 关掉可保证 GPU 链路"绝不出显存"，代价是这类帧会被跳过。
+    bool gpuAllowReadbackFallback = true;
+
     // ---- 音画同步 ----
     int64_t videoMaxLeadUs = 500000;   // 音频停滞时视频最多超前多少（默认 500ms）
     // 视频落后音频超过多少就丢帧（编码器侧最后一道兜底）。

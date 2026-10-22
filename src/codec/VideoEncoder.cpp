@@ -244,9 +244,102 @@ bool VideoEncoder::CopyFromD3D11Texture(const core::FramePtr& frame, AVFrame* ds
     if (!dstTex) {
         return false;
     }
+
+    // 尺寸校验：CopySubresourceRegion 是 1:1 块拷贝，尺寸不一致时
+    // D3D11 会直接失败（或只拷一部分），之前这里既不比对也不查返回值。
+    D3D11_TEXTURE2D_DESC srcDesc = {};
+    D3D11_TEXTURE2D_DESC dstDesc = {};
+    src->GetDesc(&srcDesc);
+    dstTex->GetDesc(&dstDesc);
+    if (srcDesc.Width != dstDesc.Width || srcDesc.Height != dstDesc.Height) {
+        TG_LOGW_THROTTLED(2000000, "VideoEncoder: GPU 帧尺寸 %ux%u != 编码器 %ux%u，需回退归一化",
+                          srcDesc.Width, srcDesc.Height, dstDesc.Width, dstDesc.Height);
+        return false;
+    }
+
     const UINT subResource = static_cast<UINT>(reinterpret_cast<uintptr_t>(dst->data[1]));
     // 纯显存拷贝：无 CPU 回读、无像素搬运
     m_d3dContext->CopySubresourceRegion(dstTex, subResource, 0, 0, 0, src, 0, nullptr);
+    return true;
+}
+
+bool VideoEncoder::EnsureStagingTexture(int width, int height)
+{
+    if (m_stagingTex && m_stagingWidth == width && m_stagingHeight == height) {
+        return true;
+    }
+    if (m_stagingTex) {
+        m_stagingTex->Release();
+        m_stagingTex = nullptr;
+    }
+    auto* device = static_cast<ID3D11Device*>(m_externalDevice);
+    if (!device) {
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = static_cast<UINT>(width);
+    desc.Height = static_cast<UINT>(height);
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(device->CreateTexture2D(&desc, nullptr, &m_stagingTex))) {
+        m_stagingTex = nullptr;
+        return false;
+    }
+    m_stagingWidth = width;
+    m_stagingHeight = height;
+    return true;
+}
+
+bool VideoEncoder::ReadBackD3D11Texture(const core::FramePtr& frame, core::FramePtr& out)
+{
+    if (!m_d3dContext || !frame || !frame->hwHandle) {
+        return false;
+    }
+    auto* src = static_cast<ID3D11Texture2D*>(frame->hwHandle);
+    D3D11_TEXTURE2D_DESC desc = {};
+    src->GetDesc(&desc);
+    if (desc.Width == 0 || desc.Height == 0) {
+        return false;
+    }
+    if (!EnsureStagingTexture(static_cast<int>(desc.Width), static_cast<int>(desc.Height))) {
+        return false;
+    }
+
+    m_d3dContext->CopyResource(m_stagingTex, src);
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(m_d3dContext->Map(m_stagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {
+        return false;
+    }
+
+    const int w = static_cast<int>(desc.Width);
+    const int h = static_cast<int>(desc.Height);
+    const size_t bytes = static_cast<size_t>(mapped.RowPitch) * h;
+    auto buffer = std::shared_ptr<uint8_t>(new uint8_t[bytes], std::default_delete<uint8_t[]>());
+    const uint8_t* srcPtr = static_cast<const uint8_t*>(mapped.pData);
+    if (mapped.RowPitch == static_cast<UINT>(w * 4)) {
+        memcpy(buffer.get(), srcPtr, bytes);
+    } else {
+        for (int y = 0; y < h; ++y) {
+            memcpy(buffer.get() + static_cast<size_t>(y) * w * 4, srcPtr + static_cast<size_t>(y) * mapped.RowPitch,
+                   static_cast<size_t>(w) * 4);
+        }
+    }
+    m_d3dContext->Unmap(m_stagingTex, 0);
+
+    out = core::MakeVideoFrame();
+    out->width = w;
+    out->height = h;
+    out->pixFmt = AV_PIX_FMT_BGRA;
+    out->planes[0] = buffer;
+    out->strides[0] = w * 4;
+    out->ptsUs = frame->ptsUs;
+    out->captureUs = frame->captureUs;
+    out->rotation = frame->rotation;
+    out->sourceId = frame->sourceId;
     return true;
 }
 #endif
@@ -430,6 +523,38 @@ core::AVFramePtr VideoEncoder::BuildAVFrame(const core::FramePtr& frame)
 
     // ---- 硬件直连（GPU 模式）----
     if (m_useHwFrame && frame->hwHandle != nullptr) {
+        // 需要变换或分辨率不一致时，纯显存拷贝无法完成归一化。
+        // 允许回读的话把纹理搬回内存交给归一化层，否则这一帧只能放弃。
+        const bool needTransform = !m_transform.IsIdentity();
+        if (needTransform && !m_gpuReadbackFallback) {
+            TG_LOGW_THROTTLED(3000000, "VideoEncoder: GPU 模式需变换但回退已关闭，丢弃该帧");
+            return nullptr;
+        }
+        if (needTransform) {
+            core::FramePtr cpuFrame;
+#ifdef _WIN32
+            if (m_ctx->pix_fmt == AV_PIX_FMT_D3D11 && frame->hwKind == core::HwKind::D3D11Texture) {
+                ReadBackD3D11Texture(frame, cpuFrame);
+            }
+#endif
+            core::FramePtr normalized;
+            if (cpuFrame &&
+                core::ApplyVideoTransform(*cpuFrame, m_transform, m_ctx->width, m_ctx->height,
+                                          AV_PIX_FMT_NV12, normalized) &&
+                normalized) {
+                // 硬件路径下 avFrame->format 是 AV_PIX_FMT_D3D11，sws_scale 写不进去。
+                // 回退时必须换成软件帧：ffmpeg 会在 send_frame 时自动 upload 回显存。
+                auto swFrame = core::MakeAVFrame();
+                swFrame->format = AV_PIX_FMT_NV12;
+                swFrame->width = m_ctx->width;
+                swFrame->height = m_ctx->height;
+                swFrame->pkt_dts = AV_NOPTS_VALUE;
+                if (FillFromCpuFrame(normalized, swFrame)) {
+                    return swFrame;
+                }
+            }
+        }
+
 #ifdef _WIN32
         // Windows：D3D11 纹理。从帧池取一个硬件帧，把采集纹理在显存里拷进去（无 CPU 回读）
         if (m_ctx->pix_fmt == AV_PIX_FMT_D3D11 && m_hwFramesCtx &&
@@ -437,7 +562,23 @@ core::AVFramePtr VideoEncoder::BuildAVFrame(const core::FramePtr& frame)
             if (av_hwframe_get_buffer(m_hwFramesCtx, avFrame.get(), 0) < 0) {
                 TG_LOGW("VideoEncoder: 硬件帧分配失败，本帧走系统内存");
             } else if (!CopyFromD3D11Texture(frame, avFrame.get())) {
-                TG_LOGW("VideoEncoder: 显存拷贝失败，本帧走系统内存");
+                // 尺寸不匹配等原因导致显存拷贝失败：允许回读就转 CPU 归一化，否则放弃
+                core::FramePtr cpuFrame;
+                core::FramePtr normalized;
+                if (m_gpuReadbackFallback && ReadBackD3D11Texture(frame, cpuFrame) && cpuFrame &&
+                    core::ApplyVideoTransform(*cpuFrame, m_transform, m_ctx->width, m_ctx->height,
+                                              AV_PIX_FMT_NV12, normalized) &&
+                    normalized) {
+                    auto swFrame = core::MakeAVFrame();
+                    swFrame->format = AV_PIX_FMT_NV12;
+                    swFrame->width = m_ctx->width;
+                    swFrame->height = m_ctx->height;
+                    swFrame->pkt_dts = AV_NOPTS_VALUE;
+                    if (FillFromCpuFrame(normalized, swFrame)) {
+                        return swFrame;
+                    }
+                }
+                return nullptr;
             } else {
                 return avFrame;
             }
@@ -463,30 +604,82 @@ core::AVFramePtr VideoEncoder::BuildAVFrame(const core::FramePtr& frame)
         TG_LOGW("VideoEncoder: 硬件帧不可用，本帧走系统内存");
     }
 
-    // 系统内存帧：经 sws_scale 归一到编码器的尺寸与像素格式
+    // 系统内存帧：先做画面变换（若配置），再经 sws_scale 归一到编码器的尺寸与像素格式
     // （采集分辨率常与推流分辨率不同，直接 memcpy 会越界，这里统一做缩放/格式转换）
     if (frame->planes[0]) {
-        const int srcW = frame->width > 0 ? frame->width : m_ctx->width;
-        const int srcH = frame->height > 0 ? frame->height : m_ctx->height;
-        const AVPixelFormat srcFmt = frame->pixFmt != AV_PIX_FMT_NONE ? frame->pixFmt : AV_PIX_FMT_NV12;
-        if (!EnsureSwsContext(srcW, srcH, srcFmt)) {
-            return nullptr;
-        }
-        if (av_frame_get_buffer(avFrame.get(), 32) < 0) {
-            return nullptr;
-        }
-        const uint8_t* srcData[4] = {frame->planes[0].get(), frame->planes[1].get(),
-                                     frame->planes[2].get(), nullptr};
-        int srcLinesize[4] = {frame->strides[0], frame->strides[1], frame->strides[2], 0};
-        sws_scale(m_sws, srcData, srcLinesize, 0, srcH, avFrame->data, avFrame->linesize);
-        avFrame->pts = frame->ptsUs >= 0
-                           ? av_rescale_q(frame->ptsUs, AVRational{1, 1000000}, m_ctx->time_base)
-                           : AV_NOPTS_VALUE;
-        return avFrame;
+        const core::FramePtr source = NormalizeFrame(frame);
+        return FillFromCpuFrame(source ? source : frame, avFrame) ? avFrame : nullptr;
     }
 
     // 空帧（仅用于 flush）
     return nullptr;
+}
+
+core::FramePtr VideoEncoder::NormalizeFrame(const core::FramePtr& frame)
+{
+    if (!frame || m_transform.IsIdentity()) {
+        return frame;   // 恒等变换：不做任何额外处理（零开销）
+    }
+    core::FramePtr out;
+    if (!core::ApplyVideoTransform(*frame, m_transform, m_ctx->width, m_ctx->height,
+                                   AV_PIX_FMT_NV12, out) ||
+        !out) {
+        TG_LOGW_THROTTLED(3000000, "VideoEncoder: 画面归一化失败，本帧按原样编码");
+        return frame;
+    }
+    return out;
+}
+
+bool VideoEncoder::FillFromCpuFrame(const core::FramePtr& src, core::AVFramePtr& avFrame)
+{
+    if (!src || !src->planes[0] || !avFrame || !m_ctx) {
+        return false;
+    }
+    const int srcW = src->width > 0 ? src->width : m_ctx->width;
+    const int srcH = src->height > 0 ? src->height : m_ctx->height;
+    const AVPixelFormat srcFmt = src->pixFmt != AV_PIX_FMT_NONE ? src->pixFmt : AV_PIX_FMT_NV12;
+    avFrame->width = m_ctx->width;
+    avFrame->height = m_ctx->height;
+
+    // 归一化层的输出已经是编码器的尺寸与目标格式时，直接拷平面，
+    // 不要再过一遍 sws_scale —— GPU 回退路径上这一帧可能几十 MB，省一次全帧搬运很值。
+    if (srcFmt == avFrame->format && srcW == m_ctx->width && srcH == m_ctx->height &&
+        src->planes[0] && src->planes[1]) {
+        if (av_frame_get_buffer(avFrame.get(), 32) < 0) {
+            return false;
+        }
+        const int planes = (srcFmt == AV_PIX_FMT_NV12) ? 2 : 3;
+        for (int p = 0; p < planes; ++p) {
+            if (!src->planes[p]) {
+                return false;
+            }
+            const int copyH = (p == 0) ? srcH : srcH / 2;
+            const size_t rowBytes = std::min(src->strides[p], avFrame->linesize[p]);
+            for (int y = 0; y < copyH; ++y) {
+                memcpy(avFrame->data[p] + static_cast<size_t>(y) * avFrame->linesize[p],
+                       src->planes[p].get() + static_cast<size_t>(y) * src->strides[p], rowBytes);
+            }
+        }
+        avFrame->pts = src->ptsUs >= 0
+                           ? av_rescale_q(src->ptsUs, AVRational{1, 1000000}, m_ctx->time_base)
+                           : AV_NOPTS_VALUE;
+        return true;
+    }
+
+    if (!EnsureSwsContext(srcW, srcH, srcFmt)) {
+        return false;
+    }
+    if (av_frame_get_buffer(avFrame.get(), 32) < 0) {
+        return false;
+    }
+    const uint8_t* srcData[4] = {src->planes[0].get(), src->planes[1].get(),
+                                 src->planes[2].get(), nullptr};
+    int srcLinesize[4] = {src->strides[0], src->strides[1], src->strides[2], 0};
+    sws_scale(m_sws, srcData, srcLinesize, 0, srcH, avFrame->data, avFrame->linesize);
+    avFrame->pts = src->ptsUs >= 0
+                       ? av_rescale_q(src->ptsUs, AVRational{1, 1000000}, m_ctx->time_base)
+                       : AV_NOPTS_VALUE;
+    return true;
 }
 
 bool VideoEncoder::EnsureSwsContext(int srcWidth, int srcHeight, AVPixelFormat srcFmt)

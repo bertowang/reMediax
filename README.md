@@ -317,6 +317,60 @@ Android / iOS 还没接 `__android_log_print` / `os_log` sink（移动端需先�
 
 验证：`--restart <n>`（重开回归）、`--concur <n>`（Prepare/Stop 并发压测），见 §10。
 
+### 4.8 画面变换（旋转 / 翻转 / 裁剪）
+
+模块：**`src/core/VideoTransform.{h,cpp}`**（libyuv 实现）。
+
+画面来源千差万别（横竖屏、镜像、局部区域、采集分辨率 ≠ 推流分辨率）。
+之前这些能力散落在各平台实现里，旋转 / 翻转 / 裁剪更是无处安放，
+外部注入帧还会绕过全部平台实现直接进总线。现在收敛成**集中归一化层**，
+所有视频帧在进入编码器之前都过一遍。
+
+**处理顺序固定为**
+
+```
+crop(裁剪) → flip(翻转) → rotate(旋转) → scale(缩放到编码分辨率) → convert(转像素格式)
+```
+
+90 / 270 度旋转会交换宽高。裁剪矩形在**源帧坐标系**上描述，会自动夹到画面内并对齐到偶数。
+
+**参数**（`VideoEncoderParams`，全部留默认即不做变换，零额外开销）
+
+| 字段 | 默认 | 说明 |
+| - | - | - |
+| `videoRotation` | 0 | 顺时针旋转，只取 0 / 90 / 180 / 270 |
+| `videoFlipHorizontal` | false | 水平镜像 |
+| `videoFlipVertical` | false | 垂直翻转 |
+| `videoCropX` / `videoCropY` | 0 | 裁剪原点 |
+| `videoCropWidth` / `videoCropHeight` | 0 | 裁剪尺寸，<= 0 表示不裁剪 |
+| `gpuAllowReadbackFallback` | true | GPU 模式下需要变换时，是否允许回读显存处理 |
+
+```cpp
+TGCapture::VideoEncoderParams vParams;
+vParams.videoRotation = 90;
+vParams.videoFlipHorizontal = true;
+capturer->SetupVideoEncoder(vParams);
+```
+
+demo：`--rotate <0|90|180|270>` / `--flip <h|v|both>` / `--crop <w,h>`。
+
+**GPU 模式下的代价（重要）**
+
+纯显存的 `CopySubresourceRegion` 只能做 1:1 拷贝，带不了旋转 / 翻转 / 缩放。
+所以 **GPU 模式一旦开变换，就只能在显存里做不了，必须把纹理读回内存用 libyuv 处理**：
+
+- 每帧几十 MB 的回读 + CPU 变换，**帧率会大幅下降**
+  （实测 2160x3840 采集 + 旋转，1 秒只能出 1 帧，基本不可用）
+- 启动时会打一条 Warn 提示
+- 把 `gpuAllowReadbackFallback` 设为 `false` 可彻底杜绝回读，
+  代价是这些帧会被直接丢弃（不出画面）
+
+需要 GPU 全链路性能时，请不要开变换；或者后续改用 `ID3D11VideoProcessor` /
+渲染 quad 的方式在显存内完成变换（当前未实现）。
+
+**当前不支持**：DPI 缩放（高 DPI 屏仍是逻辑像素/物理像素混用）、HDR / 广色域、
+旋转角写入码流（`Frame::rotation` 未写进 SPS VUI 或 displaymatrix）。
+
 ---
 
 ## 5. 音画同步
@@ -576,6 +630,9 @@ cd build\windows-x64\Release
 | `--list-audio` | 列出系统麦克风/扬声器端点后退出 |
 | `--restart <n>` | 首轮结束后再 `Stop→Prepare→Start` 跑 n 轮（重开回归，每轮时长同 `--seconds`） |
 | `--concur <n>` | 并发压测：`Prepare` 与 `Stop` 两条线程交错冲击 n 秒，验证生命周期互斥 |
+| `--rotate <deg>` | 画面旋转 0 / 90 / 180 / 270 |
+| `--flip <h\|v\|both>` | 画面翻转：h=水平镜像，v=垂直翻转 |
+| `--crop <w,h>` | 从源帧左上角裁剪（如 `--crop 960,540`） |
 
 取窗口句柄（注意 demo 按 16 进制解析）：
 
@@ -607,6 +664,14 @@ cd build\windows-x64\Release
 | 12 | 高帧率 | `--seconds 10` 且 `fps=60` | `avDiff` 稳定；`stall` 不随帧率线性增长 |
 | 13 | 系统冻结 | 录制中挂起进程 10s | `jump` +1，恢复后视频 PTS 不突跳 |
 | 14 | 并发启停 | `--concur 5` | `prepare_ok` / `stop` 数量接近、进程 `exit=0`、不挂死 |
+| 15 | 画面旋转 | `--rotate 180 --fake-video` | 画面左上/右下亮度与 base **完全互换** |
+| 16 | 旋转自洽 | `--rotate 90` vs `--rotate 270` | 两者左上/右下互为交换 |
+| 17 | 翻转自洽 | `--flip both` vs `--rotate 180` | 两者结果**完全一致**（水平+垂直 = 180°） |
+| 18 | 裁剪 | `--crop 640,360 --fake-video` | 画面只剩源左上区域，整体变暗 |
+
+> 15~18 用 `--fake-video` 的人造图案（左暗右亮 + 上暗下亮）验证，
+> 判读方式：`ffprobe -f lavfi -i "movie=v.flv,crop=iw/2:ih/2:0:0,signalstats"` 取左上/右下平均亮度。
+> 真实屏幕在当前会话可能是黑屏，不适合做内容校验。
 
 每次跑完看两处：
 
@@ -654,6 +719,17 @@ ffplay out.flv                      # 实际播放确认音画同步
 * **日志**：`Init` 的 `logDir` / `printLog` 未实现；移动端未接 `__android_log_print` / `os_log` sink（见 4.6）。
 * 暂停静帧、水印、本地文件采集为接口占位（返回 0 或告警）。
 * `GetStatsInfo` 当前返回基础 JSON（码率 / 队列 / 编码器统计）。
+* **画面变换**：
+  * **GPU 模式开销大** —— 纯显存拷贝带不了旋转/翻转/缩放，只能回读显存用 libyuv 处理，
+    实测 2160x3840 + 旋转约 1 帧/秒。要走 GPU 全链路性能就不要开变换（见 4.8）。
+    后续可用 `ID3D11VideoProcessor` 或渲染 quad 在显存内完成，当前未实现。
+  * **DPI 缩放未处理** —— 高 DPI 屏（150%/200%）下 `GetClientRect` 是逻辑像素、
+    DXGI 是物理像素，混用会只采到一部分或出黑边；Android Java 侧 `dpi` 还是硬编码 1。
+  * **旋转未写进码流** —— `Frame::rotation` 有字段但没写进 SPS VUI / displaymatrix，
+    播放器不会自动纠正方向，旋转是把像素真的转过去了。
+  * **Android / iOS 的 `FrameWidth()` 是配置值而非真实尺寸**，
+    与实际帧不一致时 GPU 路径会走回退（CPU 路径靠 sws 自适应）。
+  * 摄像头源（`TypeOfSelfCamera`）枚举存在但**无实现**；`CreateLocalFileCapture` 是空壳。
 * **并发**：`Prepare`/`Start`/`Stop` 已串行化（见 4.7），但 `Prepare()` 失败路径的回滚
   目前只覆盖 Muxer；新增模块时记得在自己的失败分支里收尾。
 

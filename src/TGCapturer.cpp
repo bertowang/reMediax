@@ -434,6 +434,33 @@ int TGCapturer::Prepare()
     const int64_t autoMaxLagUs = syncParams.forceSyncFactor * m_videoIntervalUs * 3 / 2;
     m_videoEncoder->SetMaxLagUs(m_videoParams.videoMaxLagUs > 0 ? m_videoParams.videoMaxLagUs
                                                                : autoMaxLagUs);
+
+    // 画面变换：采集帧进入编码器之前统一应用（裁剪 → 翻转 → 旋转 → 缩放 → 格式）
+    core::VideoTransform transform;
+    transform.rotation = m_videoParams.videoRotation;
+    transform.flipHorizontal = m_videoParams.videoFlipHorizontal;
+    transform.flipVertical = m_videoParams.videoFlipVertical;
+    transform.cropX = m_videoParams.videoCropX;
+    transform.cropY = m_videoParams.videoCropY;
+    transform.cropWidth = m_videoParams.videoCropWidth;
+    transform.cropHeight = m_videoParams.videoCropHeight;
+    m_videoEncoder->SetVideoTransform(transform);
+    m_videoEncoder->SetGpuReadbackFallback(m_videoParams.gpuAllowReadbackFallback);
+    if (!transform.IsIdentity()) {
+        int outW = 0, outH = 0;
+        transform.TransformedSize(m_videoParams.width, m_videoParams.height, outW, outH);
+        TG_LOGI("TGCapturer: 画面变换 rot=%d flipH=%d flipV=%d crop=%d,%d %dx%d -> %dx%d",
+                transform.NormalizedRotation(), transform.flipHorizontal ? 1 : 0,
+                transform.flipVertical ? 1 : 0, transform.cropX, transform.cropY,
+                transform.cropWidth, transform.cropHeight, outW, outH);
+        if (m_perfMode == PerformanceMode::Gpu) {
+            // 纯显存的 CopySubresourceRegion 只能做 1:1 拷贝，带不了旋转/翻转/缩放，
+            // 所以 GPU 模式下一旦开变换就只能把纹理读回内存用 libyuv 处理 ——
+            // 代价是每帧几十 MB 的回读，帧率会大幅下降。这里必须显式告知。
+            TG_LOGW("TGCapturer: GPU 模式下启用画面变换会强制回读显存，帧率将显著下降；"
+                    "若不需要变换请清空相关参数，或把 gpuAllowReadbackFallback 设为 false 直接丢帧");
+        }
+    }
     m_muxer->SetInterleaveUs(static_cast<int64_t>(m_muxParams.interleaveMs) * 1000);
 
     core::AudioMediaType audioType;
@@ -735,14 +762,32 @@ int TGCapturer::PushExternalVideoFrame(const uint8_t* data, int width, int heigh
 
     if (pixelBuffer) {
         // iOS CVPixelBuffer / Windows D3D 纹理：零拷贝直送硬编
+        // 注意：两种载体共用同一个入口，需要靠运行期判断区分，见下方 hwKind 选择。
         frame->hwKind = core::HwKind::CVPixelBuffer;
         frame->hwHandle = pixelBuffer;
     } else if (data) {
-        const size_t bytes = static_cast<size_t>(stride > 0 ? stride : width) * height * 3 / 2;
-        auto buffer = std::shared_ptr<uint8_t>(new uint8_t[bytes], std::default_delete<uint8_t[]>());
-        memcpy(buffer.get(), data, bytes);
+        if (width <= 0 || height <= 0) {
+            return -3;
+        }
+        const int rowStride = stride > 0 ? stride : width;
+        if (rowStride < width) {
+            return -3;   // stride 不能小于宽度，否则 Y 平面行会重叠
+        }
+        // NV12 是两平面：Y(stride × h) + UV(stride × h/2)
+        const size_t ySize = static_cast<size_t>(rowStride) * height;
+        const size_t uvSize = static_cast<size_t>(rowStride) * (height / 2);
+        auto buffer = std::shared_ptr<uint8_t>(new uint8_t[ySize + uvSize],
+                                               std::default_delete<uint8_t[]>());
+        memcpy(buffer.get(), data, ySize + uvSize);
+        uint8_t* uv = buffer.get() + ySize;
         frame->planes[0] = buffer;
-        frame->strides[0] = stride > 0 ? stride : width;
+        frame->strides[0] = rowStride;
+        // 关键：必须同时给出 UV 平面。之前只填了 planes[0]，
+        // sws_scale 会拿到 planes[1] == nullptr，导致画面只剩亮度（绿屏/崩溃）。
+        frame->planes[1] = std::shared_ptr<uint8_t>(buffer, uv);
+        frame->strides[1] = rowStride;
+        frame->width = width & ~1;
+        frame->height = height & ~1;
     } else {
         return -2;
     }

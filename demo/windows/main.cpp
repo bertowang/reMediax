@@ -44,6 +44,11 @@ struct Options
     std::string perf = "cpu"; // cpu | gpu（全链路 GPU：采集帧不出显存）
     int restart = 0;          // 首轮结束后再 Stop→Prepare→Start 多少轮（重开回归）
     int concur = 0;           // >0 时改跑并发压测：Prepare 与 Stop 交错冲击 n 秒
+    int rotation = 0;         // 画面旋转 0/90/180/270
+    bool flipH = false;       // 水平镜像
+    bool flipV = false;       // 垂直翻转
+    int cropW = 0;            // 裁剪（源帧左上角为原点）
+    int cropH = 0;
 };
 
 // 测试用视频源：生成 NV12 测试图案，用于隔离"采集侧"与"编码/封装侧"问题
@@ -71,8 +76,17 @@ protected:
             const size_t ySize = static_cast<size_t>(m_w) * m_h;
             const size_t uvSize = static_cast<size_t>(m_w) * m_h / 2;
             auto buffer = std::shared_ptr<uint8_t>(new uint8_t[ySize + uvSize], std::default_delete<uint8_t[]>());
-            const int shift = (index++ * 4) % 200;
-            memset(buffer.get(), 128 + shift, ySize);
+            // 带方向的测试图案：Y 从左暗到右亮 + 从上暗到下亮。
+            // 之前是整帧均匀灰度，旋转 / 翻转后画面完全一样，没法验证画面变换是否真的生效。
+            const int shift = (index++ * 4) % 16;
+            uint8_t* yPlane = buffer.get();
+            for (int y = 0; y < m_h; ++y) {
+                uint8_t* row = yPlane + static_cast<size_t>(y) * m_w;
+                for (int x = 0; x < m_w; ++x) {
+                    int v = 16 + (x * 180 / m_w) + (y * 60 / m_h) + shift;
+                    row[x] = static_cast<uint8_t>(v > 235 ? 235 : v);
+                }
+            }
             memset(buffer.get() + ySize, 128, uvSize);
 
             auto frame = std::make_shared<TGCapture::core::Frame>();
@@ -119,7 +133,10 @@ void PrintUsage()
            "  --perf <cpu|gpu> 性能模式，默认 cpu；gpu = 全链路 GPU（采集帧不出显存，需硬编）\n"
            "  --gpu            等价 --perf gpu\n"
            "  --restart <n>    首轮结束后再 Stop→Prepare→Start 跑 n 轮（重开回归，每轮时长同 --seconds）\n"
-           "  --concur <n>     并发压测：Prepare 与 Stop 两条线程交错冲击 n 秒，验证生命周期互斥\n");
+           "  --concur <n>     并发压测：Prepare 与 Stop 两条线程交错冲击 n 秒，验证生命周期互斥\n"
+           "  --rotate <deg>   画面旋转，取 0/90/180/270\n"
+           "  --flip <h|v|both> 画面翻转：h=水平镜像，v=垂直翻转\n"
+           "  --crop <w,h>     从源帧左上角裁剪（如 --crop 960,540）\n");
 }
 
 Options ParseArgs(int argc, char** argv)
@@ -184,6 +201,17 @@ Options ParseArgs(int argc, char** argv)
             opt.restart = std::stoi(value);
         } else if (key == "--concur") {
             opt.concur = std::stoi(value);
+        } else if (key == "--rotate") {
+            opt.rotation = std::stoi(value);
+        } else if (key == "--flip") {
+            opt.flipH = (value == "h" || value == "both");
+            opt.flipV = (value == "v" || value == "both");
+        } else if (key == "--crop") {
+            const auto comma = value.find(',');
+            if (comma != std::string::npos) {
+                opt.cropW = std::stoi(value.substr(0, comma));
+                opt.cropH = std::stoi(value.substr(comma + 1));
+            }
         } else if (key == "--no-audio") {
             opt.audio = false;
         }
@@ -275,6 +303,11 @@ int main(int argc, char** argv)
         vParams.vCodec = "h264_nvenc";
         vParams.vEncoderType = TGCapture::h264_nvenc;
     }
+    vParams.videoRotation = opt.rotation;
+    vParams.videoFlipHorizontal = opt.flipH;
+    vParams.videoFlipVertical = opt.flipV;
+    vParams.videoCropWidth = opt.cropW;
+    vParams.videoCropHeight = opt.cropH;
     printf("[demo] 性能模式: %s  编码器: %s\n", opt.perf.c_str(), vParams.vCodec.c_str());
     capturer->SetupVideoEncoder(vParams);
 

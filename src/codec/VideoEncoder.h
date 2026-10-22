@@ -15,6 +15,7 @@
 #include "core/MediaTypes.h"
 #include "core/Queue.h"
 #include "core/Thread.h"
+#include "core/VideoTransform.h"
 
 extern "C"
 {
@@ -57,6 +58,12 @@ public:
     void SetExternalDevice(void* device) noexcept { m_externalDevice = device; }
     bool IsGpuPath() const noexcept { return m_useHwFrame && m_perfMode == PerformanceMode::Gpu; }
 
+    // 画面变换（采集帧 → 编码分辨率之前应用）。默认不做变换。
+    void SetVideoTransform(const core::VideoTransform& transform) { m_transform = transform; }
+    const core::VideoTransform& GetVideoTransform() const noexcept { return m_transform; }
+    // GPU 模式下，需要变换或分辨率不一致时是否允许回读到内存处理
+    void SetGpuReadbackFallback(bool allow) noexcept { m_gpuReadbackFallback = allow; }
+
     // BusNode
     bool Submit(core::FramePtr frame) override;
     size_t Pending() const override;
@@ -85,9 +92,16 @@ private:
     bool InitHardwareFrames(AVPixelFormat hwFmt);
 #ifdef _WIN32
     bool CopyFromD3D11Texture(const core::FramePtr& frame, AVFrame* dst);
+    // GPU 帧需要变换或分辨率不一致时，回读到系统内存再交给归一化层
+    bool ReadBackD3D11Texture(const core::FramePtr& frame, core::FramePtr& out);
+    bool EnsureStagingTexture(int width, int height);
 #endif
     // 尺寸/像素格式归一：采集分辨率与编码器不一致时用 sws_scale 转换
     bool EnsureSwsContext(int srcWidth, int srcHeight, AVPixelFormat srcFmt);
+    // 统一的画面归一化入口：应用变换 + 缩放 + 转格式；失败时返回原帧
+    core::FramePtr NormalizeFrame(const core::FramePtr& frame);
+    // 系统内存帧 → AVFrame（sws_scale 缩放到编码器尺寸并转格式）
+    bool FillFromCpuFrame(const core::FramePtr& src, core::AVFramePtr& avFrame);
 
 private:
     std::string m_codecName;
@@ -105,7 +119,15 @@ private:
     void* m_externalDevice = nullptr;   // Windows: ID3D11Device*（采集侧设备）
 #ifdef _WIN32
     ID3D11DeviceContext* m_d3dContext = nullptr;   // 采集设备的 context，用于显存内拷贝
+    // GPU 回读用的暂存纹理（按需创建，按尺寸缓存）
+    ID3D11Texture2D* m_stagingTex = nullptr;
+    int m_stagingWidth = 0;
+    int m_stagingHeight = 0;
 #endif
+
+    // 画面变换配置（默认恒等，不做额外处理）
+    core::VideoTransform m_transform;
+    bool m_gpuReadbackFallback = true;
 
     core::VideoMediaType m_srcType;
     core::VideoMediaType m_dstType;
