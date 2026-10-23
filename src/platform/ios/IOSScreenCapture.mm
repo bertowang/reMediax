@@ -4,8 +4,14 @@
 #import <ReplayKit/ReplayKit.h>
 #import <UIKit/UIKit.h>
 
+// AVFoundation 有 `typedef NSString* AVMediaType`，ffmpeg 有 `enum AVMediaType`，
+// 同一个 .mm 里同时出现会报 definition of type 'AVMediaType' conflicts with typedef。
+// 只在包含工程头（会带进 ffmpeg 头）的这段时间内把 ffmpeg 侧的枚举改名，随后立即 #undef。
+#define AVMediaType TG_AVMediaType
+#include "core/Clock.h"
 #include "core/Logger.h"
 #include "platform/ios/IOSScreenCapture.h"
+#undef AVMediaType
 
 namespace TGCapture::platform
 {

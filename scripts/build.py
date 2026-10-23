@@ -130,8 +130,12 @@ def main() -> int:
     if args.platform == "ios":
         configure += [
             "-DCMAKE_SYSTEM_NAME=iOS",
+            # 不给 sysroot 时 CMake 会按宿主的 macOS SDK 推断成 macabi，
+            # 编译器直接报 invalid version number in '--target=arm64-apple-ios12.0-macabi'
+            "-DCMAKE_OSX_SYSROOT=iphoneos",
             "-DCMAKE_OSX_ARCHITECTURES=arm64",
-            "-DCMAKE_OSX_DEPLOYMENT_TARGET=12.0",
+            # 12.0 编不过：libc++ 的 <filesystem> 要 iOS 13.0、std::jthread/stop_token 要 iOS 14.0
+            "-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0",
         ]
 
     if args.ide and args.platform == "android":

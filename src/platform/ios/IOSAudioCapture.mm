@@ -2,8 +2,13 @@
 
 #import <AVFoundation/AVFoundation.h>
 
+// 同 IOSScreenCapture.mm：避开 AVFoundation 的 `typedef NSString* AVMediaType`
+// 与 ffmpeg 的 `enum AVMediaType` 同名冲突
+#define AVMediaType TG_AVMediaType
+#include "core/Clock.h"
 #include "core/Logger.h"
 #include "platform/ios/IOSAudioCapture.h"
+#undef AVMediaType
 
 namespace TGCapture::platform
 {

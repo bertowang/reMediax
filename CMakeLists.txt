@@ -126,6 +126,13 @@ if(MSVC)
     target_compile_definitions(tgcapture PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
 else()
     target_compile_options(tgcapture PRIVATE -Wall -Wextra)
+    # Apple 的 libc++ 把 stop_token / jthread 归为"未完备"特性（_LIBCPP_HAS_NO_EXPERIMENTAL_STOP_TOKEN），
+    # 不加这个开关会报 no type named 'jthread' in namespace 'std'
+    if(CMAKE_CXX_COMPILER_ID MATCHES "AppleClang")
+        target_compile_options(tgcapture PRIVATE -fexperimental-library)
+    endif()
+    # iOS 的 .mm 用了 __weak / __bridge_transfer，必须开 ARC（CMake 默认不给 OBJCXX 加）
+    target_compile_options(tgcapture PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
 endif()
 
 # ---------------------------------------------------------------- demo

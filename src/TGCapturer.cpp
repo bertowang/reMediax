@@ -97,11 +97,16 @@ int TGCapturer::EnableSpeakerCapture()
     auto source = std::make_shared<platform::WinAudioCapture>(TypeOfSpeaker, true);  // WASAPI loopback
 #elif defined(__ANDROID__)
     auto source = std::make_shared<platform::AndroidAudioCapture>(TypeOfSpeaker, true);  // AudioPlaybackCapture
-#else
-    return -1;
 #endif
+
+#if defined(_WIN32) || defined(__ANDROID__)
     m_ownedAudioSources.push_back(source);
     return AddAudioSource(source.get());
+#else
+    // iOS 没有系统内录：需宿主 App 加 Broadcast Upload Extension 后走 PushExternalAudioFrame
+    TG_LOGW("TGCapturer: 当前平台无扬声器/系统内录实现");
+    return -1;
+#endif
 }
 
 IVideoSource* TGCapturer::CreateScreenCapture(int index, VideoCapMode mode, VideoScaleStrategy strategy)
