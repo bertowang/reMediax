@@ -38,6 +38,12 @@ public:
     [[nodiscard]] int FrameWidth() const noexcept { return m_width; }
     [[nodiscard]] int FrameHeight() const noexcept { return m_height; }
 
+    // 该源能否把帧留在显存直送硬编（GPU 模式的前提）。
+    // 默认 false：只有真正支持硬件帧直通的平台实现才覆写。
+    // 关键：不能靠"是不是某个平台类"来判断 —— 同一个类（如 WinScreenCapture）
+    // 在屏幕与窗口两种模式下能力不同，窗口模式没有桌面复制通道，强行走 GPU 会抓到整屏。
+    [[nodiscard]] virtual bool SupportsGpuDirect() const noexcept { return false; }
+
 protected:
     void Emit(core::FramePtr frame)
     {

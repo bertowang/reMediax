@@ -156,6 +156,10 @@ inline bool Logger::OpenLogFile(const std::string& dir, size_t maxBytes)
     if (dir.empty()) {
         return false;
     }
+    // 必须先把上一轮的文件关掉：对已打开的 ofstream 再调 open() 会失败并置 failbit，
+    // 结果是"重复 Init 之后日志悄悄不再落盘"。
+    m_file.close();
+    m_file.clear();
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     if (ec && !std::filesystem::is_directory(dir, ec)) {
@@ -176,10 +180,19 @@ inline bool Logger::OpenLogFile(const std::string& dir, size_t maxBytes)
 
     m_fileStem = (std::filesystem::path(dir) / ("tgcapture_" + std::string(stamp))).string();
     m_maxFileBytes = maxBytes > 0 ? maxBytes : (32u * 1024u * 1024u);
-    m_fileIndex = 0;
     m_fileBytes = 0;
 
-    m_file.open(m_fileStem + ".log", std::ios::out | std::ios::trunc);
+    // 文件名只精确到秒：同一秒内多次 Init 会撞名，trunc 会把上一轮日志整个覆盖掉。
+    // 撞名就往后找后缀，并让轮转从该后缀继续，避免轮转时又覆盖回来。
+    int suffix = 0;
+    std::string path = m_fileStem + ".log";
+    while (std::filesystem::exists(path) && suffix < 1000) {
+        ++suffix;
+        path = m_fileStem + "_" + std::to_string(suffix) + ".log";
+    }
+    m_fileIndex = suffix;
+
+    m_file.open(path, std::ios::out | std::ios::trunc);
     if (!m_file.is_open()) {
         return false;
     }
@@ -191,8 +204,9 @@ inline void Logger::CloseLogFile()
     std::lock_guard<std::mutex> lock(m_outputMutex);
     if (m_file.is_open()) {
         m_file.flush();
-        m_file.close();
     }
+    m_file.close();
+    m_file.clear();   // 清掉可能的 failbit，否则下一次 open 直接失败
     m_fileBytes = 0;
 }
 
@@ -230,31 +244,49 @@ inline std::string Logger::MakePrefix(LogLevel level)
 
 inline void Logger::WriteBuiltin(LogLevel level, const char* msg, bool hasSink) const
 {
-    std::lock_guard<std::mutex> lock(m_outputMutex);
+    bool rotateFailed = false;
+    int rotatedIndex = 0;
 
-    if (!hasSink && m_printLog.load()) {
-        // 前缀只给内置输出加：宿主 sink 通常自己拼时间戳，
-        // 而且它拿到的 msg 可能还要再加工，塞进固定前缀反而不好切分。
-        const std::string line = MakePrefix(level) + msg;
-        printf("%s\n", line.c_str());
-        // 每条都 fflush 会把吞吐压到 ~5 千条/秒（实测），比写文件还慢 40 倍。
-        // 只给 Warn/Error 立即 flush：关键日志不丢，普通日志交给 CRT 缓冲。
-        if (level >= LogLevel::Warn) {
-            fflush(stdout);
+    // 临界区只覆盖"输出"本身：轮转失败的提示必须放到锁外再打，
+    // 否则会在同一线程里二次进入 WriteBuiltin 尝试再拿这把非递归锁（自死锁）。
+    {
+        std::lock_guard<std::mutex> lock(m_outputMutex);
+
+        if (!hasSink && m_printLog.load()) {
+            // 前缀只给内置输出加：宿主 sink 通常自己拼时间戳，
+            // 而且它拿到的 msg 可能还要再加工，塞进固定前缀反而不好切分。
+            const std::string line = MakePrefix(level) + msg;
+            printf("%s\n", line.c_str());
+            // 每条都 fflush 会把吞吐压到 ~5 千条/秒（实测），比写文件还慢 40 倍。
+            // 只给 Warn/Error 立即 flush：关键日志不丢，普通日志交给 CRT 缓冲。
+            if (level >= LogLevel::Warn) {
+                fflush(stdout);
+            }
+        }
+
+        if (m_file.is_open()) {
+            m_file << MakePrefix(level) << msg << '\n';
+            m_fileBytes += (msg ? strlen(msg) : 0) + 96;   // 含前缀的近似长度
+            if (m_fileBytes >= m_maxFileBytes) {
+                m_file.flush();
+                m_file.close();
+                m_file.clear();
+                ++m_fileIndex;
+                m_file.open(m_fileStem + "_" + std::to_string(m_fileIndex) + ".log",
+                            std::ios::out | std::ios::trunc);
+                m_fileBytes = 0;
+                rotateFailed = !m_file.is_open();
+                rotatedIndex = m_fileIndex;
+            }
         }
     }
 
-    if (m_file.is_open()) {
-        m_file << MakePrefix(level) << msg << '\n';
-        m_fileBytes += (msg ? strlen(msg) : 0) + 96;   // 含前缀的近似长度
-        if (m_fileBytes >= m_maxFileBytes) {
-            m_file.flush();
-            m_file.close();
-            ++m_fileIndex;
-            m_file.open(m_fileStem + "_" + std::to_string(m_fileIndex) + ".log",
-                        std::ios::out | std::ios::trunc);
-            m_fileBytes = 0;
-        }
+    // 轮转失败（磁盘满 / 权限 / 目录被删）后 m_file 是关闭的，之后所有日志会静默消失。
+    // 必须留一句话，否则"日志突然没了"这种现场完全无从查起。
+    // 不会递归：m_file 已关闭，再进来不会命中文件分支（且这里在锁外，不碰 m_outputMutex）。
+    if (rotateFailed) {
+        Logger::Instance().Log(LogLevel::Error, "Logger: 日志轮转失败，已停止落盘（下一个文件序号 %d）",
+                               rotatedIndex);
     }
 }
 

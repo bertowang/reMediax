@@ -40,6 +40,9 @@ public:
     // GPU 模式：帧留在显存（ID3D11Texture2D），不再 GPU→CPU 回读、不再分配系统内存位图
     void SetGpuMode(bool gpu) noexcept { m_gpuMode = gpu; }
     [[nodiscard]] bool GpuMode() const noexcept { return m_gpuMode; }
+    // 只有"屏幕"支持 GPU 直连：Desktop Duplication 复制的是整个显示器，
+    // 窗口采集拿不到对应的复制通道，走 GPU 会抓到整屏而不是目标窗口。
+    [[nodiscard]] bool SupportsGpuDirect() const noexcept override { return !m_isWindow; }
     // 建好 D3D11 设备与桌面复制通道并返回设备（幂等）。
     // 编码器要用同一个设备，才能在显存内直拷（跨设备无法 CopyResource）。
     void* EnsureD3D11Device();
@@ -50,7 +53,13 @@ protected:
 
 private:
     bool ResolveSourceRect(int& x, int& y, int& width, int& height);
+    // GDI 兜底资源（DC + DIB 位图）。抽成独立方法：DXGI 失效后要临时回退 GDI，
+    // 那时必须能补建这些资源，否则 m_bmpBits 为空 → 采集静默永久失效。
+    bool InitGdi(int width, int height);
     bool InitDXGI(int width, int height);
+    // CPU 回读用的 staging 纹理按需创建：GPU 模式下 Open 不建它，
+    // 若之后编码器降级把 m_gpuMode 关掉，GrabDXGI 仍能正常工作而不是 CopyResource(nullptr)。
+    bool EnsureStaging();
     void ReleaseDXGI();
     bool GrabDXGI(std::shared_ptr<uint8_t>& bgra, int& width, int& height);
     bool AcquireDesktopTexture();                 // 取一帧桌面纹理到 m_desktopTex（GPU 路径用）
@@ -75,6 +84,10 @@ private:
     int m_bmpWidth = 0;
     int m_bmpHeight = 0;
     uint8_t* m_bmpBits = nullptr;
+    // 屏幕采集的 BitBlt 原点（虚拟桌面坐标）：一次算好即可，不必每帧枚举显示器
+    int m_srcX = 0;
+    int m_srcY = 0;
+    bool m_srcRectResolved = false;
 
     // DXGI Desktop Duplication（裸 COM 指针，与 WinAudioCapture 保持同一风格）
     ID3D11Device* m_device = nullptr;

@@ -358,6 +358,21 @@ int TGCapturer::Prepare()
     videoType.SetPixelFormat(AV_PIX_FMT_NV12);
     videoType.SetFrameRate(static_cast<int>(m_videoParams.fps * 1000), 1000);
 
+    // 分辨率必须是偶数：NV12/YUV420P 的 UV 是 2x2 下采样，奇数宽高会让 UV 平面整体错位，
+    // 多数编码器也会直接拒绝。在这里对齐并说清楚，比让错误一路带到编码器好排查得多。
+    const int evenW = m_videoParams.width > 0 ? (m_videoParams.width & ~1) : 0;
+    const int evenH = m_videoParams.height > 0 ? (m_videoParams.height & ~1) : 0;
+    if (evenW != m_videoParams.width || evenH != m_videoParams.height) {
+        TG_LOGW("TGCapturer: 分辨率 %dx%d 不是偶数，已对齐为 %dx%d", m_videoParams.width,
+                m_videoParams.height, evenW, evenH);
+        m_videoParams.width = evenW;
+        m_videoParams.height = evenH;
+        videoType.SetWidth(evenW);
+        videoType.SetHeight(evenH);
+    }
+    m_useExternalVideoPts = m_videoParams.videoUseExternalPts;
+    m_externalAudioChannel = -1;
+
     // 纯视频模式：不建音频编码器、封装器也不建音频流
     m_audioEnabled = m_audioParams.enabled && m_audioParams.sampleRate > 0 && m_audioParams.channels > 0;
 
@@ -366,7 +381,8 @@ int TGCapturer::Prepare()
 #if defined(_WIN32)
     if (m_perfMode == PerformanceMode::Gpu) {
         auto* win = dynamic_cast<platform::WinScreenCapture*>(m_videoSource);
-        if (win) {
+        // 必须是"屏幕"这种真有桌面复制通道的源：窗口采集走 GPU 会抓到整屏而不是目标窗口
+        if (win && win->SupportsGpuDirect()) {
             win->SetGpuMode(true);
             externalDevice = win->EnsureD3D11Device();
             if (!externalDevice) {
@@ -375,7 +391,7 @@ int TGCapturer::Prepare()
                 m_perfMode = PerformanceMode::Cpu;
             }
         } else {
-            TG_LOGW("TGCapturer: 当前采集源不支持 GPU 直连，回退 CPU 链路");
+            TG_LOGW("TGCapturer: 当前采集源不支持 GPU 直连（窗口采集无桌面复制通道），回退 CPU 链路");
             m_perfMode = PerformanceMode::Cpu;
         }
     }
@@ -474,6 +490,19 @@ int TGCapturer::Prepare()
         m_state.store(State::Idle);
         return -3;
     }
+    // 编码器没能建起硬件链路（hwdevice / hw_frames_ctx 初始化失败）时，采集侧必须一并退回系统内存。
+    // 否则采集继续产出 GPU 纹理帧，而编码器走软件路径，BuildAVFrame 拿不到 planes[0]，
+    // 结果是每帧被丢弃 —— 表现为"流能开、包在写、画面全黑"，且没有任何显式报错。
+#if defined(_WIN32)
+    if (m_perfMode == PerformanceMode::Gpu && !m_videoEncoder->IsGpuPath()) {
+        TG_LOGW("TGCapturer: 编码器硬件链路未就绪，采集侧一并回退 CPU（帧不再走显存）");
+        auto* win = dynamic_cast<platform::WinScreenCapture*>(m_videoSource);
+        if (win) {
+            win->SetGpuMode(false);
+        }
+        m_perfMode = PerformanceMode::Cpu;
+    }
+#endif
     if (m_audioEnabled) {
         if (m_audioEncoder->Open(m_audioParams, audioType) < 0) {
             FireError(-4, 0, "open audio encoder failed");
@@ -654,6 +683,23 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
         return;
     }
 
+    // 调用方自带时间轴：直接用它给的 PTS，不再走内核的同步与时间轴生成
+    if (frame->ptsLocked && frame->ptsUs >= 0) {
+        const int frameW = frame->width;
+        const int frameH = frame->height;
+        const int64_t framePts = frame->ptsUs;
+        if (!m_bus.Dispatch("video_encoder", std::move(frame))) {
+            return;
+        }
+        if (!m_firstFrameSent.exchange(true)) {
+            TG_LOGI("TGCapturer: 首帧视频 %dx%d pts=%lld（外部时间轴）", frameW, frameH,
+                    static_cast<long long>(framePts));
+            FireNotify(EsCap_Notify_Fisrt_Frame_OK, "first frame", 0);
+        }
+        m_lastVideoUs = core::MonotonicClock::NowUs();
+        return;
+    }
+
     // ---- 音画同步：视频 PTS 由音频时钟反推（不用采集 wall clock）----
     // 有音频时"视频等音频"：主时钟尚未产出第一拍就先不发帧。
     // 若此时改走采集时间轴，等音频就绪后首帧 PTS 会从几秒回退到几十毫秒，
@@ -731,12 +777,23 @@ void TGCapturer::OnAudioFrame(core::FramePtr frame)
     if (!frame->audioData || frame->audioBytes == 0 || frame->channels <= 0) {
         return;
     }
-    if (!m_mixer->BufferedFrames(0) && m_mixer->ChannelCount() == 0) {
-        // 没有任何内部音频源：临时建一条通道给它
-        m_mixer->SetOutputFormat(frame->sampleRate, frame->channels);
-        m_mixer->AddChannel(0, frame->sampleRate, frame->channels, core::MonotonicClock::NowUs());
+    // 外部注入的音频必须独占一路：之前一律塞进 0 号通道，
+    // 有内部麦克风时两路会共用同一个通道时钟，时间戳互相拉扯（表现为音频抖动/变调）。
+    if (m_externalAudioChannel < 0) {
+        const int id = static_cast<int>(m_mixer->ChannelCount());   // 追加在内部源之后
+        if (id == 0) {
+            m_mixer->SetOutputFormat(frame->sampleRate, frame->channels);
+        }
+        if (m_mixer->AddChannel(id, frame->sampleRate, frame->channels,
+                                core::MonotonicClock::NowUs()) == 0) {
+            m_externalAudioChannel = id;
+            TG_LOGI("TGCapturer: 外部注入音频占用混流通道 %d（%dHz %dch）", id, frame->sampleRate,
+                    frame->channels);
+        } else {
+            return;
+        }
     }
-    const int id = m_mixer->ChannelCount() > 0 ? 0 : -1;
+    const int id = m_externalAudioChannel;
     if (id < 0) {
         return;
     }
@@ -761,10 +818,21 @@ int TGCapturer::PushExternalVideoFrame(const uint8_t* data, int width, int heigh
     frame->captureUs = core::MonotonicClock::NowUs();
 
     if (pixelBuffer) {
-        // iOS CVPixelBuffer / Windows D3D 纹理：零拷贝直送硬编
-        // 注意：两种载体共用同一个入口，需要靠运行期判断区分，见下方 hwKind 选择。
-        frame->hwKind = core::HwKind::CVPixelBuffer;
+        // iOS CVPixelBuffer / Windows D3D 纹理：零拷贝直送硬编。
+        // 两种载体共用同一个入口，必须按平台选定 hwKind —— 之前恒定为 CVPixelBuffer，
+        // Windows 上传 D3D 纹理会匹配不上 HwKind::D3D11Texture，帧被整条链路丢弃。
         frame->hwHandle = pixelBuffer;
+#if defined(__APPLE__)
+        frame->hwKind = core::HwKind::CVPixelBuffer;
+#elif defined(_WIN32)
+        frame->hwKind = core::HwKind::D3D11Texture;
+#else
+        frame->hwKind = core::HwKind::None;
+        TG_LOGW_THROTTLED(3000000, "TGCapturer: 当前平台不支持外部注入硬件帧，该帧按无效处理");
+        return -4;
+#endif
+        // 硬件帧没有系统内存像素，pixFmt 无意义（与采集侧 GPU 帧保持一致）
+        frame->pixFmt = AV_PIX_FMT_NONE;
     } else if (data) {
         if (width <= 0 || height <= 0) {
             return -3;
@@ -791,6 +859,8 @@ int TGCapturer::PushExternalVideoFrame(const uint8_t* data, int width, int heigh
     } else {
         return -2;
     }
+    // 调用方自带时间轴时锁定 PTS，内核不再用音频主时钟改写（见 videoUseExternalPts）
+    frame->ptsLocked = m_useExternalVideoPts && ptsUs >= 0;
     OnVideoFrame(std::move(frame));
     return 0;
 }
@@ -846,9 +916,17 @@ int TGCapturer::SetupWatermarkInfo(const WatermarkParams& params)
 
 int TGCapturer::SetAVTimeout(int64_t audioTimeoutMs, int64_t videoTimeoutMs)
 {
-    m_audioTimeoutMs = audioTimeoutMs;
-    m_videoTimeoutMs = videoTimeoutMs;
-    m_videoEncoder->SetMaxLagUs(videoTimeoutMs * 1000);
+    if (audioTimeoutMs > 0) {
+        m_audioTimeoutMs = audioTimeoutMs;
+    }
+    if (videoTimeoutMs > 0) {
+        m_videoTimeoutMs = videoTimeoutMs;
+        m_videoEncoder->SetMaxLagUs(videoTimeoutMs * 1000);
+    } else {
+        // 传 0 不能照单全收：maxLagUs=0 会让编码器把每一帧都判成"落后音频"而全部丢弃
+        TG_LOGW("TGCapturer: SetAVTimeout 的 videoTimeoutMs=%lld 无效，保留 %lldms",
+                static_cast<long long>(videoTimeoutMs), static_cast<long long>(m_videoTimeoutMs));
+    }
     return 0;
 }
 

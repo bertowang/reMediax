@@ -56,6 +56,38 @@ public:
         return true;
     }
 
+    // 满时丢最旧，但跳过 keep 判为真的元素（典型用途：保护视频关键帧）。
+    // 直接用 DropOldest 会在下游拥塞时把 IDR 丢掉，之后整个 GOP 都解不出来（花屏）。
+    template <typename Keep>
+    bool PushKeepProtected(T item, Keep keep)
+    {
+        {
+            std::unique_lock<std::mutex> lock(m_mutex);
+            if (m_closed) {
+                return false;
+            }
+            if (m_queue.size() >= m_capacity) {
+                bool dropped = false;
+                for (auto it = m_queue.begin(); it != m_queue.end(); ++it) {
+                    if (!keep(*it)) {
+                        m_queue.erase(it);
+                        ++m_dropped;
+                        dropped = true;
+                        break;
+                    }
+                }
+                if (!dropped) {
+                    // 队列里全是受保护元素：也只能丢最旧的，否则会永久塞满不再出包
+                    m_queue.pop_front();
+                    ++m_dropped;
+                }
+            }
+            m_queue.push_back(std::move(item));
+        }
+        m_notEmpty.notify_one();
+        return true;
+    }
+
     // 阻塞弹出；返回 nullopt 表示已关闭且无数据
     std::optional<T> Pop()
     {

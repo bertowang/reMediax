@@ -31,10 +31,13 @@ struct I420View
     int height = 0;
 };
 
-// 中间缓冲：I420 三个平面放在同一块内存里，由 keepAlive 持有，避免变换过程中被释放
+// 中间缓冲：I420 三个平面放在同一块内存里，由 keepAlive 持有，避免变换过程中被释放。
+// Allocate 是"按需扩容"语义：尺寸没变大就复用上一次的内存 —— 变换在每帧路径上，
+// 每帧 4 次 new[]（1080p 约 12 MB）的分配与首次触碰缺页开销比像素拷贝还贵。
 struct I420Buffer
 {
     std::shared_ptr<uint8_t> data;
+    size_t capacityBytes = 0;
     I420View view;
 
     bool Allocate(int width, int height)
@@ -45,7 +48,11 @@ struct I420Buffer
         const int strideUV = w / 2;
         const size_t total = static_cast<size_t>(strideY) * h +
                              static_cast<size_t>(strideUV) * (h / 2) * 2;
-        data.reset(new uint8_t[total], std::default_delete<uint8_t[]>());
+        // 只复用、不缩小：分辨率偶尔变小也保留已分配的大块，避免反复分配
+        if (!data || total > capacityBytes) {
+            data.reset(new uint8_t[total], std::default_delete<uint8_t[]>());
+            capacityBytes = total;
+        }
         uint8_t* base = data.get();
         view.y = base;
         view.strideY = strideY;
@@ -149,45 +156,66 @@ libyuv::RotationMode ToRotationMode(int rotation)
     }
 }
 
+// 每帧变换要用的 4 块中间缓冲：源 I420、翻转级、旋转级、缩放级。
+// thread_local：变换只在编码线程上跑，每个线程各自一套，既复用又不需要加锁。
+struct TransformCache
+{
+    I420Buffer src;
+    I420Buffer flip;
+    I420Buffer rotate;
+    I420Buffer scaled;
+};
+
+TransformCache& Cache()
+{
+    static thread_local TransformCache cache;
+    return cache;
+}
+
 // 翻转 + 旋转：libyuv 的 I420Mirror 与 I420Rotate 无法一次表达组合，
-// 所以按 flip → rotate 串联，两级各自按需分配缓冲。
-bool FlipAndRotate(const I420View& in, const VideoTransform& t, I420Buffer& mirrorBuf,
-                   I420Buffer& rotateBuf, I420View& out)
+// 所以按 flip → rotate 串联；每一级都写进"与当前源不同"的那块缓冲。
+bool FlipAndRotate(const I420View& in, const VideoTransform& t, I420Buffer& bufA, I420Buffer& bufB,
+                   I420View& out)
 {
     I420View cur = in;
 
+    // libyuv 没有独立的"只垂直翻转"接口，用镜像 + 旋转 180 组合出来：
+    //   水平镜像           = I420Mirror
+    //   垂直翻转           = I420Mirror + I420Rotate(180)
+    //   水平 + 垂直        = I420Rotate(180)
+    const bool both = t.flipHorizontal && t.flipVertical;
     if (t.flipHorizontal || t.flipVertical) {
-        if (!mirrorBuf.Allocate(cur.width, cur.height)) {
+        if (!bufA.Allocate(cur.width, cur.height)) {
             return false;
         }
-        // libyuv 没有独立的"只垂直翻转"接口，用镜像 + 旋转 180 组合出来：
-        //   水平镜像           = I420Mirror
-        //   垂直翻转           = I420Mirror + I420Rotate(180)
-        //   水平 + 垂直        = I420Rotate(180)
-        const bool both = t.flipHorizontal && t.flipVertical;
         if (both) {
             if (libyuv::I420Rotate(cur.y, cur.strideY, cur.u, cur.strideU, cur.v, cur.strideV,
-                                   mirrorBuf.view.y, mirrorBuf.view.strideY, mirrorBuf.view.u,
-                                   mirrorBuf.view.strideU, mirrorBuf.view.v, mirrorBuf.view.strideV,
-                                   cur.width, cur.height, libyuv::kRotate180) != 0) {
+                                   bufA.view.y, bufA.view.strideY, bufA.view.u, bufA.view.strideU,
+                                   bufA.view.v, bufA.view.strideV, cur.width, cur.height,
+                                   libyuv::kRotate180) != 0) {
                 return false;
             }
         } else if (libyuv::I420Mirror(cur.y, cur.strideY, cur.u, cur.strideU, cur.v, cur.strideV,
-                                      mirrorBuf.view.y, mirrorBuf.view.strideY, mirrorBuf.view.u,
-                                      mirrorBuf.view.strideU, mirrorBuf.view.v, mirrorBuf.view.strideV,
-                                      cur.width, cur.height) != 0) {
+                                      bufA.view.y, bufA.view.strideY, bufA.view.u,
+                                      bufA.view.strideU, bufA.view.v, bufA.view.strideV, cur.width,
+                                      cur.height) != 0) {
             return false;
         }
-        cur = mirrorBuf.ConstView();
+        cur = bufA.ConstView();
+
         if (t.flipVertical && !both) {
-            // 还需要一次 180 旋转才能变成"上下颠倒"
-            if (libyuv::I420Rotate(cur.y, cur.strideY, cur.u, cur.strideU, cur.v, cur.strideV,
-                                   mirrorBuf.view.y, mirrorBuf.view.strideY, mirrorBuf.view.u,
-                                   mirrorBuf.view.strideU, mirrorBuf.view.v, mirrorBuf.view.strideV,
-                                   cur.width, cur.height, libyuv::kRotate180) != 0) {
+            // 再转 180 才是"上下颠倒"。必须用另一块缓冲：libyuv 没有"原地旋转"的契约，
+            // 之前把同一块 buffer 既当源又当目的，是在赌它的内部实现按对称下标读写。
+            if (!bufB.Allocate(cur.width, cur.height)) {
                 return false;
             }
-            cur = mirrorBuf.ConstView();
+            if (libyuv::I420Rotate(cur.y, cur.strideY, cur.u, cur.strideU, cur.v, cur.strideV,
+                                   bufB.view.y, bufB.view.strideY, bufB.view.u, bufB.view.strideU,
+                                   bufB.view.v, bufB.view.strideV, cur.width, cur.height,
+                                   libyuv::kRotate180) != 0) {
+                return false;
+            }
+            cur = bufB.ConstView();
         }
     }
 
@@ -195,16 +223,17 @@ bool FlipAndRotate(const I420View& in, const VideoTransform& t, I420Buffer& mirr
     if (rot != 0) {
         const int w = (rot == 90 || rot == 270) ? cur.height : cur.width;
         const int h = (rot == 90 || rot == 270) ? cur.width : cur.height;
-        if (!rotateBuf.Allocate(w, h)) {
+        // 同理：目的缓冲必须与 cur 所在的缓冲不同
+        I420Buffer& dst = (cur.y == bufA.view.y) ? bufB : bufA;
+        if (!dst.Allocate(w, h)) {
             return false;
         }
-        if (libyuv::I420Rotate(cur.y, cur.strideY, cur.u, cur.strideU, cur.v, cur.strideV,
-                               rotateBuf.view.y, rotateBuf.view.strideY, rotateBuf.view.u,
-                               rotateBuf.view.strideU, rotateBuf.view.v, rotateBuf.view.strideV,
-                               cur.width, cur.height, ToRotationMode(rot)) != 0) {
+        if (libyuv::I420Rotate(cur.y, cur.strideY, cur.u, cur.strideU, cur.v, cur.strideV, dst.view.y,
+                               dst.view.strideY, dst.view.u, dst.view.strideU, dst.view.v,
+                               dst.view.strideV, cur.width, cur.height, ToRotationMode(rot)) != 0) {
             return false;
         }
-        cur = rotateBuf.ConstView();
+        cur = dst.ConstView();
     }
 
     out = cur;
@@ -295,8 +324,9 @@ bool ApplyVideoTransform(const Frame& src, const VideoTransform& transform, int 
         return false;
     }
 
-    // 1) 源 → I420
-    I420Buffer srcBuf;
+    // 1) 源 → I420（中间缓冲走线程本地缓存，每帧只有最后的输出帧是新分配）
+    TransformCache& cache = Cache();
+    I420Buffer& srcBuf = cache.src;
     I420View cur;
     if (!ToI420(src, srcBuf, cur)) {
         TG_LOGW_THROTTLED(2000000, "VideoTransform: 不支持的源格式 %d，跳过归一化",
@@ -310,14 +340,12 @@ bool ApplyVideoTransform(const Frame& src, const VideoTransform& transform, int 
     cur = CropView(cur, cx, cy, cw, ch);
 
     // 3) 翻转 + 旋转
-    I420Buffer mirrorBuf;
-    I420Buffer rotateBuf;
-    if (!FlipAndRotate(cur, transform, mirrorBuf, rotateBuf, cur)) {
+    if (!FlipAndRotate(cur, transform, cache.flip, cache.rotate, cur)) {
         return false;
     }
 
     // 4) 缩放
-    I420Buffer scaledBuf;
+    I420Buffer& scaledBuf = cache.scaled;
     const int dstW = dstWidth & ~1;
     const int dstH = dstHeight & ~1;
     if (cur.width != dstW || cur.height != dstH) {

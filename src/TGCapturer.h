@@ -163,6 +163,12 @@ private:
     // 运行期
     std::atomic_bool m_videoMuted{false};
     std::atomic_bool m_firstFrameSent{false};
+    // 外部注入视频是否沿用调用方自带的 PTS（VideoEncoderParams::videoUseExternalPts）。
+    // Prepare 写、采集/注入线程读，用 atomic 避免跨线程读写同一 bool。
+    std::atomic_bool m_useExternalVideoPts{false};
+    // 外部注入音频独占的混流通道号（-1 = 尚未建立）。
+    // 不能复用 0 号：那是内部麦克风源，两路共用一个通道时钟会互相拉扯时间戳。
+    std::atomic_int m_externalAudioChannel{-1};
     int64_t m_audioTimeoutMs = 3000;
     int64_t m_videoTimeoutMs = 3000;
     int64_t m_lastVideoUs = 0;

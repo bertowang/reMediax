@@ -126,6 +126,10 @@ void Muxer::Close()
         avformat_free_context(m_fmt);
         m_fmt = nullptr;
     }
+    // 流指针随 AVFormatContext 一起失效，必须置空：
+    // 否则下一轮 Open 之前若被 WriteOne 读到就是野指针。
+    m_videoStream = nullptr;
+    m_audioStream = nullptr;
     m_videoQueue->Close();
     m_audioQueue->Close();
     m_opened.store(false);
@@ -137,7 +141,11 @@ void Muxer::SubmitVideoPacket(core::AVPacketPtr packet)
         return;
     }
     m_lastVideoArrivalUs.store(core::MonotonicClock::NowUs());
-    m_videoQueue->Push(std::move(packet));
+    // 拥塞时优先丢非关键帧：丢掉 IDR 会让后续整个 GOP 都解不出来（花屏），
+    // 丢 P 帧最多是短暂无变化，观感与可恢复性都好得多。
+    m_videoQueue->PushKeepProtected(
+        std::move(packet),
+        [](const core::AVPacketPtr& p) { return p && (p->flags & AV_PKT_FLAG_KEY) != 0; });
 }
 
 void Muxer::SubmitAudioPacket(core::AVPacketPtr packet)

@@ -206,6 +206,13 @@ struct VideoEncoderParams
     // 关掉可保证 GPU 链路"绝不出显存"，代价是这类帧会被跳过。
     bool gpuAllowReadbackFallback = true;
 
+    // 外部注入（PushExternalVideoFrame）时是否沿用调用方传入的 ptsUs。
+    // 默认 false：视频 PTS 由音频主时钟反推 —— 这是开播场景的正确做法，
+    // 传入的 ptsUs 只在"无音频 / 音频未就绪"时作为兜底。
+    // 只有调用方自带完整时间轴（如游戏引擎已做过音画同步）才需要置 true；
+    // 置 true 后内核不再改写 PTS，音画同步的责任转移到调用方。
+    bool videoUseExternalPts = false;
+
     // ---- 音画同步 ----
     int64_t videoMaxLeadUs = 500000;   // 音频停滞时视频最多超前多少（默认 500ms）
     // 视频落后音频超过多少就丢帧（编码器侧最后一道兜底）。

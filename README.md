@@ -202,6 +202,18 @@ capturer->PushExternalVideoFrame(data, w, h, stride, ptsUs, pixelBuffer);
 capturer->PushExternalAudioFrame(TGCapture::TypeOfGameMicphone4Slave, pcm, bytes, sampleRate, channels, ptsUs);
 ```
 
+**两个容易踩的语义点**
+
+- `pixelBuffer` 的硬件载体类型**由平台决定**（iOS → `CVPixelBuffer`，Windows → `D3D11Texture`），
+  同一个入口不支持跨平台混传；非这两个平台传入 `pixelBuffer` 会返回 `-4` 并打 Warn。
+- `ptsUs` **默认不生效**：只要音频开着，视频 PTS 一律由音频主时钟反推（这是开播场景的正确做法），
+  传入值只在"无音频 / 音频未就绪"时兜底。
+  调用方若自带完整时间轴（如游戏引擎已做过音画同步），把
+  `VideoEncoderParams::videoUseExternalPts` 置 `true`，内核就不再改写 PTS，
+  音画同步责任随之转移到调用方。
+- 外部注入的音频会**独占一条混流通道**（追加在内部源之后），
+  不会和 0 号麦克风共用同一个通道时钟。
+
 ### 4.5 参数总表
 
 **`VideoEncoderParams`**
@@ -441,6 +453,13 @@ demo：`--rotate <0|90|180|270>` / `--flip <h|v|both>` / `--crop <w,h>`。
 - 启动时会打一条 Warn 提示
 - 把 `gpuAllowReadbackFallback` 设为 `false` 可彻底杜绝回读，
   代价是这些帧会被直接丢弃（不出画面）
+
+**GPU 直连只对"屏幕"成立**：Desktop Duplication 复制的是整个显示器，
+窗口采集拿不到对应的复制通道，强行走 GPU 会抓到整屏而不是目标窗口。
+`Prepare()` 里会用 `VideoSourceBase::SupportsGpuDirect()` 判断，不满足则自动回落 CPU 并打 Warn。
+反过来，若编码器没能建起硬件链路（`hwdevice` / `hw_frames_ctx` 初始化失败），
+采集侧也会一并切回 CPU —— 否则采集继续出 GPU 纹理帧、编码器走软件路径，
+结果是"流能开、包在写、画面全黑"。
 
 需要 GPU 全链路性能时，请不要开变换；或者后续改用 `ID3D11VideoProcessor` /
 渲染 quad 的方式在显存内完成变换（当前未实现）。

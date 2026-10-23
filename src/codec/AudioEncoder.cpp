@@ -137,6 +137,18 @@ int AudioEncoder::EncodeOne(const core::FramePtr& frame)
         return 0;  // 数据不足，等待下一批
     }
 
+    // 一次提交可能凑出多个编码器帧（采集帧长与编码器 frame_size 不一致时）。
+    // 之前每个 AVFrame 都用同一个 ptsUs，会产出多个 PTS 完全相同的音频包；
+    // 兜底时钟也错把"样本数"当微秒推进（time_base 是 1/1e6），时间轴被压缩了 20 倍。
+    const int64_t frameDurUs =
+        (m_ctx->sample_rate > 0)
+            ? static_cast<int64_t>(frameSize) * 1000000LL / m_ctx->sample_rate
+            : 0;
+    const int64_t basePts = frame->ptsUs >= 0
+                                ? av_rescale_q(frame->ptsUs, AVRational{1, 1000000}, m_ctx->time_base)
+                                : m_nextPts;
+    int chunkIndex = 0;
+
     int ret = 0;
     while (m_pcmBuffer.size() >= need) {
         core::AVFramePtr avFrame = core::MakeAVFrame();
@@ -162,10 +174,8 @@ int AudioEncoder::EncodeOne(const core::FramePtr& frame)
             memcpy(avFrame->data[0], chunk, static_cast<size_t>(frameSize) * channels * sizeof(int16_t));
         }
 
-        avFrame->pts = frame->ptsUs >= 0
-                           ? av_rescale_q(frame->ptsUs, AVRational{1, 1000000}, m_ctx->time_base)
-                           : m_nextPts;
-        m_nextPts += frameSize;   // 仅在没有 ptsUs 时兜底（外部注入未带时间戳）
+        avFrame->pts = basePts + frameDurUs * chunkIndex;
+        ++chunkIndex;
 
         ret = avcodec_send_frame(m_ctx, avFrame.get());
         if (ret < 0) {
@@ -189,6 +199,8 @@ int AudioEncoder::EncodeOne(const core::FramePtr& frame)
         m_pcmBuffer.erase(m_pcmBuffer.begin(), m_pcmBuffer.begin() + static_cast<long>(need));
         m_encoded.fetch_add(1);
     }
+    // 兜底时钟按"实际送出的样本数"推进，供下一批没带 ptsUs 的帧使用
+    m_nextPts = basePts + frameDurUs * chunkIndex;
     return 0;
 }
 

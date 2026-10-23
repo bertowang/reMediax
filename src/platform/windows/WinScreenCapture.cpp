@@ -159,6 +159,11 @@ int WinScreenCapture::Open(int width, int height, float fps)
 
     m_bmpWidth = Even(srcW);
     m_bmpHeight = Even(srcH);
+    // 屏幕的 BitBlt 原点在虚拟桌面坐标系里，是固定值：这里存下来，
+    // 免得每帧 BitBlt 前都跑一次 EnumDisplayMonitors（纯浪费，且是系统调用）。
+    m_srcX = srcX;
+    m_srcY = srcY;
+    m_srcRectResolved = true;
 
     // 屏幕采集优先 DXGI；失败自动回落 GDI
     // 注意：EnsureD3D11Device() 可能已经建好复制通道，这里必须复用而不是重复 DuplicateOutput
@@ -183,32 +188,9 @@ int WinScreenCapture::Open(int width, int height, float fps)
             return 0;
         }
     } else {
-        m_windowDC = m_isWindow ? (m_clientOnly ? GetDC(m_hwnd) : GetWindowDC(m_hwnd))
-                                : CreateDCW(L"DISPLAY", nullptr, nullptr, nullptr);
-        if (!m_windowDC) {
-            TG_LOGE("WinScreenCapture: 获取源 DC 失败");
+        if (!InitGdi(m_bmpWidth, m_bmpHeight)) {
             return -2;
         }
-        m_memDC = CreateCompatibleDC(m_windowDC);
-        if (!m_memDC) {
-            return -3;
-        }
-
-        BITMAPINFO bmi{};
-        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = m_bmpWidth;
-        bmi.bmiHeader.biHeight = -m_bmpHeight;  // 自上而下
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-
-        m_bitmap = CreateDIBSection(m_memDC, &bmi, DIB_RGB_COLORS,
-                                    reinterpret_cast<void**>(&m_bmpBits), nullptr, 0);
-        if (!m_bitmap || !m_bmpBits) {
-            TG_LOGE("WinScreenCapture: CreateDIBSection 失败");
-            return -4;
-        }
-        SelectObject(m_memDC, m_bitmap);
     }
 
     m_width = m_bmpWidth;
@@ -262,6 +244,46 @@ bool WinScreenCapture::ResolveSourceRect(int& x, int& y, int& width, int& height
     y = param.rect.top;
     width = param.rect.right - param.rect.left;
     height = param.rect.bottom - param.rect.top;
+    return true;
+}
+
+bool WinScreenCapture::InitGdi(int width, int height)
+{
+    if (m_windowDC && m_memDC && m_bmpBits) {
+        return true;
+    }
+    if (!m_windowDC) {
+        m_windowDC = m_isWindow ? (m_clientOnly ? GetDC(m_hwnd) : GetWindowDC(m_hwnd))
+                                : CreateDCW(L"DISPLAY", nullptr, nullptr, nullptr);
+        if (!m_windowDC) {
+            TG_LOGE("WinScreenCapture: 获取源 DC 失败");
+            return false;
+        }
+    }
+    if (!m_memDC) {
+        m_memDC = CreateCompatibleDC(m_windowDC);
+        if (!m_memDC) {
+            TG_LOGE("WinScreenCapture: CreateCompatibleDC 失败");
+            return false;
+        }
+    }
+    if (!m_bitmap) {
+        BITMAPINFO bmi{};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = width > 0 ? width : m_bmpWidth;
+        bmi.bmiHeader.biHeight = -(height > 0 ? height : m_bmpHeight);  // 自上而下
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+
+        m_bitmap = CreateDIBSection(m_memDC, &bmi, DIB_RGB_COLORS,
+                                    reinterpret_cast<void**>(&m_bmpBits), nullptr, 0);
+        if (!m_bitmap || !m_bmpBits) {
+            TG_LOGE("WinScreenCapture: CreateDIBSection 失败");
+            return false;
+        }
+        SelectObject(m_memDC, m_bitmap);
+    }
     return true;
 }
 
@@ -360,6 +382,30 @@ bool WinScreenCapture::InitDXGI(int width, int height)
     return true;
 }
 
+bool WinScreenCapture::EnsureStaging()
+{
+    if (m_staging) {
+        return true;
+    }
+    if (!m_device || m_dupDesc.ModeDesc.Width == 0 || m_dupDesc.ModeDesc.Height == 0) {
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = m_dupDesc.ModeDesc.Width;
+    desc.Height = m_dupDesc.ModeDesc.Height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(m_device->CreateTexture2D(&desc, nullptr, &m_staging)) || !m_staging) {
+        m_staging = nullptr;
+        return false;
+    }
+    return true;
+}
+
 void* WinScreenCapture::EnsureD3D11Device()
 {
     if (m_device && m_duplication) {
@@ -412,7 +458,8 @@ void WinScreenCapture::ReleaseDXGI()
 
 bool WinScreenCapture::GrabDXGI(std::shared_ptr<uint8_t>& bgra, int& width, int& height)
 {
-    if (!m_duplication) {
+    // staging 按需创建：GPU 模式下 Open 跳过了它，而运行期可能因为编码器降级被切回 CPU 路径
+    if (!m_duplication || !m_context || !EnsureStaging()) {
         return false;
     }
     IDXGIResource* resource = nullptr;
@@ -434,7 +481,10 @@ bool WinScreenCapture::GrabDXGI(std::shared_ptr<uint8_t>& bgra, int& width, int&
         TG_LOGW("WinScreenCapture: DXGI 失效(0x%08X)，重建复制通道", static_cast<unsigned>(hr));
         ReleaseDXGI();
         if (!InitDXGI(0, 0)) {
+            // 重建失败要回退 GDI：但 GDI 的 DC/位图在 DXGI 路径下从未创建，
+            // 不补建的话 m_bmpBits 为空，之后每一帧都抓不到且没有任何报错。
             m_activeMode = GDI;
+            InitGdi(m_bmpWidth, m_bmpHeight);
         }
         return false;
     }
@@ -486,10 +536,11 @@ bool WinScreenCapture::GrabGDI(std::shared_ptr<uint8_t>& bgra, int& width, int& 
         return false;
     }
 
-    int srcX = 0, srcY = 0;
+    // 屏幕：BitBlt 的原点是虚拟桌面坐标，Open 时已经算好并缓存
+    int srcX = m_srcX;
+    int srcY = m_srcY;
     HDC srcDC = m_windowDC;
-    if (!m_isWindow) {
-        // 屏幕：BitBlt 的原点是虚拟桌面坐标
+    if (!m_isWindow && !m_srcRectResolved) {
         int dummyW = 0, dummyH = 0;
         ResolveSourceRect(srcX, srcY, dummyW, dummyH);
     }
@@ -560,6 +611,7 @@ bool WinScreenCapture::GrabGpu(ID3D11Texture2D** tex, std::shared_ptr<void>& own
         ReleaseDXGI();
         if (!EnsureD3D11Device()) {
             m_activeMode = GDI;
+            InitGdi(m_bmpWidth, m_bmpHeight);
         }
         return false;
     }

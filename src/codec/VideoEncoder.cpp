@@ -46,6 +46,27 @@ bool CodecAcceptsBgra(const std::string& name)
     return name == "h264_nvenc" || name == "hevc_nvenc";
 }
 
+// 让 AVFrame 持有一份 core::Frame 的强引用。
+// 硬件直连时 data[3] 只是一个裸句柄，AVFrame 本身不拥有它：一旦 AVFrame 比 Frame 活得久
+// （或将来把提交改成异步），底层 CVPixelBuffer / 纹理的 owner 会被提前释放。
+// 用 av_buffer_create 挂一个自定义释放器，把持有关系交给 AVFrame 自己管。
+bool AttachFrameOwner(AVFrame* avFrame, const core::FramePtr& frame)
+{
+    if (!avFrame || !frame) {
+        return false;
+    }
+    auto* holder = new core::FramePtr(frame);
+    AVBufferRef* ref = av_buffer_create(
+        nullptr, 0,
+        [](void* opaque, uint8_t*) { delete static_cast<core::FramePtr*>(opaque); }, holder, 0);
+    if (!ref) {
+        delete holder;
+        return false;
+    }
+    avFrame->buf[0] = ref;
+    return true;
+}
+
 AVHWDeviceType HwDeviceType(AVPixelFormat fmt)
 {
     switch (fmt) {
@@ -245,8 +266,9 @@ bool VideoEncoder::CopyFromD3D11Texture(const core::FramePtr& frame, AVFrame* ds
         return false;
     }
 
-    // 尺寸校验：CopySubresourceRegion 是 1:1 块拷贝，尺寸不一致时
-    // D3D11 会直接失败（或只拷一部分），之前这里既不比对也不查返回值。
+    // CopySubresourceRegion 是 1:1 块拷贝：尺寸或像素格式不一致都必须走回退。
+    // 格式尤其容易漏：采集纹理恒为 BGRA，而编码器帧池的 sw_format 可能是 NV12
+    // （h264_mf / h264_amf 不吃 BGRA）。只比宽高的话会把 BGRA 数据当 NV12 编码，画面全乱。
     D3D11_TEXTURE2D_DESC srcDesc = {};
     D3D11_TEXTURE2D_DESC dstDesc = {};
     src->GetDesc(&srcDesc);
@@ -256,9 +278,17 @@ bool VideoEncoder::CopyFromD3D11Texture(const core::FramePtr& frame, AVFrame* ds
                           srcDesc.Width, srcDesc.Height, dstDesc.Width, dstDesc.Height);
         return false;
     }
+    if (srcDesc.Format != dstDesc.Format) {
+        TG_LOGW_THROTTLED(2000000, "VideoEncoder: GPU 帧格式 %u != 编码器 %u，需回退归一化",
+                          static_cast<unsigned>(srcDesc.Format),
+                          static_cast<unsigned>(dstDesc.Format));
+        return false;
+    }
 
     const UINT subResource = static_cast<UINT>(reinterpret_cast<uintptr_t>(dst->data[1]));
-    // 纯显存拷贝：无 CPU 回读、无像素搬运
+    // 纯显存拷贝：无 CPU 回读、无像素搬运。
+    // 注意：ID3D11DeviceContext::CopySubresourceRegion 返回 void，D3D11 的错误不通过返回值暴露
+    // （只体现在 device-removed 上），所以"尺寸 + 格式"的前置校验就是这里唯一的防线。
     m_d3dContext->CopySubresourceRegion(dstTex, subResource, 0, 0, 0, src, 0, nullptr);
     return true;
 }
@@ -361,6 +391,20 @@ void VideoEncoder::Close()
         av_buffer_unref(&m_hwDeviceCtx);
         m_hwDeviceCtx = nullptr;
     }
+#ifdef _WIN32
+    // staging 纹理是裸 COM 指针，必须在这里释放：漏掉的话每轮 Stop→Prepare 泄漏一张纹理，
+    // 而且它引用着采集侧的 D3D11 设备，会比设备活得更久。
+    if (m_stagingTex) {
+        m_stagingTex->Release();
+        m_stagingTex = nullptr;
+    }
+    m_stagingWidth = 0;
+    m_stagingHeight = 0;
+    // 上面 av_buffer_unref(m_hwDeviceCtx) 已经把 ffmpeg 持有的 device_context Release 掉了，
+    // 这里必须置空，否则下一轮走 CPU 路径时 CopyFromD3D11Texture 会拿到悬垂指针。
+    m_d3dContext = nullptr;
+#endif
+    m_useHwFrame = false;
     m_queue->Close();
     m_opened.store(false);
     // 关键：PTS 单调保护的状态必须随流复位。
@@ -446,7 +490,8 @@ int VideoEncoder::EncodeOne(const core::FramePtr& frame)
     }
     auto avFrame = BuildAVFrame(frame);
     if (!avFrame) {
-        TG_LOGW("VideoEncoder: BuildAVFrame 返回空");
+        // 每帧路径：必须限频，否则掉帧时会以帧率刷屏，反而拖慢采集
+        TG_LOGW_THROTTLED(1000000, "VideoEncoder: BuildAVFrame 返回空，丢帧");
         return -2;
     }
     if (trace) {
@@ -589,7 +634,7 @@ core::AVFramePtr VideoEncoder::BuildAVFrame(const core::FramePtr& frame)
             frame->hwKind == core::HwKind::CVPixelBuffer) {
             avFrame->format = m_ctx->pix_fmt;
             avFrame->data[3] = reinterpret_cast<uint8_t*>(frame->hwHandle);
-            avFrame->buf[0] = nullptr;
+            AttachFrameOwner(avFrame.get(), frame);
             return avFrame;
         }
         if (m_ctx->hw_frames_ctx) {
@@ -598,10 +643,20 @@ core::AVFramePtr VideoEncoder::BuildAVFrame(const core::FramePtr& frame)
         if (avFrame->hw_frames_ctx) {
             avFrame->format = m_ctx->pix_fmt;
             avFrame->data[3] = reinterpret_cast<uint8_t*>(frame->hwHandle);
-            avFrame->buf[0] = nullptr;
+            AttachFrameOwner(avFrame.get(), frame);
             return avFrame;
         }
         TG_LOGW("VideoEncoder: 硬件帧不可用，本帧走系统内存");
+    }
+
+    // 硬件帧但编码器没走硬件链路（hwdevice / 帧池初始化失败时会出现）：
+    // 这种情况 CPU 侧拿不到任何像素，只能丢弃，必须显式说出来 ——
+    // 否则现象是"流正常、包在写、画面全黑"，排查时完全没有线索。
+    if (frame->hwHandle != nullptr) {
+        TG_LOGW_THROTTLED(2000000, "VideoEncoder: 收到硬件帧但编码器为软件链路（hw=%d），丢帧；"
+                                   "请把采集侧一并切回 CPU 模式",
+                          m_useHwFrame ? 1 : 0);
+        return nullptr;
     }
 
     // 系统内存帧：先做画面变换（若配置），再经 sws_scale 归一到编码器的尺寸与像素格式
@@ -638,32 +693,49 @@ bool VideoEncoder::FillFromCpuFrame(const core::FramePtr& src, core::AVFramePtr&
     const int srcW = src->width > 0 ? src->width : m_ctx->width;
     const int srcH = src->height > 0 ? src->height : m_ctx->height;
     const AVPixelFormat srcFmt = src->pixFmt != AV_PIX_FMT_NONE ? src->pixFmt : AV_PIX_FMT_NV12;
+    const AVPixelFormat dstFmt = static_cast<AVPixelFormat>(avFrame->format);
     avFrame->width = m_ctx->width;
     avFrame->height = m_ctx->height;
 
     // 归一化层的输出已经是编码器的尺寸与目标格式时，直接拷平面，
     // 不要再过一遍 sws_scale —— GPU 回退路径上这一帧可能几十 MB，省一次全帧搬运很值。
-    if (srcFmt == avFrame->format && srcW == m_ctx->width && srcH == m_ctx->height &&
-        src->planes[0] && src->planes[1]) {
+    if (srcFmt == dstFmt && srcW == m_ctx->width && srcH == m_ctx->height && src->planes[0] &&
+        src->planes[1]) {
         if (av_frame_get_buffer(avFrame.get(), 32) < 0) {
             return false;
         }
         const int planes = (srcFmt == AV_PIX_FMT_NV12) ? 2 : 3;
+        // 只有源的 stride 能完整放进目标 linesize 时才能逐行 memcpy。
+        // 之前这里用 min(stride, linesize) 截行拷贝：源比目标宽时每行只拷一部分，
+        // 画面右侧被裁掉并整体错位，而且没有任何报错 —— 属于最难排查的一类问题。
+        bool strideFit = true;
         for (int p = 0; p < planes; ++p) {
-            if (!src->planes[p]) {
-                return false;
-            }
-            const int copyH = (p == 0) ? srcH : srcH / 2;
-            const size_t rowBytes = std::min(src->strides[p], avFrame->linesize[p]);
-            for (int y = 0; y < copyH; ++y) {
-                memcpy(avFrame->data[p] + static_cast<size_t>(y) * avFrame->linesize[p],
-                       src->planes[p].get() + static_cast<size_t>(y) * src->strides[p], rowBytes);
+            if (!src->planes[p] || src->strides[p] <= 0 || src->strides[p] > avFrame->linesize[p]) {
+                strideFit = false;
+                break;
             }
         }
-        avFrame->pts = src->ptsUs >= 0
-                           ? av_rescale_q(src->ptsUs, AVRational{1, 1000000}, m_ctx->time_base)
-                           : AV_NOPTS_VALUE;
-        return true;
+        if (strideFit) {
+            for (int p = 0; p < planes; ++p) {
+                const int copyH = (p == 0) ? srcH : srcH / 2;
+                const size_t rowBytes = static_cast<size_t>(src->strides[p]);
+                for (int y = 0; y < copyH; ++y) {
+                    memcpy(avFrame->data[p] + static_cast<size_t>(y) * avFrame->linesize[p],
+                           src->planes[p].get() + static_cast<size_t>(y) * src->strides[p], rowBytes);
+                }
+            }
+            avFrame->pts = src->ptsUs >= 0
+                               ? av_rescale_q(src->ptsUs, AVRational{1, 1000000}, m_ctx->time_base)
+                               : AV_NOPTS_VALUE;
+            return true;
+        }
+        // stride 放不下：放弃这次分配的缓冲，交给 sws_scale 重新处理（它会按源 stride 正确重采样）
+        TG_LOGW_THROTTLED(2000000, "VideoEncoder: 源 stride %d > 目标 linesize %d，改走 sws_scale",
+                          src->strides[0], avFrame->linesize[0]);
+        av_frame_unref(avFrame.get());
+        avFrame->format = dstFmt;
+        avFrame->width = m_ctx->width;
+        avFrame->height = m_ctx->height;
     }
 
     if (!EnsureSwsContext(srcW, srcH, srcFmt)) {

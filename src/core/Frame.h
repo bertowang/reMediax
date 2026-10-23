@@ -39,6 +39,8 @@ struct Frame
 
     // 时间基：统一以采集单调时钟的微秒为准
     int64_t ptsUs = AV_NOPTS_VALUE;
+    // PTS 已由生产者（外部注入方）确定，下游不要再拿音频主时钟/采集时钟改写它
+    bool ptsLocked = false;
     int64_t captureUs = AV_NOPTS_VALUE;   // 采集时刻（用于音画同步与统计）
 
     // ---- 视频（系统内存） ----
