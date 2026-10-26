@@ -998,7 +998,14 @@ int TGCapturer::PushExternalAudioFrame(AudioCapSourceType type, const uint8_t* d
     frame->audioBytes = static_cast<size_t>(size);
     frame->audioData = std::shared_ptr<uint8_t>(new uint8_t[static_cast<size_t>(size)], std::default_delete<uint8_t[]>());
     memcpy(frame->audioData.get(), data, static_cast<size_t>(size));
-    frame->ptsUs = ptsUs >= 0 ? ptsUs : core::MonotonicClock::NowUs();
+    // ptsUs：调用方自带的采集时间戳。既写进 frame->ptsUs（供 Encoder 用），
+    // 也写进 frame->captureUs（供 Mixer 的 ChannelClock 做 drift 校正）。
+    // 之前只写了 ptsUs，没写 captureUs → Mixer 走兜底用 wallclock，调用方 PTS 实际被丢弃
+    // （PTS 抖动 / 回退 / 跳变全被内核无感吸收，故障完全不可观测）。
+    // 对齐 PushExternalVideoFrame 的 captureUs 处理，让两条外灌通路语义一致。
+    const int64_t effectivePts = ptsUs >= 0 ? ptsUs : core::MonotonicClock::NowUs();
+    frame->ptsUs = effectivePts;
+    frame->captureUs = effectivePts;
     OnAudioFrame(type, std::move(frame));
     return 0;
 }

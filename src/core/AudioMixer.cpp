@@ -73,7 +73,12 @@ int64_t AudioChannelClock::ReferencePtsUs(int64_t nowUs)
         return m_lastRefUs;
     }
     if (advance < 0) {
-        // 系统时间回退：直接忽略这次更新
+        // 系统时间回退：忽略这次更新（lastRef 不前进，防止把回退量算进 drift）。
+        // 之前这里静默吸收，调用方自带 PTS 回退时 jumpCount 永远为 0 —— 故障完全不可观测。
+        // 只统计显著回退（> 1ms），避免 clock_gettime 微秒级抖动把 baseline jumpCount 刷花。
+        if (-advance > 1000) {
+            ++m_stats.jumpCount;
+        }
         return m_lastRefUs;
     }
     m_lastRefUs = expected;
@@ -142,7 +147,8 @@ int64_t AudioChannelClock::NextPts(int nbSamples, int64_t nowUs)
     // 首帧：raw（采样数累计）与 ref（系统时钟）两个时钟必须同时起算。
     // 否则"AddChannel 到第一帧到达"之间的设备启动延迟（打开 WASAPI、填充缓冲，实测 ~300ms）
     // 会被整体算进 drift，首帧就触发 ForceAlign，之后 PI/BURST 的统计也全都偏移。
-    if (m_prevPts < 0 && nowUs > 0) {
+    // 注意 nowUs==0 也是合法首帧（外部注入场景常见），不能用 "> 0" 过滤。
+    if (m_prevPts < 0 && nowUs >= 0) {
         m_currentPts = 0;
         m_refStartUs = nowUs;
         m_lastRefUs = 0;
@@ -347,7 +353,10 @@ void AudioMixer::Push(int id, const int16_t* data, int frames, int64_t captureUs
     // 采集端若没填 captureUs（Frame 默认 AV_NOPTS_VALUE），这里兜底用当前单调时钟：
     // 否则 NextPts 拿到的 nowUs 恒为 0，参考时钟变成常数，drift 会被算成巨量负值，
     // 每帧都触发 ForceAlign，通道时钟统计全废。
-    const int64_t nowUs = captureUs > 0 ? captureUs : MonotonicClock::NowUs();
+    // 捕获时间戳：0 是合法 PTS（外部注入的第一帧就是 0），只有真·无效（AV_NOPTS_VALUE / 负数）才兜底 wallclock。
+    // 之前用 "> 0" 判定导致首帧用 wallclock、第二帧及之后用 captureUs，两套坐标系错位，
+    // ReferencePtsUs 的 m_refStartUs 持续和 nowUs 对不上，baseline 下 jumpCount 稳定在 4~5。
+    const int64_t nowUs = (captureUs != AV_NOPTS_VALUE && captureUs >= 0) ? captureUs : MonotonicClock::NowUs();
     ch->clock.NextPts(frames, nowUs);
 
     // ---- 样本级补/丢累加（delta 累加，对齐 MediaX FrameProductionDiag 的思路）----

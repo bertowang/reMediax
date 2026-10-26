@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <random>
 #include <cerrno>
 #include <csignal>
 #include <cstdint>
@@ -58,6 +59,14 @@ struct Options
     //   触发 PI → BURST → ForceAlign 层级校正，日志里可观测
     float       audio1Speed = 1.0f;
     float       audio2Speed = 1.0f;
+    // 故障注入（压测用，默认全关）：
+    //   --audio-pts-jitter-ms <N>  音频 PTS 加 ±N ms 的随机抖动（模拟采集端时间戳不准）
+    //   --audio-pts-back-every <K> 每 K 帧对音频 PTS 回退 1 帧时长（模拟设备时钟回退，触发 jumpWarns/staleReset）
+    //   --video-stall-start <s> --video-stall-dur <s>  视频在 start 秒后暂停 dur 秒不推帧
+    int         audioPtsJitterMs    = 0;
+    int         audioPtsBackEvery   = 0;
+    int         videoStallStartSec  = 0;
+    int         videoStallDurSec    = 0;
 
     // 编码/封装
     std::string out      = "out.flv";
@@ -91,6 +100,10 @@ void PrintUsage()
            "    --audio2-loops <n>      第 2 路音频循环次数，0=无限，默认 0(无限)\n"
            "    --audio1-speed <f>      第 1 路推送速度倍率，默认 1.0（>1 模拟过快，<1 过慢）\n"
            "    --audio2-speed <f>      第 2 路推送速度倍率，默认 1.0\n"
+           "  故障注入（压测用）:\n"
+           "    --audio-pts-jitter-ms <N>  音频 PTS ±N ms 随机抖动，默认 0\n"
+           "    --audio-pts-back-every <K> 每 K 个音频帧将 PTS 回退 1 帧时长，默认 0（关）\n"
+           "    --video-stall-start <s> --video-stall-dur <s>  视频从第 s 秒起暂停 dur 秒不推帧\n"
            "  输出:\n"
            "    --out <url>             out.flv / out.ts / rtmp:// / srt://，默认 out.flv\n"
            "    --seconds <n>           运行秒数，0 = 直到视频结束，默认 10\n"
@@ -121,6 +134,10 @@ Options ParseArgs(int argc, char** argv)
         else if (a == "--audio2-loops") { if (auto* v = next(i, "--audio2-loops")) opt.audio2Loops = std::atoi(v); }
         else if (a == "--audio1-speed") { if (auto* v = next(i, "--audio1-speed")) opt.audio1Speed = static_cast<float>(std::atof(v)); }
         else if (a == "--audio2-speed") { if (auto* v = next(i, "--audio2-speed")) opt.audio2Speed = static_cast<float>(std::atof(v)); }
+        else if (a == "--audio-pts-jitter-ms")  { if (auto* v = next(i, "--audio-pts-jitter-ms"))  opt.audioPtsJitterMs    = std::atoi(v); }
+        else if (a == "--audio-pts-back-every") { if (auto* v = next(i, "--audio-pts-back-every")) opt.audioPtsBackEvery   = std::atoi(v); }
+        else if (a == "--video-stall-start")    { if (auto* v = next(i, "--video-stall-start"))    opt.videoStallStartSec  = std::atoi(v); }
+        else if (a == "--video-stall-dur")      { if (auto* v = next(i, "--video-stall-dur"))      opt.videoStallDurSec    = std::atoi(v); }
         else if (a == "--video")   { if (auto* v = next(i, "--video"))   opt.video = v; }
         else if (a == "--audio1")  { if (auto* v = next(i, "--audio1"))  opt.audio1 = v; }
         else if (a == "--audio2")  { if (auto* v = next(i, "--audio2"))  opt.audio2 = v; }
@@ -364,6 +381,26 @@ int main(int argc, char** argv)
     std::vector<int16_t> pcm1(static_cast<size_t>(samplesPerPush) * ch);
     std::vector<int16_t> pcm2(static_cast<size_t>(samplesPerPush) * ch);
 
+    // 故障注入状态
+    std::mt19937 jitterRng{20261026};
+    auto applyPtsInjection = [&](int64_t pts, int frameSeq) -> int64_t {
+        int64_t out = pts;
+        if (opt.audioPtsJitterMs > 0) {
+            std::uniform_int_distribution<int> dist(-opt.audioPtsJitterMs, opt.audioPtsJitterMs);
+            out += static_cast<int64_t>(dist(jitterRng)) * 1000LL;
+            if (out < 0) { out = 0; }
+        }
+        if (opt.audioPtsBackEvery > 0 && frameSeq > 0 && (frameSeq % opt.audioPtsBackEvery) == 0) {
+            out -= audioUs;              // 回退 1 帧时长
+            if (out < 0) { out = 0; }
+        }
+        return out;
+    };
+    const int64_t stallStartUs = static_cast<int64_t>(opt.videoStallStartSec) * 1000000LL;
+    const int64_t stallEndUs   = stallStartUs + static_cast<int64_t>(opt.videoStallDurSec) * 1000000LL;
+    bool stallEnteredLogged = false;
+    bool stallExitedLogged  = false;
+
     const auto t0 = std::chrono::steady_clock::now();
     int64_t videoDue   = 0;
     int64_t audio1Due  = 0, audio1Pts = 0;   // Due = wallclock 触发时刻，Pts = 采样数时间轴
@@ -400,7 +437,19 @@ int main(int argc, char** argv)
         if (audio1Done && audio2Done && !opt.audio) { break; }
 
         // ---- 视频 ----
-        if (!videoDone && now >= videoDue) {
+        // 视频卡顿注入：进入 [stallStart, stallEnd) 窗口时暂停推送（不前进 videoDue）
+        const bool inVideoStall = opt.videoStallDurSec > 0 &&
+                                  now >= stallStartUs && now < stallEndUs;
+        if (inVideoStall && !stallEnteredLogged) {
+            printf("[demo][inject] t=%.3fs 进入视频卡顿窗口（dur=%ds）\n",
+                   now / 1e6, opt.videoStallDurSec);
+            stallEnteredLogged = true;
+        }
+        if (!inVideoStall && stallEnteredLogged && !stallExitedLogged) {
+            printf("[demo][inject] t=%.3fs 退出视频卡顿窗口\n", now / 1e6);
+            stallExitedLogged = true;
+        }
+        if (!videoDone && !inVideoStall && now >= videoDue) {
             if (videoPipe.ReadFull(nv12.data(), frameBytes)) {
                 if (capturer->PushExternalVideoFrame(nv12.data(), w, h, w, videoDue) == 0) {
                     ++pushedVideo;
@@ -415,9 +464,10 @@ int main(int argc, char** argv)
         // ---- 音频 1：原音量，走 Micphone 通道 ----
         if (!audio1Done && now >= audio1Due) {
             if (audio1Pipe.ReadFull(pcm1.data(), pcmChunkBytes)) {
+                const int64_t pts = applyPtsInjection(audio1Pts, pushedAudio1);
                 if (capturer->PushExternalAudioFrame(TypeOfGameMicphone4Slave,
                         reinterpret_cast<const uint8_t*>(pcm1.data()),
-                        pcmChunkBytes, sr, ch, audio1Pts) == 0) {
+                        pcmChunkBytes, sr, ch, pts) == 0) {
                     ++pushedAudio1;
                 } else { ++rejected; }
                 audio1Due += a1TrigUs;   // wallclock 节奏（受 speed 影响）
@@ -430,9 +480,10 @@ int main(int argc, char** argv)
         if (!audio2Done && now >= audio2Due) {
             if (audio2Pipe.ReadFull(pcm2.data(), pcmChunkBytes)) {
                 ScalePcm(pcm2.data(), samplesPerPush, ch, opt.audio2Volume);
+                const int64_t pts = applyPtsInjection(audio2Pts, pushedAudio2);
                 if (capturer->PushExternalAudioFrame(TypeOfGameAudio4Slave,
                         reinterpret_cast<const uint8_t*>(pcm2.data()),
-                        pcmChunkBytes, sr, ch, audio2Pts) == 0) {
+                        pcmChunkBytes, sr, ch, pts) == 0) {
                     ++pushedAudio2;
                 } else { ++rejected; }
                 audio2Due += a2TrigUs;
