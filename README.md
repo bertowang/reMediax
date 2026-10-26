@@ -887,18 +887,41 @@ cd build/linux-x86_64
 
 #### 日志判读
 
-每次结束看最后一行 `[TGCapturer] 音画同步` 的统计：
+**运行期心跳（10s / 条，MixLoop 发出）** — 长压测时在时间轴上就能看到 drift 分布，不用等 Stop 聚合：
 
 ```
-[TGCapturer] 音画同步 avDiff=85ms  clamp=0  forceSync=8480  adapt=39482
-                               stall=0  skip=0  jump=0  staleReset=0  syncDrop=0
+[I] TGCapturer: 心跳 avDiff=118ms force=193 adapt=898 clamp=0 stall=0 skip=0 jump=0 staleReset=0
+  | ch0[drift=0ms  pi=1636 burst=1 force=0 jump=0 under=1671 comp=0ms drop=0ms buf=0]
+  | ch1[drift=0ms  pi=1841 burst=2 force=0 jump=0 under=1465 comp=0ms drop=0ms buf=0]
 ```
 
-- 正常运行：`avDiff` < 1 帧时长，`forceSync` ≈ 0，`adapt` 低
-- 存在 drift（本例 ±3%，跑了 30min）：`adapt` / `forceSync` 持续累加 → 内核在吸收偏差，`avDiff` 收敛到 ≈ 2~3 帧内
+- 外层（视频 PTS 生成器）：`avDiff` < 1 帧时长 OK；`forceSync/adapt` 持续累加表明内核在吸收 drift
+- `ch<N>`（每路音频独立）：
+  - `drift` 当前瞬时偏差（参考时钟 − 本路时钟）；稳态下近 0，`pi` 持续增长说明 PI 在吃掉偏差（校正真在工作）
+  - `burst/force` 一次性启动尖峰正常；稳态连增表示 drift 太大 PI 吃不下
+  - `under` 持续增长说明本路补货率 < Mix 消费率（部分段靠静音补齐）
+  - `comp/drop` 样本级补/丢累计（限速 5ms/s）
+  - `buf` 该路 pcm 积压；长期非 0 表示积压可能死锁
 - `clamp / stall / skip / jump / staleReset / syncDrop` 应恒为 0 — 任何非零都要查
 
-运行期每 3 秒节流一条 `混流取不到数据（通道 N，帧长 1024）` 是**正常运行节律**（Mix 消费率略高于补货率时，MixLoop 轻度 sleep 等待），不是错误；日志中 `通道 N` 的 `N` 是 `ChannelCount()` 而非通道号，别误读。
+**结束聚合（Stop 时一次性输出）**：
+
+```
+[I] TGCapturer: 音画同步 avDiff=85ms clamp=0 forceSync=8480 adapt=39482 stall=0 skip=0 jump=0 staleReset=0 syncDrop=0
+[I] VideoEncoder: 线程退出 codec=libopenh264 encoded=... dropped=0 latency_us=...
+[I] AudioEncoder: 线程退出 codec=libfdk_aac encoded=... latency_us=...
+[demo] 输出=... 视频帧=... 音频1=... 音频2=... 拒绝=...
+```
+
+**demo 推送心跳（30s / 条）** — 验证 demo 自身仍在供帧 + 校核 speed 效果：
+
+```
+[demo] t=60.001s video+901(=1801) a1+1227(=2455) a2+1383(=2766) rej=0
+```
+
+`a2+ / a1+` 比值应接近 `audio2-speed / audio1-speed`（本例 `1383/1227≈1.126 ≈ 1.07/0.95`）。
+
+**运行期告警**：每 3 秒节流一条 `混流取不到数据（当前通道数 N，帧长 1024）` 是**正常运行节律**（Mix 消费率略高于补货率时，MixLoop 轻度 sleep 等待），不是错误。
 
 #### 已知时间轴行为
 
