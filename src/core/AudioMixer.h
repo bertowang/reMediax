@@ -138,7 +138,15 @@ private:
 
         // 样本级补偿（对齐 MediaX FrameProductionDiag::accumulatedCompensationUs / pendingProductionDrop）
         // 限速 COMP_FORCE_RATE_LIMIT_US = 5000us/s：每秒最多补 / 丢 5ms 样本，避免瞬间抽变音
+        //
+        // 累加语义采用 "delta 累加"（Review 后保守方案）：
+        //   pendingCompUs += (当前帧 drift - 上一帧 drift)
+        //   PI 稳态下 driftUs 近似常数，delta≈0，不会把 PI 已经维持住的稳态偏差再累一遍；
+        //   ForceAlign / BURST 把时间戳一次性"跳齐"后，driftUs 的瞬时跳变不代表"新增偏差"，
+        //   由 Push 侧检测跳变并刷新 prevDriftUs 跳过累加，避免双重补偿。
         int64_t pendingCompUs = 0;        // 本路 drift 累加器（正=本路慢，待补；负=本路快，待丢）
+        int64_t prevDriftUs = 0;          // 上一帧 driftUs 快照（用于 delta 累加）
+        bool    driftBaselineSet = false; // 首帧时 drift 不是"新增"，不参与 delta 计算
         int64_t lastCompUs = 0;           // 上一次做补偿的系统时间
         int64_t compensationUs = 0;       // 累计实际补偿量（统计用）
         int64_t productionDropUs = 0;     // 累计实际丢弃量（统计用）

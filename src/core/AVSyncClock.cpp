@@ -12,6 +12,7 @@ void AudioClock::Reset() noexcept
 {
     m_nextPtsUs.store(0);
     m_outputPtsUs.store(0);
+    m_lastAdvanceWallUs.store(0);
     m_started.store(false);
 }
 
@@ -19,6 +20,9 @@ int64_t AudioClock::ReserveUs(int64_t durationUs) noexcept
 {
     const int64_t pts = m_nextPtsUs.fetch_add(durationUs > 0 ? durationUs : 0);
     m_started.store(true);
+    // Reserve 本质也是一次时钟推进（混流器输出路径走 AdvanceTo，采集路径走 Reserve），
+    // 两条路径都更新 lastAdvanceWallUs，否则 IsFresh 对纯 Reserve 使用者判活不准
+    m_lastAdvanceWallUs.store(MonotonicClock::NowUs());
     return pts;
 }
 
@@ -44,10 +48,20 @@ void AudioClock::AdvanceTo(int64_t nextPtsUs) noexcept
         return;
     }
     int64_t cur = m_nextPtsUs.load();
-    while (nextPtsUs > cur && !m_nextPtsUs.compare_exchange_weak(cur, nextPtsUs)) {
-        // 只在前进方向更新，避免多线程下回退
+    bool advanced = false;
+    while (nextPtsUs > cur) {
+        if (m_nextPtsUs.compare_exchange_weak(cur, nextPtsUs)) {
+            advanced = true;
+            break;
+        }
+        // CAS 失败时 cur 已被更新为最新值，继续比较
     }
     m_started.store(true);
+    // 只有真正把时钟推前过才算"活跃"；如果 AdvanceTo 的 nextPts 比当前值还小被忽略，
+    // 不应该顺便刷新墙钟（否则会把"停滞但调用者仍在尝试推进"误判为活跃）
+    if (advanced) {
+        m_lastAdvanceWallUs.store(MonotonicClock::NowUs());
+    }
 }
 
 int64_t AudioClock::InFlightUs() const noexcept
@@ -62,6 +76,18 @@ int64_t AudioClock::ReferencePtsUs() const noexcept
         return kInvalidPtsUs;
     }
     return m_nextPtsUs.load() + m_compensationUs.load();
+}
+
+bool AudioClock::IsFresh(int64_t staleMs) const noexcept
+{
+    if (!m_started.load()) {
+        return false;
+    }
+    const int64_t last = m_lastAdvanceWallUs.load();
+    if (last == 0 || staleMs <= 0) {
+        return false;
+    }
+    return (MonotonicClock::NowUs() - last) < staleMs * 1000;
 }
 
 // ------------------------------------------------------------------ VideoPtsGenerator

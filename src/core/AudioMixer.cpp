@@ -243,6 +243,15 @@ void AudioMixer::Reset()
     for (auto& ch : m_channels) {
         ch.pcm.clear();
         ch.clock.Reset();
+        // 时间戳/drift 相关的运行期状态要一起复位，否则再次开播首帧会把上一轮的
+        // prevDriftUs 当成"本轮基线"，立刻累一笔大 delta 触发无中生有的补偿。
+        ch.pendingCompUs = 0;
+        ch.prevDriftUs = 0;
+        ch.driftBaselineSet = false;
+        ch.lastCompUs = 0;
+        ch.compensationUs = 0;
+        ch.productionDropUs = 0;
+        ch.underrun = 0;
     }
     m_outputPtsUs = 0;
 }
@@ -341,10 +350,39 @@ void AudioMixer::Push(int id, const int16_t* data, int frames, int64_t captureUs
     const int64_t nowUs = captureUs > 0 ? captureUs : MonotonicClock::NowUs();
     ch->clock.NextPts(frames, nowUs);
 
-    // 本帧 drift 累加（取最新一次的瞬时 drift）—— 用它做样本级补偿。
-    // 对齐 MediaX FrameProductionDiag：PI/BURST 只改时间戳标签，样本级补/丢处理
-    // "实际产出速率 vs 系统时间"的偏差（设备丢包/调度卡顿）。两者分工互补，不重复补偿。
-    ch->pendingCompUs += ch->clock.stats().driftUs;
+    // ---- 样本级补/丢累加（delta 累加，对齐 MediaX FrameProductionDiag 的思路）----
+    // 不能用 "pendingCompUs += driftUs"（旧实现）：
+    //   1) PI 稳态下 driftUs 近似常数，每帧累加会把 PI 已经维持住的稳态偏差无限累成样本补偿；
+    //   2) ForceAlign/BURST 把时间戳一次性跳齐后，驱动 PI/BURST 收敛的旧偏差已被吸收，
+    //      下一帧继续累加这个"历史偏差"会导致双重补偿（视觉表现：ForceAlign 后几秒钟
+    //      音频出现持续的尾部样本重复或丢弃）。
+    //
+    // delta 方案：只累加 "本帧 drift 相对上一帧 drift 的新增量"。
+    //   - PI 稳态下 delta≈0 → 不触发；
+    //   - ForceAlign/BURST 跳齐那一拍 drift 会出现大跳变（通常 > 2 帧时长），
+    //     把它视为"已被时间戳校正吸收"，只刷新 baseline 不累加；
+    //   - 设备真实"慢产/快产"时 drift 持续递增/递减，delta 为同号增量，累加后正常触发限速补偿。
+    const int64_t curDriftUs = ch->clock.stats().driftUs;
+    const int64_t frameDurUs =
+        (m_outSampleRate > 0 && frames > 0)
+            ? (static_cast<int64_t>(frames) * 1000000LL / m_outSampleRate)
+            : 21333;
+    if (!ch->driftBaselineSet) {
+        // 首帧不参与 delta 计算（首帧 drift 代表"启动延迟 offset"，已被 ForceAlign 吸收）
+        ch->driftBaselineSet = true;
+    } else {
+        const int64_t deltaUs = curDriftUs - ch->prevDriftUs;
+        const int64_t absDelta = deltaUs >= 0 ? deltaUs : -deltaUs;
+        if (absDelta > 2 * frameDurUs) {
+            // 大跳变 = ForceAlign/BURST 吸收偏差 → 只刷新基线，不累加
+            TG_LOGD("AudioMixer: 通道 %d drift 跳变 %lldus (|delta|>%lldus)，视为校正吸收",
+                    ch->id, static_cast<long long>(deltaUs),
+                    static_cast<long long>(2 * frameDurUs));
+        } else {
+            ch->pendingCompUs += deltaUs;
+        }
+    }
+    ch->prevDriftUs = curDriftUs;
 
     const int srcChannels = ch->channels;
     if (ch->swr) {

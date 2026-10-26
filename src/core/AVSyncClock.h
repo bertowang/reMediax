@@ -53,10 +53,17 @@ public:
 
     bool Valid() const noexcept { return m_started.load(); }
 
+    // "最近 staleMs 毫秒内有过 AdvanceTo" ——
+    // Valid() 是单向开关（音频第一次产出后永远 true），不足以识别"音频断流"场景；
+    // 由本接口按墙钟判定主时钟是否仍活跃，供 OnVideoFrame 做 fallback 决策（对齐 MediaX
+    // 的 pcmSysDrift 判活机制：主时钟推进相对系统时钟延迟过久即视为失效）。
+    bool IsFresh(int64_t staleMs) const noexcept;
+
 private:
     std::atomic<int64_t> m_nextPtsUs{0};
     std::atomic<int64_t> m_outputPtsUs{0};
     std::atomic<int64_t> m_compensationUs{0};
+    std::atomic<int64_t> m_lastAdvanceWallUs{0};   // 最近一次 AdvanceTo 的墙钟（us，用于 IsFresh）
     std::atomic_bool m_started{false};
 };
 

@@ -727,19 +727,26 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
 
     // ---- 音画同步：视频 PTS 由音频时钟反推（不用采集 wall clock）----
     // 对齐 MediaX：每帧独立判定，不保留"已降级"状态 ——
-    // 音频恢复后下一帧 m_audioClock->Valid() 自然为 true，直接切回主时钟，
+    // 音频恢复后下一帧 m_audioClock->IsFresh() 自然为 true，直接切回主时钟，
     // VideoOnlyTimeline 也顺手 Reset 让再次掉线能重新从 0 起算。
+    //
+    // 关键：判活用 IsFresh(audioTimeoutMs) 而不是 Valid()。Valid() 是单向开关
+    // （第一次 Advance/Reserve 后永远 true），音频长时间断流时 ReferencePtsUs()
+    // 会一直返回最后一次推进的旧 PTS —— VideoPtsGenerator 的 stallFrames 虽然能
+    // clamp 到 audio+maxLead，但那个 audio 已经是几秒钟前的值，视频 PTS 会相对
+    // 墙钟永久落后一个 drift。IsFresh 按"最近 N ms 内有过真实推进"判活，断流后
+    // 会自然走到下面的 wall-clock fallback 分支。
     //
     // 有音频时"视频等音频"：主时钟尚未产出第一拍就先不发帧（最多等 audioTimeoutMs）。
     // 等不到才走采集时间轴 —— 这是 wall-clock fallback 分支，不污染音频时钟域。
     int64_t audioRef = core::kInvalidPtsUs;
     bool useAudioClock = false;
-    if (m_audioEnabled && m_audioClock && m_audioClock->Valid()) {
+    if (m_audioEnabled && m_audioClock && m_audioClock->IsFresh(m_audioTimeoutMs)) {
         useAudioClock = true;
         audioRef = m_audioClock->ReferencePtsUs();
         // 音频刚从异常恢复：重置等待起点 + 让 videoOnlyTimeline 下次能从 0 重起
         if (m_audioWaitStartUs != 0) {
-            TG_LOGI("TGCapturer: 音频主时钟恢复，切回主时钟（曾等待 %lldms）",
+            TG_LOGI("TGCapturer: 音频主时钟恢复，切回主时钟（曾等待/断流 %lldms）",
                     static_cast<long long>((core::MonotonicClock::NowUs() - m_audioWaitStartUs) / 1000));
             m_audioWaitStartUs = 0;
             m_videoOnlyTimeline->Reset();
@@ -748,16 +755,25 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
         const int64_t nowUs = core::MonotonicClock::NowUs();
         if (m_audioWaitStartUs == 0) {
             m_audioWaitStartUs = nowUs;
-            TG_LOGI("TGCapturer: 等待音频主时钟首帧（最多 %lldms）",
-                    static_cast<long long>(m_audioTimeoutMs));
+            // 区分"首帧前等待" vs "运行中断流"的日志，便于定位
+            if (m_audioClock && m_audioClock->Valid()) {
+                TG_LOGW("TGCapturer: 音频主时钟断流（最后一拍 %lldms 前），进入 wall-clock fallback",
+                        static_cast<long long>(m_audioTimeoutMs));
+            } else {
+                TG_LOGI("TGCapturer: 等待音频主时钟首帧（最多 %lldms）",
+                        static_cast<long long>(m_audioTimeoutMs));
+            }
         }
-        if (nowUs - m_audioWaitStartUs < m_audioTimeoutMs * 1000) {
+        // 首帧前（Valid()==false）要尊重 audioTimeoutMs 的等待窗口；
+        // 运行中断流（Valid()==true 但 IsFresh()==false）直接 fallback，不再等。
+        const bool firstFrameWait = m_audioClock && !m_audioClock->Valid();
+        if (firstFrameWait && (nowUs - m_audioWaitStartUs < m_audioTimeoutMs * 1000)) {
             return;   // 正常等待，不计入丢帧统计
         }
-        TG_LOGW_THROTTLED(5000000, "TGCapturer: 音频未就绪，本帧走采集时间轴");
+        TG_LOGW_THROTTLED(5000000, "TGCapturer: 音频未就绪/断流，本帧走采集时间轴");
         // 注意：不再调 m_sync->Reset()。
         // 当前帧用 wall-clock PTS，但 m_sync 里的旧 audio ref 已被 VideoEncoder 的落后丢帧判决所依赖；
-        // 恢复音频主时钟后，上面 Valid()=true 分支会接管，m_sync 由 UpdateAudioClock 刷新即可。
+        // 恢复音频主时钟后，上面 IsFresh 分支会接管，m_sync 由 UpdateAudioClock 刷新即可。
     }
 
     if (useAudioClock) {
