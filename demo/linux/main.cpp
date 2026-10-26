@@ -369,12 +369,32 @@ int main(int argc, char** argv)
     int64_t audio1Due  = 0, audio1Pts = 0;   // Due = wallclock 触发时刻，Pts = 采样数时间轴
     int64_t audio2Due  = 0, audio2Pts = 0;
     int pushedVideo = 0, pushedAudio1 = 0, pushedAudio2 = 0, rejected = 0;
+    // 推送进度心跳：长压测时需要确认 demo 自身仍在供帧（而不是被 fread 卡住）
+    const int64_t kDemoBeatUs = 30 * 1000000LL;
+    int64_t lastBeatUs = 0;
+    int lastPushedVideo = 0, lastPushedAudio1 = 0, lastPushedAudio2 = 0;
     bool videoDone = false, audio1Done = !opt.audio, audio2Done = !opt.audio;
 
     while (!errored.load()) {
         if (s_stop.load()) { printf("[demo] 收到退出信号，刷 trailer\n"); break; }
         const int64_t now = ElapsedUs(t0);
         if (totalUs > 0 && now >= totalUs) { break; }
+
+        // 心跳：30s/次，每路给出"本窗口帧数"和"累计帧数"，瞬时速率 = Δ/30
+        if (now - lastBeatUs >= kDemoBeatUs) {
+            const int dv = pushedVideo  - lastPushedVideo;
+            const int d1 = pushedAudio1 - lastPushedAudio1;
+            const int d2 = pushedAudio2 - lastPushedAudio2;
+            printf("[demo] t=%lld.%03llds video+%d(=%d) a1+%d(=%d) a2+%d(=%d) rej=%d\n",
+                   static_cast<long long>(now / 1000000),
+                   static_cast<long long>((now % 1000000) / 1000),
+                   dv, pushedVideo, d1, pushedAudio1, d2, pushedAudio2, rejected);
+            std::fflush(stdout);
+            lastBeatUs = now;
+            lastPushedVideo  = pushedVideo;
+            lastPushedAudio1 = pushedAudio1;
+            lastPushedAudio2 = pushedAudio2;
+        }
         // 视频 EOF 作为整体结束条件（音频无限循环场景下不应等 audio pipe EOF，否则永不退出）
         if (videoDone) { break; }
         if (audio1Done && audio2Done && !opt.audio) { break; }

@@ -253,15 +253,62 @@ void TGCapturer::StopAudioMixer()
 
 void TGCapturer::MixLoop(std::stop_token token)
 {
+    // 心跳：每 10 秒打一条累计状态，长压测时能在时间轴上看到 drift / avDiff 的分布，
+    // 而不是只在 Stop 时才有一次最终聚合
+    const int64_t kHeartbeatUs = 10 * 1000000LL;
+    int64_t lastBeatUs = core::MonotonicClock::NowUs();
     while (!token.stop_requested()) {
         std::shared_ptr<uint8_t> data;
         int64_t ptsUs = 0;
         if (!m_mixer->Mix(m_audioFrameSize, data, ptsUs)) {
-            // 全部音频源都取不到数据：限频提示，避免"音频时间轴悄悄停住"却没有任何迹象
-            TG_LOGW_THROTTLED(3000000, "TGCapturer: 混流取不到数据（通道 %zu，帧长 %d）",
+            // 所有混流通道都没凑够一帧数据：限频提示，避免"音频时间轴悄悄停住"却没有任何迹象。
+            // "通道数" 指当前挂载的混流通道总数，不是通道号 —— 之前文案 "通道 N" 容易被误读
+            TG_LOGW_THROTTLED(3000000, "TGCapturer: 混流取不到数据（当前通道数 %zu，帧长 %d）",
                               m_mixer->ChannelCount(), m_audioFrameSize);
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
+        }
+
+        // ---- 心跳：10s/次 I 级累计状态 ----
+        const int64_t nowUs = core::MonotonicClock::NowUs();
+        if (nowUs - lastBeatUs >= kHeartbeatUs) {
+            lastBeatUs = nowUs;
+            // 1) 视频 PTS 生成器累计
+            core::VideoPtsGenerator::Stats vs{};
+            if (m_videoPtsGen) { vs = m_videoPtsGen->stats(); }
+            // 2) 每路音频的 drift / PI / BURST / ForceAlign / 积压
+            auto diags = m_mixer->AllDiagnostics();
+            std::string per;
+            per.reserve(128);
+            for (size_t i = 0; i < diags.size(); ++i) {
+                const auto& d = diags[i];
+                char buf[192];
+                std::snprintf(buf, sizeof(buf),
+                              " ch%zu[drift=%lldms pi=%llu burst=%llu force=%llu "
+                              "jump=%llu under=%llu comp=%lldms drop=%lldms buf=%zu]",
+                              i,
+                              static_cast<long long>(d.clock.driftUs / 1000),
+                              static_cast<unsigned long long>(d.clock.piCount),
+                              static_cast<unsigned long long>(d.clock.burstCount),
+                              static_cast<unsigned long long>(d.clock.forceCount),
+                              static_cast<unsigned long long>(d.clock.jumpCount),
+                              static_cast<unsigned long long>(d.underrun),
+                              static_cast<long long>(d.compensationUs / 1000),
+                              static_cast<long long>(d.productionDropUs / 1000),
+                              m_mixer->BufferedFrames(static_cast<int>(i)));
+                per += buf;
+            }
+            TG_LOGI("TGCapturer: 心跳 avDiff=%lldms force=%llu adapt=%llu clamp=%llu "
+                    "stall=%llu skip=%llu jump=%llu staleReset=%llu|%s",
+                    static_cast<long long>(vs.avDiffUs / 1000),
+                    static_cast<unsigned long long>(vs.forceSynced),
+                    static_cast<unsigned long long>(vs.adapted),
+                    static_cast<unsigned long long>(vs.clamped),
+                    static_cast<unsigned long long>(vs.stalled),
+                    static_cast<unsigned long long>(vs.skipped),
+                    static_cast<unsigned long long>(vs.jumpWarns),
+                    static_cast<unsigned long long>(vs.staleResets),
+                    per.c_str());
         }
 
         const int channels = m_mixer->OutputChannels();
