@@ -88,7 +88,7 @@ private:
 
     void OnVideoFrame(core::FramePtr frame);
     // 外部注入的音频（PushExternalAudioFrame）也进混流器
-    void OnAudioFrame(core::FramePtr frame);
+    void OnAudioFrame(AudioCapSourceType type, core::FramePtr frame);
     void FireError(int32_t what, int32_t extra, const std::string& msg);
     void FireNotify(NotifyMsgType type, const std::string& content, int64_t data);
     void ReleaseAll();
@@ -176,9 +176,12 @@ private:
     // 外部注入视频是否沿用调用方自带的 PTS（VideoEncoderParams::videoUseExternalPts）。
     // Prepare 写、采集/注入线程读，用 atomic 避免跨线程读写同一 bool。
     std::atomic_bool m_useExternalVideoPts{false};
-    // 外部注入音频独占的混流通道号（-1 = 尚未建立）。
-    // 不能复用 0 号：那是内部麦克风源，两路共用一个通道时钟会互相拉扯时间戳。
-    std::atomic_int m_externalAudioChannel{-1};
+    // 外部注入音频按 AudioCapSourceType 分路，每种类型独占一个混流通道。
+    // 不能复用 0 号：那是内部麦克风源，两路共用一个通道时钟会互相拉扯时间戳；
+    // 外部多路（如游戏音频 + 游戏麦克风）也必须各占一路，否则会被串成一条时间轴，
+    // 结果不是"混音"而是"交替输出"。
+    std::unordered_map<int, int> m_externalAudioChannels;
+    std::mutex m_externalAudioMutex;
     int64_t m_audioTimeoutMs = 3000;
     int64_t m_videoTimeoutMs = 3000;
     int64_t m_lastVideoUs = 0;

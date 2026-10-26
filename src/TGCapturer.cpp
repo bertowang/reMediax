@@ -395,7 +395,10 @@ int TGCapturer::Prepare()
         videoType.SetHeight(evenH);
     }
     m_useExternalVideoPts = m_videoParams.videoUseExternalPts;
-    m_externalAudioChannel = -1;
+    {
+        std::lock_guard<std::mutex> lock(m_externalAudioMutex);
+        m_externalAudioChannels.clear();
+    }
 
     // 纯视频模式：不建音频编码器、封装器也不建音频流
     m_audioEnabled = m_audioParams.enabled && m_audioParams.sampleRate > 0 && m_audioParams.channels > 0;
@@ -828,7 +831,7 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
 }
 
 // 外部注入的音频：同样进混流器（走 0 号通道，没有内部音频源时由它独占）
-void TGCapturer::OnAudioFrame(core::FramePtr frame)
+void TGCapturer::OnAudioFrame(AudioCapSourceType type, core::FramePtr frame)
 {
     if (!frame || !m_audioEnabled || !m_mixer || m_state.load() != State::Running) {
         return;
@@ -836,23 +839,33 @@ void TGCapturer::OnAudioFrame(core::FramePtr frame)
     if (!frame->audioData || frame->audioBytes == 0 || frame->channels <= 0) {
         return;
     }
-    // 外部注入的音频必须独占一路：之前一律塞进 0 号通道，
-    // 有内部麦克风时两路会共用同一个通道时钟，时间戳互相拉扯（表现为音频抖动/变调）。
-    if (m_externalAudioChannel < 0) {
-        const int id = static_cast<int>(m_mixer->ChannelCount());   // 追加在内部源之后
-        if (id == 0) {
-            m_mixer->SetOutputFormat(frame->sampleRate, frame->channels);
-        }
-        if (m_mixer->AddChannel(id, frame->sampleRate, frame->channels,
-                                core::MonotonicClock::NowUs()) == 0) {
-            m_externalAudioChannel = id;
-            TG_LOGI("TGCapturer: 外部注入音频占用混流通道 %d（%dHz %dch）", id, frame->sampleRate,
-                    frame->channels);
+    // 外部注入的音频按 type 分路：每种 AudioCapSourceType 独占一个混流通道。
+    // 共享单一通道会把两路串成一条时间轴（表现为"交替输出"而非真正混音），且与内部麦克风源
+    // 共用同一个通道时钟还会互相拉扯时间戳（音频抖动/变调）。
+    int id = -1;
+    {
+        std::lock_guard<std::mutex> lock(m_externalAudioMutex);
+        const int key = static_cast<int>(type);
+        auto it = m_externalAudioChannels.find(key);
+        if (it != m_externalAudioChannels.end()) {
+            id = it->second;
         } else {
-            return;
+            const int newId = static_cast<int>(m_mixer->ChannelCount());  // 追加在内部源之后
+            // 以第一个 active 通道（内部源或首路外部注入）的格式作为混流输出格式。
+            if (newId == 0) {
+                m_mixer->SetOutputFormat(frame->sampleRate, frame->channels);
+            }
+            if (m_mixer->AddChannel(newId, frame->sampleRate, frame->channels,
+                                    core::MonotonicClock::NowUs()) == 0) {
+                m_externalAudioChannels[key] = newId;
+                id = newId;
+                TG_LOGI("TGCapturer: 外部注入音频 type=%d 占用混流通道 %d（%dHz %dch）",
+                        static_cast<int>(type), id, frame->sampleRate, frame->channels);
+            } else {
+                return;
+            }
         }
     }
-    const int id = m_externalAudioChannel;
     if (id < 0) {
         return;
     }
@@ -939,7 +952,7 @@ int TGCapturer::PushExternalAudioFrame(AudioCapSourceType type, const uint8_t* d
     frame->audioData = std::shared_ptr<uint8_t>(new uint8_t[static_cast<size_t>(size)], std::default_delete<uint8_t[]>());
     memcpy(frame->audioData.get(), data, static_cast<size_t>(size));
     frame->ptsUs = ptsUs >= 0 ? ptsUs : core::MonotonicClock::NowUs();
-    OnAudioFrame(std::move(frame));
+    OnAudioFrame(type, std::move(frame));
     return 0;
 }
 

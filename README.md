@@ -821,8 +821,13 @@ ffplay out.flv                      # 实际播放确认音画同步
 * **Linux：有内核、无原生采集** —— 屏幕需 X11 / PipeWire、音频需 PulseAudio / ALSA，
   当前均未实现，因此 `IsSupported()` 一律返回 false、`Create*Capture` / `Enable*Capture`
   返回空 / 负值。编码 → 封装 → 音画同步 → 混流与外灌帧（`PushExternal*Frame`）照常可用，
-  `demo/linux` 即用它验证（2~3 秒可录出 `h264 + aac` 的 flv）。
+  `demo/linux` 用系统 `ffmpeg` CLI 把真实素材解成裸 NV12 / S16LE PCM，
+  按"1 视频 + 2 独立音频"喂进 `PushExternalVideoFrame` / `PushExternalAudioFrame`，
+  由内核混流器把两路音频合并后再和视频一起走编码封装。
   要真正开播，需补 Linux 采集源，或用 `PushExternalVideoFrame` 从上层喂帧。
+* **外部注入音频按 `AudioCapSourceType` 分路**：同一进程内多次 `PushExternalAudioFrame`
+  传不同的 `type`（如 `TypeOfGameAudio4Slave` 与 `TypeOfGameMicphone4Slave`）会各自占用
+  独立的混流通道并被真正做 sample-wise 相加；传相同 `type` 则串成同一时间轴（覆盖/交替）。
 * **Android / iOS 尚未在各自平台编译验证**（本机只有 Windows 工具链）：
   `src/platform/android/*`、`src/platform/ios/*` 与 `TGCaptureSystemCapture.java`
   需在有 SDK/NDK/Xcode 的环境跑一次。
