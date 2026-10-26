@@ -812,6 +812,98 @@ ffplay out.flv                      # 实际播放确认音画同步
 | GPU 全链路 | `h264_nvenc` + D3D11 帧池（fmt=`AV_PIX_FMT_D3D11`, sw=`BGRA`），3 秒 98 帧，文件可解析 |
 | 稳定性 | 同配置连跑 5 次均 `exit=0`、产物有效 |
 
+### 10.5 Linux 外灌帧 demo（真实素材 1 视频 + 2 音频）
+
+Linux 没有原生采集，但是**整条编码 / 封装 / 混流 / 音画同步链路都可以用外灌帧跑通**。
+`demo/linux/main.cpp` 用系统 `ffmpeg` CLI 把素材解成裸 NV12 / S16LE PCM 经管道喂入，
+两路音频走不同的 `AudioCapSourceType` 各占独立混流通道，由内核做 sample-wise mix。
+
+#### 参数速查
+
+```bash
+./tg_capture_demo --help
+```
+
+| 参数 | 默认 | 说明 |
+| - | - | - |
+| `--video <path>` | dance-girl.n.mp4 | 视频源（任意 ffmpeg 可解的容器） |
+| `--audio1 <path>` | 同 `--video` | 第 1 路音频源 → `TypeOfGameMicphone4Slave`（混流通道 0） |
+| `--audio2 <path>` | iqiyi.ts | 第 2 路音频源 → `TypeOfGameAudio4Slave`（混流通道 1） |
+| `--audio2-volume <f>` | 0.1 | 第 2 路相对音量（线性缩放 S16 样本） |
+| `--video-loops <n>` / `--audio1-loops` / `--audio2-loops` | 1 / 1 / 0 | 各路独立循环次数（`0` = 无限） |
+| `--audio1-speed <f>` / `--audio2-speed <f>` | 1.0 / 1.0 | 推送速度倍率（`>1`=过快，`<1`=过慢，详见下文） |
+| `--out <url>` | out.flv | 输出（`.flv` / `.ts` / `rtmp://…` / `srt://…`） |
+| `--seconds <n>` | 10 | 运行秒数；`0` = 直到视频 EOF |
+| `--w --h --fps --bitrate` | 1280 720 30 3000000 | 编码参数 |
+| `--sample-rate --channels` | 44100 2 | 音频采样率/声道数 |
+| `--no-audio` / `--audio2-no-loop` | — | 开关 |
+| `--ffmpeg <path>` | ffmpeg (PATH) | 使用的 ffmpeg CLI |
+| `--log-level <n>` | 1 | 0=Debug 1=Info 2=Warn 3=Error |
+
+`--audio*-speed` 用于**压测音源节奏异常**（内核应持续吸收 drift）：
+- PTS 固定按采样数累加（`1024/44100 ≈ 23.22ms`/块），单调推进
+- wallclock 触发间隔 = `23.22ms / speed`，`speed>1` 加密触发（源产太快），`speed<1` 疏松触发（源产太慢）
+- Mixer `AudioChannelClock` 看到 `driftUs = refPts(wallclock) - currentPts(samples)`，按偏差大小分档 PI / BURST / ForceAlign 校正
+- VideoPtsGenerator 侧对视频 PTS 做 `adapt`（RangeAdapt 渐进追赶）/ `forceSync`（强制跳齐）
+
+#### 典型用例
+
+```bash
+cd build/linux-x86_64
+
+# ① 最小烟测：6s 常态双路音频 + 视频
+./tg_capture_demo --seconds 6 --out /tmp/smoke.flv
+
+# ② 推流（本地 RTMP）
+# 另开终端起接收端：ffmpeg -f flv -listen 1 -i rtmp://0.0.0.0/live/stream -c copy /tmp/pulled.flv
+./tg_capture_demo --seconds 30 --out rtmp://127.0.0.1/live/stream
+
+# ③ 换素材：命令行全可配
+./tg_capture_demo \
+  --video    /path/to/my_video.mp4 \
+  --audio1   /path/to/vocal.wav \
+  --audio2   /path/to/bgm.mp3  --audio2-volume 0.2 \
+  --seconds  60 --out /tmp/mix.flv
+
+# ④ 长时压测（素材循环 10 遍 + 轻度音源 drift，模拟真实硬件时钟不均）
+#    预计 wallclock ≈ 10 × 素材时长；视频 EOF 后自动退出
+./tg_capture_demo \
+  --video /data/home/bertonwang/mov/dance-girl.n.mp4 \
+  --audio1 /data/home/bertonwang/mov/dance-girl.n.mp4 \
+  --audio2 /data/home/bertonwang/mov/iqiyi.ts         --audio2-volume 0.1 \
+  --video-loops 10 --audio1-loops 10 --audio2-loops 400 \
+  --audio1-speed 0.97  --audio2-speed 1.03 \
+  --w 854 --h 480 --fps 30 --bitrate 1500000 \
+  --seconds 0 --out /tmp/stress.flv
+
+# ⑤ 极端 drift（±10%）短跑，看日志里 forceSync/adapt 快速累加
+./tg_capture_demo \
+  --audio1-speed 0.90 --audio2-speed 1.10 \
+  --seconds 90 --out /tmp/drift.flv
+
+# ⑥ 直播推流 + Ctrl+C 优雅停：SIGINT/SIGTERM 会被捕获，正常刷 flv/ts trailer
+./tg_capture_demo --seconds 0 --out /tmp/live.flv   # Ctrl+C 结束
+```
+
+#### 日志判读
+
+每次结束看最后一行 `[TGCapturer] 音画同步` 的统计：
+
+```
+[TGCapturer] 音画同步 avDiff=85ms  clamp=0  forceSync=8480  adapt=39482
+                               stall=0  skip=0  jump=0  staleReset=0  syncDrop=0
+```
+
+- 正常运行：`avDiff` < 1 帧时长，`forceSync` ≈ 0，`adapt` 低
+- 存在 drift（本例 ±3%，跑了 30min）：`adapt` / `forceSync` 持续累加 → 内核在吸收偏差，`avDiff` 收敛到 ≈ 2~3 帧内
+- `clamp / stall / skip / jump / staleReset / syncDrop` 应恒为 0 — 任何非零都要查
+
+运行期每 3 秒节流一条 `混流取不到数据（通道 N，帧长 1024）` 是**正常运行节律**（Mix 消费率略高于补货率时，MixLoop 轻度 sleep 等待），不是错误；日志中 `通道 N` 的 `N` 是 `ChannelCount()` 而非通道号，别误读。
+
+#### 已知时间轴行为
+
+两路音频 `speed` 不同（相位错开触发 Mix）时，`AudioMixer::m_outputPtsUs` 以 Mix 调用频率累加，导致**输出 flv 的 Duration 元数据虚增**（本例 wallclock 29.8min → flv Duration 56:55）。`speed=1.0/1.0` 稳态下不触发（6s/10s 常态烟测 Duration ≈ wallclock）。推流链路里下游用的是实际 PTS 流而非 Duration 元数据，不影响推流本身；只有本地回放时间轴会偏。
+
 ---
 
 ## 11. 已知限制 / 后续项
