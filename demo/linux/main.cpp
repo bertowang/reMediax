@@ -21,6 +21,7 @@
 //       --out      out.flv \
 //       --seconds  10
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cerrno>
@@ -46,7 +47,17 @@ struct Options
     std::string audio1;                                       // 默认 = video
     std::string audio2 = "/data/home/bertonwang/mov/iqiyi.ts";
     float       audio2Volume = 0.1f;                          // 第 2 路相对第 1 路的音量比例
-    bool        audio2Loop   = true;                          // 短素材循环以铺满视频时长
+    bool        audio2Loop   = true;                          // 兼容旧参数：true=无限循环, false=播一遍
+    // 循环次数（0 = 无限）；--audio2-loops 和 --audio2-no-loop 二选一（前者优先）
+    int         videoLoops  = 1;
+    int         audio1Loops = 1;
+    int         audio2Loops = 0;                              // 默认跟 audio2Loop=true 等价（无限）
+    // 推送速度倍率（压测用）：>1 模拟源产太快，<1 模拟源产太慢
+    //   内核 AudioMixer 参考时钟是 wallclock、内部 PTS 按采样数累加，
+    //   speed!=1 时 wallclock 推进与采样推进出现偏差 → ChannelClock 看到 drift，
+    //   触发 PI → BURST → ForceAlign 层级校正，日志里可观测
+    float       audio1Speed = 1.0f;
+    float       audio2Speed = 1.0f;
 
     // 编码/封装
     std::string out      = "out.flv";
@@ -75,6 +86,11 @@ void PrintUsage()
            "    --audio2 <path>         第 2 路音频源，默认 iqiyi.ts\n"
            "    --audio2-volume <f>     第 2 路相对音量，默认 0.1\n"
            "    --audio2-no-loop        第 2 路素材放完即停（默认循环）\n"
+           "    --video-loops  <n>      视频源循环次数，0=无限，默认 1\n"
+           "    --audio1-loops <n>      第 1 路音频循环次数，0=无限，默认 1\n"
+           "    --audio2-loops <n>      第 2 路音频循环次数，0=无限，默认 0(无限)\n"
+           "    --audio1-speed <f>      第 1 路推送速度倍率，默认 1.0（>1 模拟过快，<1 过慢）\n"
+           "    --audio2-speed <f>      第 2 路推送速度倍率，默认 1.0\n"
            "  输出:\n"
            "    --out <url>             out.flv / out.ts / rtmp:// / srt://，默认 out.flv\n"
            "    --seconds <n>           运行秒数，0 = 直到视频结束，默认 10\n"
@@ -99,7 +115,12 @@ Options ParseArgs(int argc, char** argv)
         std::string a = argv[i];
         if (a == "--help") { opt.showHelp = true; }
         else if (a == "--no-audio") { opt.audio = false; }
-        else if (a == "--audio2-no-loop") { opt.audio2Loop = false; }
+        else if (a == "--audio2-no-loop") { opt.audio2Loop = false; opt.audio2Loops = 1; }
+        else if (a == "--video-loops")  { if (auto* v = next(i, "--video-loops"))  opt.videoLoops  = std::atoi(v); }
+        else if (a == "--audio1-loops") { if (auto* v = next(i, "--audio1-loops")) opt.audio1Loops = std::atoi(v); }
+        else if (a == "--audio2-loops") { if (auto* v = next(i, "--audio2-loops")) opt.audio2Loops = std::atoi(v); }
+        else if (a == "--audio1-speed") { if (auto* v = next(i, "--audio1-speed")) opt.audio1Speed = static_cast<float>(std::atof(v)); }
+        else if (a == "--audio2-speed") { if (auto* v = next(i, "--audio2-speed")) opt.audio2Speed = static_cast<float>(std::atof(v)); }
         else if (a == "--video")   { if (auto* v = next(i, "--video"))   opt.video = v; }
         else if (a == "--audio1")  { if (auto* v = next(i, "--audio1"))  opt.audio1 = v; }
         else if (a == "--audio2")  { if (auto* v = next(i, "--audio2"))  opt.audio2 = v; }
@@ -201,6 +222,12 @@ int main(int argc, char** argv)
 
     // ffmpeg 子进程写管道时如果我们这边先退出，SIGPIPE 会把我们干掉；忽略它，让 fread 自然返回 EOF
     std::signal(SIGPIPE, SIG_IGN);
+    // Ctrl+C / kill -TERM 优雅退出：标志位 → 主循环 break → Stop() 刷 Muxer trailer
+    // 不装处理器会被默认 SIGINT 当场终结进程，导致 flv 没有 trailer（ffprobe Duration 读不到）
+    static std::atomic<bool> s_stop{false};
+    auto onSig = +[](int) { s_stop.store(true); };
+    std::signal(SIGINT,  onSig);
+    std::signal(SIGTERM, onSig);
 
     ITGCapturerMgr::Init(opt.logLevel, "", true);
 
@@ -278,57 +305,79 @@ int main(int argc, char** argv)
     const int samplesPerPush  = 1024;  // AAC 一帧 1024 采样
     const int pcmChunkBytes   = samplesPerPush * ch * static_cast<int>(sizeof(int16_t));
 
+    // -stream_loop K：K=N-1 跑 N 遍，K=-1 无限；N==1 不加
+    auto streamLoopArg = [](int loops) -> std::string {
+        if (loops <= 0) { return "-stream_loop -1"; }
+        if (loops == 1) { return ""; }
+        char b[32];
+        std::snprintf(b, sizeof(b), "-stream_loop %d", loops - 1);
+        return b;
+    };
+
     char cmdbuf[1024];
     FfmpegPipe videoPipe, audio1Pipe, audio2Pipe;
 
     std::snprintf(cmdbuf, sizeof(cmdbuf),
-                  "%s -nostdin -loglevel error -i %s -map 0:v:0 "
+                  "%s -nostdin -loglevel error %s -i %s -map 0:v:0 "
                   "-vf \"scale=%d:%d:flags=bicubic,fps=%g,format=nv12\" "
                   "-f rawvideo - 2>/dev/null",
-                  opt.ffmpegBin.c_str(), ShellQuote(opt.video).c_str(), w, h, opt.fps);
+                  opt.ffmpegBin.c_str(), streamLoopArg(opt.videoLoops).c_str(),
+                  ShellQuote(opt.video).c_str(), w, h, opt.fps);
     if (!videoPipe.Open(cmdbuf)) { ITGCapturer::Destroy(capturer); ITGCapturerMgr::UnInit(); return 1; }
 
     if (opt.audio) {
         std::snprintf(cmdbuf, sizeof(cmdbuf),
-                      "%s -nostdin -loglevel error -i %s -map 0:a:0 "
+                      "%s -nostdin -loglevel error %s -i %s -map 0:a:0 "
                       "-ar %d -ac %d -f s16le - 2>/dev/null",
-                      opt.ffmpegBin.c_str(), ShellQuote(opt.audio1).c_str(), sr, ch);
+                      opt.ffmpegBin.c_str(), streamLoopArg(opt.audio1Loops).c_str(),
+                      ShellQuote(opt.audio1).c_str(), sr, ch);
         if (!audio1Pipe.Open(cmdbuf)) { ITGCapturer::Destroy(capturer); ITGCapturerMgr::UnInit(); return 1; }
 
         std::snprintf(cmdbuf, sizeof(cmdbuf),
                       "%s -nostdin -loglevel error %s -i %s -map 0:a:0 "
                       "-ar %d -ac %d -f s16le - 2>/dev/null",
-                      opt.ffmpegBin.c_str(),
-                      opt.audio2Loop ? "-stream_loop -1" : "",
+                      opt.ffmpegBin.c_str(), streamLoopArg(opt.audio2Loops).c_str(),
                       ShellQuote(opt.audio2).c_str(), sr, ch);
         if (!audio2Pipe.Open(cmdbuf)) { ITGCapturer::Destroy(capturer); ITGCapturerMgr::UnInit(); return 1; }
     }
 
-    printf("[demo] video=%s\n[demo] audio1=%s\n[demo] audio2=%s vol=%.2f%s\n[demo] out=%s %dx%d@%.2f %dkbps / %dHz %dch\n",
-           opt.video.c_str(), opt.audio1.c_str(), opt.audio2.c_str(), opt.audio2Volume,
-           opt.audio2Loop ? " (loop)" : "", opt.out.c_str(),
-           w, h, opt.fps, opt.bitrate / 1000, sr, ch);
+    printf("[demo] video=%s loops=%d\n"
+           "[demo] audio1=%s loops=%d speed=%.3f\n"
+           "[demo] audio2=%s loops=%d speed=%.3f vol=%.2f\n"
+           "[demo] out=%s %dx%d@%.2f %dkbps / %dHz %dch\n",
+           opt.video.c_str(),  opt.videoLoops,
+           opt.audio1.c_str(), opt.audio1Loops, opt.audio1Speed,
+           opt.audio2.c_str(), opt.audio2Loops, opt.audio2Speed, opt.audio2Volume,
+           opt.out.c_str(), w, h, opt.fps, opt.bitrate / 1000, sr, ch);
 
     // -------------------------------------------------------------------- 灌帧
     const int64_t frameUs  = static_cast<int64_t>(1000000.0 / opt.fps);
-    const int64_t audioUs  = static_cast<int64_t>(1000000.0 * samplesPerPush / sr);
-    const int64_t totalUs  = static_cast<int64_t>(opt.seconds) * 1000000LL;  // 0 = 不限
+    const int64_t audioUs  = static_cast<int64_t>(1000000.0 * samplesPerPush / sr);  // 采样数时间轴
+    const int64_t totalUs  = static_cast<int64_t>(opt.seconds) * 1000000LL;           // 0 = 不限
+    // speed>1 → wallclock 触发间隔变小（1s wallclock 推送 speed 秒的采样数据）
+    //   内核 AudioMixer 的参考时钟是真实 wallclock，内部 PTS 按采样数累加，
+    //   触发间隔 ≠ 采样时长 时，ChannelClock 会观察到 drift 并触发 PI/BURST/ForceAlign。
+    const int64_t a1TrigUs = static_cast<int64_t>(audioUs / std::max(0.001f, opt.audio1Speed));
+    const int64_t a2TrigUs = static_cast<int64_t>(audioUs / std::max(0.001f, opt.audio2Speed));
 
     std::vector<uint8_t> nv12(static_cast<size_t>(frameBytes));
     std::vector<int16_t> pcm1(static_cast<size_t>(samplesPerPush) * ch);
     std::vector<int16_t> pcm2(static_cast<size_t>(samplesPerPush) * ch);
 
     const auto t0 = std::chrono::steady_clock::now();
-    int64_t videoDue = 0;
-    int64_t audio1Due = 0;
-    int64_t audio2Due = 0;
+    int64_t videoDue   = 0;
+    int64_t audio1Due  = 0, audio1Pts = 0;   // Due = wallclock 触发时刻，Pts = 采样数时间轴
+    int64_t audio2Due  = 0, audio2Pts = 0;
     int pushedVideo = 0, pushedAudio1 = 0, pushedAudio2 = 0, rejected = 0;
     bool videoDone = false, audio1Done = !opt.audio, audio2Done = !opt.audio;
 
     while (!errored.load()) {
+        if (s_stop.load()) { printf("[demo] 收到退出信号，刷 trailer\n"); break; }
         const int64_t now = ElapsedUs(t0);
         if (totalUs > 0 && now >= totalUs) { break; }
-        if (videoDone && audio1Done && audio2Done) { break; }
+        // 视频 EOF 作为整体结束条件（音频无限循环场景下不应等 audio pipe EOF，否则永不退出）
+        if (videoDone) { break; }
+        if (audio1Done && audio2Done && !opt.audio) { break; }
 
         // ---- 视频 ----
         if (!videoDone && now >= videoDue) {
@@ -348,10 +397,11 @@ int main(int argc, char** argv)
             if (audio1Pipe.ReadFull(pcm1.data(), pcmChunkBytes)) {
                 if (capturer->PushExternalAudioFrame(TypeOfGameMicphone4Slave,
                         reinterpret_cast<const uint8_t*>(pcm1.data()),
-                        pcmChunkBytes, sr, ch, audio1Due) == 0) {
+                        pcmChunkBytes, sr, ch, audio1Pts) == 0) {
                     ++pushedAudio1;
                 } else { ++rejected; }
-                audio1Due += audioUs;
+                audio1Due += a1TrigUs;   // wallclock 节奏（受 speed 影响）
+                audio1Pts += audioUs;    // PTS 按采样数推进（不受 speed 影响）
             } else {
                 audio1Done = true;
             }
@@ -362,19 +412,14 @@ int main(int argc, char** argv)
                 ScalePcm(pcm2.data(), samplesPerPush, ch, opt.audio2Volume);
                 if (capturer->PushExternalAudioFrame(TypeOfGameAudio4Slave,
                         reinterpret_cast<const uint8_t*>(pcm2.data()),
-                        pcmChunkBytes, sr, ch, audio2Due) == 0) {
+                        pcmChunkBytes, sr, ch, audio2Pts) == 0) {
                     ++pushedAudio2;
                 } else { ++rejected; }
-                audio2Due += audioUs;
+                audio2Due += a2TrigUs;
+                audio2Pts += audioUs;
             } else {
                 audio2Done = true;
             }
-        }
-
-        // 视频驱动结束；若视频已完，让音频也尽快退出
-        if (videoDone) {
-            if (!audio1Done && audio1Pipe.Eof()) { audio1Done = true; }
-            if (!audio2Done && audio2Pipe.Eof()) { audio2Done = true; }
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
