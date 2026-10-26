@@ -166,10 +166,15 @@ int64_t VideoPtsGenerator::Next(int64_t audioRefPts, int64_t frameIntervalUs, bo
     }
 
     // 音频 PTS 回退 / 跳变告警
+    // 对齐 MediaX：audio ref 倒走时**拒绝消费**本帧的新 ref —— 直接沿用上一次 ref 做追赶/pause 判定，
+    // 避免 ForceAlign 把视频 PTS 一并拖后（后续 ClampMonotonic 虽兜住下界，但 avDiff 已失准）。
     const int64_t audioStep = audioRefPts - m_prevAudioRef;
     if (m_prevAudioRef >= 0 &&
         (audioStep < 0 || audioStep > m_params.jumpWarnFactor * intervalUs)) {
         m_jumpWarns.fetch_add(1, std::memory_order_relaxed);
+        if (audioStep < 0) {
+            audioRefPts = m_prevAudioRef;
+        }
     }
 
     // 音频是否"停滞"不能只看严格相等：音频主时钟按 1024 样本离散推进，

@@ -46,9 +46,14 @@ public:
     [[nodiscard]] AVCodecContext* CodecContext() const noexcept { return m_ctx; }
     [[nodiscard]] bool IsOpened() const noexcept { return m_ctx != nullptr; }
     [[nodiscard]] uint64_t EncodedFrames() const noexcept { return m_encoded.load(); }
+    [[nodiscard]] const std::string& CodecName() const noexcept { return m_codecName; }
+
+    // 端到端编码延迟 EMA（微秒）：capture → encode out
+    [[nodiscard]] int64_t EncodeLatencyUs() const noexcept { return m_encodeLatencyUs.load(); }
 
 protected:
     void Loop(std::stop_token token) override;
+    void OnThreadExit() override;
 
 private:
     int EncodeOne(const core::FramePtr& frame);
@@ -70,6 +75,7 @@ private:
 
     Muxer* m_muxer = nullptr;
     std::atomic<uint64_t> m_encoded{0};
+    std::atomic<int64_t> m_encodeLatencyUs{0};   // capture → encode out EMA（μs）
     std::atomic_bool m_opened{false};
 };
 

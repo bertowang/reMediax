@@ -18,6 +18,8 @@
 #include "core/AudioMixer.h"
 #include "core/Bus.h"
 #include "core/Clock.h"
+#include "core/PauseFrame.h"
+#include "core/Watermark.h"
 #include "mux/Muxer.h"
 
 namespace TGCapture
@@ -143,8 +145,9 @@ private:
     int64_t m_videoIntervalUs = 33333;
     uint64_t m_syncDropped = 0;
     // 音频主时钟首帧等待：音频未就绪时视频不发帧（避免就绪后 PTS 回退被整段丢弃）
+    // 对齐 MediaX：fallback 判定每帧独立进行，不保留"已降级"状态；
+    // 只保留一个 **节流**日志闸门避免刷屏，不影响后续"音频恢复 → 自动切回主时钟"。
     int64_t m_audioWaitStartUs = 0;
-    bool m_audioFallbackWarned = false;
 
     // 内核
     std::shared_ptr<codec::VideoEncoder> m_videoEncoder;
@@ -163,6 +166,13 @@ private:
     // 运行期
     std::atomic_bool m_videoMuted{false};
     std::atomic_bool m_firstFrameSent{false};
+
+    // 暂停静帧（对齐 MediaX ESGeneratePicture::SetPausePic）
+    std::shared_ptr<core::PauseFrame> m_pauseFrame;
+    PauseParams m_pauseParams;
+
+    // 水印（对齐 MediaX ESVPicFilter）
+    std::shared_ptr<core::Watermark> m_watermark;
     // 外部注入视频是否沿用调用方自带的 PTS（VideoEncoderParams::videoUseExternalPts）。
     // Prepare 写、采集/注入线程读，用 atomic 避免跨线程读写同一 bool。
     std::atomic_bool m_useExternalVideoPts{false};

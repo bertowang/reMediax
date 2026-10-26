@@ -15,7 +15,14 @@
 //     - 某路数据没到（卡顿/静音）→ 该路按静音补齐，不拖住整体时间轴
 //     - 采样率/声道不一致时用 swresample 归一到输出格式
 //
-// 输出时间轴由 Mix() 固定步长按输出采样率推进，因此某一路掉线也不会让整体时间轴停住。
+// 输出时间轴策略（对齐 MediaX ReferenceClockManager::CheckAndCorrectPts 的"校正值写回 pts"）：
+//
+//   以"主通道"（第一个加入的 active 通道）的 corrected PTS 为输出时间轴基准 ——
+//   这样 PI/BURST 校正真正生效在下游（之前仅做统计，Mix 的 outPtsUs 自推进，
+//   校正量完全没落到时间戳上，表现为"统计看着在收敛、实际多路漂移从没纠正"）。
+//
+//   主通道掉线/断流兜底：若主通道 clock 本轮未推进，fallback 到 m_outputPtsUs
+//   按输出采样率线性推进，保证整体时间轴不被断流冻结。
 #ifndef TGCAPTURE_CORE_AUDIO_MIXER_H
 #define TGCAPTURE_CORE_AUDIO_MIXER_H
 
@@ -101,6 +108,21 @@ public:
     // 各路校正统计（诊断用）
     [[nodiscard]] AudioChannelClock::Stats ChannelStats(int id) const;
 
+    // 诊断信息：PI/BURST 统计 + 本路 underrun + 样本级补偿（对齐 MediaX FrameProductionDiag）
+    struct ChannelDiag
+    {
+        AudioChannelClock::Stats clock{};
+        uint64_t underrun = 0;              // 数据没到被静音补齐的次数
+        int64_t compensationUs = 0;         // 累计少产补偿（本路慢，复制样本填充）
+        int64_t productionDropUs = 0;       // 累计多产丢弃（本路快，丢弃样本）
+    };
+    [[nodiscard]] ChannelDiag ChannelDiagnostic(int id) const;
+    // 便捷接口：按 index 顺序取全部通道诊断，供 TGCapturer::GetStatsInfo 序列化
+    [[nodiscard]] std::vector<ChannelDiag> AllDiagnostics() const;
+
+    // 运行期通道增益（线性，0.0 ~ 4.0；clamp 由 Mixer 内部完成，不停流不重建管线）
+    void SetChannelGain(int id, float gain);
+
 private:
     struct Channel
     {
@@ -112,6 +134,14 @@ private:
         std::deque<int16_t> pcm;      // 交错 S16
         SwrContext* swr = nullptr;    // 采样率/声道归一到输出格式
         uint64_t underrun = 0;        // 数据没到的次数
+        float gain = 1.0f;            // 运行期增益（SetChannelGain）
+
+        // 样本级补偿（对齐 MediaX FrameProductionDiag::accumulatedCompensationUs / pendingProductionDrop）
+        // 限速 COMP_FORCE_RATE_LIMIT_US = 5000us/s：每秒最多补 / 丢 5ms 样本，避免瞬间抽变音
+        int64_t pendingCompUs = 0;        // 本路 drift 累加器（正=本路慢，待补；负=本路快，待丢）
+        int64_t lastCompUs = 0;           // 上一次做补偿的系统时间
+        int64_t compensationUs = 0;       // 累计实际补偿量（统计用）
+        int64_t productionDropUs = 0;     // 累计实际丢弃量（统计用）
     };
 
     Channel* Find(int id);

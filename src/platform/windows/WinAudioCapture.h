@@ -4,6 +4,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -13,6 +14,7 @@
 struct IAudioClient;
 struct IAudioCaptureClient;
 struct IMMDevice;
+struct IMMDeviceEnumerator;
 struct ISimpleAudioVolume;
 
 namespace TGCapture::platform
@@ -62,10 +64,14 @@ protected:
 
 private:
     void SilenceLoop(std::stop_token token);   // 设备不可用时的静音兜底
+    void EmitSilence(int frames);              // 推一帧静音（心跳），对齐 MediaX PushSilenceAudioData
 
 private:
     bool InitWASAPI();
     void ReleaseWASAPI();
+    int  RetryOpen();                           // 对齐 MediaX::WinMMCapturer::RetryOpen，仅工作线程调用
+    void RegisterDeviceNotify();                // 注册 IMMNotificationClient
+    void UnregisterDeviceNotify();
     void Resample(const uint8_t* src, int frames, core::FramePtr& out);
 
 private:
@@ -73,10 +79,21 @@ private:
     IAudioClient* m_audioClient = nullptr;
     IAudioCaptureClient* m_captureClient = nullptr;
     IMMDevice* m_device = nullptr;
+    IMMDeviceEnumerator* m_enumerator = nullptr;     // 保留以便反注册 notification client
+    void* m_notifyClient = nullptr;                   // 实际类型为内部 DeviceNotifyClient*（避免头文件暴露 IMMNotificationClient）
     UINT32 m_bufferFrames = 0;
     int m_deviceChannels = 2;
     int m_deviceSampleRate = 44100;
     bool m_deviceFloat = false;
+
+    // 设备变更延迟标志：COM 回调线程只置标志，工作线程循环开头读到后在安全时机 RetryOpen，
+    // 避免 COM 线程与采集线程并发操作 m_audioClient 导致 UAF（对齐 MediaX P0 修复）
+    std::atomic<bool> m_needRetryOpen{false};
+
+    // loopback 心跳：WASAPI loopback 在无播放时 packetLength 持续为 0，
+    // 若不发任何帧，混音器会判断该通道断流 → 音频时间轴卡住。
+    // 每 10ms 发一帧静音（对齐 MediaX::WinMMCapturer::PushSilenceAudioData 的 AUDCLNT_BUFFERFLAGS_SILENT 分支）
+    int64_t m_lastEmitUs = 0;
 
     SwrContext* m_swr = nullptr;
     bool m_comInited = false;

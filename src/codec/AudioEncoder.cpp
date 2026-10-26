@@ -111,10 +111,18 @@ void AudioEncoder::Loop(std::stop_token token)
             continue;
         }
         if (EncodeOne(*item) < 0) {
-            TG_LOGW("AudioEncoder: 编码一帧失败");
+            TG_LOGW("AudioEncoder: 编码一帧失败 codec=%s", m_codecName.c_str());
         }
     }
     Drain();
+}
+
+void AudioEncoder::OnThreadExit()
+{
+    TG_LOGI("AudioEncoder: 线程退出 codec=%s encoded=%llu latency_us=%lld",
+            m_codecName.c_str(),
+            static_cast<unsigned long long>(m_encoded.load()),
+            static_cast<long long>(m_encodeLatencyUs.load()));
 }
 
 int AudioEncoder::EncodeOne(const core::FramePtr& frame)
@@ -201,6 +209,15 @@ int AudioEncoder::EncodeOne(const core::FramePtr& frame)
     }
     // 兜底时钟按"实际送出的样本数"推进，供下一批没带 ptsUs 的帧使用
     m_nextPts = basePts + frameDurUs * chunkIndex;
+    // 端到端编码延迟 EMA（μs）：capture → encode out；captureUs 无效时跳过
+    if (frame->captureUs != AV_NOPTS_VALUE) {
+        const int64_t latencyUs = core::MonotonicClock::NowUs() - frame->captureUs;
+        if (latencyUs >= 0 && latencyUs < 10000000) {
+            int64_t cur = m_encodeLatencyUs.load();
+            int64_t next = (cur == 0) ? latencyUs : (cur + (latencyUs - cur) / 8);
+            m_encodeLatencyUs.store(next);
+        }
+    }
     return 0;
 }
 

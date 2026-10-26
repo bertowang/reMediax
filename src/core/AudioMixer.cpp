@@ -16,6 +16,12 @@ constexpr int64_t kMaxRefAdvanceUs = 2000000;  // 单次参考时钟推进上限
 constexpr int64_t kForceAlignFactor = 5;       // |drift| > 5 帧时长 → 强制对齐
 constexpr int64_t kBurstFactor = 3;            // |drift| > 3 帧时长 → BURST 收敛
 constexpr int64_t kJumpWarnFactor = 5;
+
+// 样本级补偿限速（对齐 MediaX ESAudioMixer 的 COMP_FORCE_RATE_LIMIT_US）：
+// 每秒最多补/丢 5ms 样本，避免瞬间抽变音；超过阈值才触发
+constexpr int64_t kCompRateLimitUsPerSec = 5000;
+constexpr int64_t kCompTriggerUs = 5000;   // |累计 drift| > 5ms 才启动补偿
+constexpr int64_t kCompIntervalUs = 1000000;  // 两次补偿至少间隔 1s
 }  // namespace
 
 // ------------------------------------------------------------------ AudioChannelClock
@@ -278,6 +284,48 @@ AudioChannelClock::Stats AudioMixer::ChannelStats(int id) const
     return ch ? ch->clock.stats() : AudioChannelClock::Stats{};
 }
 
+AudioMixer::ChannelDiag AudioMixer::ChannelDiagnostic(int id) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto* ch = Find(id);
+    ChannelDiag d;
+    if (ch) {
+        d.clock = ch->clock.stats();
+        d.underrun = ch->underrun;
+        d.compensationUs = ch->compensationUs;
+        d.productionDropUs = ch->productionDropUs;
+    }
+    return d;
+}
+
+std::vector<AudioMixer::ChannelDiag> AudioMixer::AllDiagnostics() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::vector<ChannelDiag> out;
+    out.reserve(m_channels.size());
+    for (const auto& ch : m_channels) {
+        ChannelDiag d;
+        d.clock = ch.clock.stats();
+        d.underrun = ch.underrun;
+        d.compensationUs = ch.compensationUs;
+        d.productionDropUs = ch.productionDropUs;
+        out.push_back(d);
+    }
+    return out;
+}
+
+void AudioMixer::SetChannelGain(int id, float gain)
+{
+    // 对齐 MediaX ESAudioMixer::SetChannelVolume：0 ~ 4.0，热更新不停流
+    if (gain < 0.0f) gain = 0.0f;
+    if (gain > 4.0f) gain = 4.0f;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (auto* ch = Find(id)) {
+        ch->gain = gain;
+        TG_LOGI("AudioMixer: 通道 %d 增益 %.2f", id, gain);
+    }
+}
+
 void AudioMixer::Push(int id, const int16_t* data, int frames, int64_t captureUs)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -293,6 +341,11 @@ void AudioMixer::Push(int id, const int16_t* data, int frames, int64_t captureUs
     const int64_t nowUs = captureUs > 0 ? captureUs : MonotonicClock::NowUs();
     ch->clock.NextPts(frames, nowUs);
 
+    // 本帧 drift 累加（取最新一次的瞬时 drift）—— 用它做样本级补偿。
+    // 对齐 MediaX FrameProductionDiag：PI/BURST 只改时间戳标签，样本级补/丢处理
+    // "实际产出速率 vs 系统时间"的偏差（设备丢包/调度卡顿）。两者分工互补，不重复补偿。
+    ch->pendingCompUs += ch->clock.stats().driftUs;
+
     const int srcChannels = ch->channels;
     if (ch->swr) {
         // 采样率/声道归一到输出格式
@@ -305,10 +358,59 @@ void AudioMixer::Push(int id, const int16_t* data, int frames, int64_t captureUs
             ch->pcm.insert(ch->pcm.end(), dst.begin(),
                            dst.begin() + static_cast<long>(converted) * m_outChannels);
         }
-        return;
+    } else {
+        ch->pcm.insert(ch->pcm.end(), data, data + static_cast<size_t>(frames) * srcChannels);
     }
 
-    ch->pcm.insert(ch->pcm.end(), data, data + static_cast<size_t>(frames) * srcChannels);
+    // 样本级补/丢（限速 kCompRateLimitUsPerSec = 5ms/s）
+    // 距上一次补偿不足 1s 则跳过；|累计 drift| 不够 5ms 也跳过。
+    if (ch->lastCompUs == 0) {
+        ch->lastCompUs = nowUs;
+    } else if (nowUs - ch->lastCompUs >= kCompIntervalUs &&
+               (ch->pendingCompUs > kCompTriggerUs || ch->pendingCompUs < -kCompTriggerUs)) {
+        const int outChannels = m_outChannels > 0 ? m_outChannels : ch->channels;
+        if (outChannels > 0 && m_outSampleRate > 0) {
+            // 本次补偿量 = min(|pendingCompUs|, 5ms)，方向与 pendingCompUs 符号一致
+            int64_t deltaUs = kCompRateLimitUsPerSec;
+            if (deltaUs > (ch->pendingCompUs > 0 ? ch->pendingCompUs : -ch->pendingCompUs)) {
+                deltaUs = ch->pendingCompUs > 0 ? ch->pendingCompUs : -ch->pendingCompUs;
+            }
+            const int64_t deltaSamples =
+                deltaUs * static_cast<int64_t>(m_outSampleRate) / 1000000LL;
+            const size_t deltaInterleaved =
+                static_cast<size_t>(deltaSamples) * static_cast<size_t>(outChannels);
+
+            if (ch->pendingCompUs > 0 && deltaInterleaved > 0) {
+                // 本路慢：pcm 尾部复制样本填充（无 PCM 可复制时跳过，等下一拍）
+                if (ch->pcm.size() >= static_cast<size_t>(outChannels)) {
+                    const size_t srcPos = ch->pcm.size() - static_cast<size_t>(outChannels);
+                    std::vector<int16_t> last(ch->pcm.begin() + static_cast<long>(srcPos),
+                                              ch->pcm.end());
+                    for (size_t k = 0; k < deltaInterleaved; k += last.size()) {
+                        const size_t copy = std::min(last.size(), deltaInterleaved - k);
+                        ch->pcm.insert(ch->pcm.end(), last.begin(), last.begin() + copy);
+                    }
+                    ch->compensationUs += deltaUs;
+                    ch->pendingCompUs -= deltaUs;
+                    ch->lastCompUs = nowUs;
+                    TG_LOGD("AudioMixer: 通道 %d 补 %lldus 样本（累计补偿 %lldms）", ch->id,
+                            (long long)deltaUs, (long long)(ch->compensationUs / 1000));
+                }
+            } else if (ch->pendingCompUs < 0 && deltaInterleaved > 0) {
+                // 本路快：从 pcm 尾部丢弃等量样本（没攒够那么多就全丢）
+                const size_t drop = std::min(deltaInterleaved, ch->pcm.size());
+                ch->pcm.erase(ch->pcm.end() - static_cast<long>(drop), ch->pcm.end());
+                const int64_t actualDropUs =
+                    static_cast<int64_t>(drop / static_cast<size_t>(outChannels)) * 1000000LL /
+                    static_cast<int64_t>(m_outSampleRate);
+                ch->productionDropUs += actualDropUs;
+                ch->pendingCompUs += actualDropUs;
+                ch->lastCompUs = nowUs;
+                TG_LOGD("AudioMixer: 通道 %d 丢 %lldus 样本（累计丢弃 %lldms）", ch->id,
+                        (long long)actualDropUs, (long long)(ch->productionDropUs / 1000));
+            }
+        }
+    }
 }
 
 bool AudioMixer::Mix(int frameSamples, std::shared_ptr<uint8_t>& outData, int64_t& outPtsUs)
@@ -336,20 +438,27 @@ bool AudioMixer::Mix(int frameSamples, std::shared_ptr<uint8_t>& outData, int64_
     outData = std::shared_ptr<uint8_t>(new uint8_t[bytes], std::default_delete<uint8_t[]>());
     auto* dst = reinterpret_cast<int16_t*>(outData.get());
 
-    // 先累加（32 位），再饱和到 S16
+    // 先累加（32 位），再饱和到 S16；按通道 gain 加权
     std::vector<int32_t> acc(need, 0);
     for (auto& ch : m_channels) {
+        const float g = ch.gain;
         if (ch.pcm.size() >= need) {
-            for (size_t i = 0; i < need; ++i) {
-                acc[i] += ch.pcm[i];
+            if (g == 1.0f) {
+                for (size_t i = 0; i < need; ++i) acc[i] += ch.pcm[i];
+            } else {
+                for (size_t i = 0; i < need; ++i)
+                    acc[i] += static_cast<int32_t>(ch.pcm[i] * g);
             }
             ch.pcm.erase(ch.pcm.begin(), ch.pcm.begin() + static_cast<long>(need));
         } else {
             // 该路没数据：按静音补齐（不拖住整体时间轴）
             ++ch.underrun;
             const size_t avail = ch.pcm.size() - (ch.pcm.size() % static_cast<size_t>(m_outChannels));
-            for (size_t i = 0; i < avail; ++i) {
-                acc[i] += ch.pcm[i];
+            if (g == 1.0f) {
+                for (size_t i = 0; i < avail; ++i) acc[i] += ch.pcm[i];
+            } else {
+                for (size_t i = 0; i < avail; ++i)
+                    acc[i] += static_cast<int32_t>(ch.pcm[i] * g);
             }
             ch.pcm.clear();
         }
@@ -359,8 +468,24 @@ bool AudioMixer::Mix(int frameSamples, std::shared_ptr<uint8_t>& outData, int64_
         dst[i] = static_cast<int16_t>(std::clamp<int32_t>(acc[i], -32768, 32767));
     }
 
-    // 输出时间轴由输出采样率固定推进：某路掉线也不会让时间轴停住
-    outPtsUs = m_outputPtsUs;
+    // 输出时间轴：对齐 MediaX "校正值写回 pts" ——
+    // 以主通道（第一个 active 通道）的 corrected PTS 为基准，让 PI/BURST 校正真正作用于下游。
+    // 主通道断流（clock 没推进）时 fallback 到 m_outputPtsUs 的线性推进，保证时间轴不冻结。
+    // 用首个 active 通道的 clock 当主时钟；AudioChannelClock::NextPts 首帧前返回 0，
+    // 所以直接比较"是否大于已经推进到的 outputPtsUs"即可区分"没推进"和"推进了"。
+    int64_t primaryCorrected = 0;
+    for (const auto& ch : m_channels) {
+        if (ch.active) {
+            primaryCorrected = ch.clock.CurrentPtsUs();
+            break;
+        }
+    }
+    if (primaryCorrected > m_outputPtsUs) {
+        outPtsUs = primaryCorrected;
+        m_outputPtsUs = primaryCorrected;
+    } else {
+        outPtsUs = m_outputPtsUs;
+    }
     if (m_outSampleRate > 0) {
         m_outputPtsUs += static_cast<int64_t>(frameSamples) * 1000000LL / m_outSampleRate;
     }

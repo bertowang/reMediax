@@ -72,7 +72,9 @@ set(TG_CORE_SOURCES
     src/codec/AudioEncoder.cpp
     src/core/AVSyncClock.cpp
     src/core/AudioMixer.cpp
+    src/core/PauseFrame.cpp
     src/core/VideoTransform.cpp
+    src/core/Watermark.cpp
     src/mux/Muxer.cpp
 )
 

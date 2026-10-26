@@ -6,6 +6,8 @@
 
 #ifdef __APPLE__
 
+#include <atomic>
+
 #include <AudioToolbox/AudioToolbox.h>
 
 #include "capture/Source.h"
@@ -24,12 +26,26 @@ public:
     // 由 ObjC++ 实现侧回调（交错 S16）
     void OnPcm(const int16_t* data, int frames, int64_t ptsUs);
 
+    // AVAudioSession 中断/路由外推 API（由内部 observer 对象在主线程调用）：
+    //   NotifyAudioInterrupted(true/false)   —— 系统中断（电话、Siri 等）开始/结束
+    //   NotifyAudioRouteChanged(reason)      —— 路由变更（耳机插拔、设备不可用）
+    // 中断/路由异常期间 engine 的 tap 不会被触发，Loop 转为静音心跳保持音频时间轴连续。
+    void NotifyAudioInterrupted(bool begin, bool shouldResume);
+    void NotifyAudioRouteChanged(int reason);
+
 protected:
     void Loop(std::stop_token token) override;
 
 private:
-    void* m_engine = nullptr;   // AVAudioEngine*（ARC 由实现文件管理）
-    bool m_started = false;
+    bool RestartEngine();   // 中断结束或路由恢复后尝试重启
+
+private:
+    void* m_engine = nullptr;      // AVAudioEngine*（ARC 由实现文件管理）
+    void* m_observer = nullptr;    // TGIOSAudioObserver*（ARC retained）
+    bool  m_started = false;
+
+    // 中断/路由异常标志：Loop 据此判定是否推静音心跳
+    std::atomic<bool> m_interrupted{false};
 };
 
 }  // namespace TGCapture::platform

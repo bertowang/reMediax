@@ -148,15 +148,33 @@ int VideoEncoder::Open(const VideoEncoderParams& params, const core::VideoMediaT
         m_swPixFmt = m_ctx->pix_fmt;
     }
 
-    // 低延迟/实时参数
-    const bool isNvenc = m_codecName.find("nvenc") != std::string::npos;
-    av_opt_set(m_ctx->priv_data, "preset", isNvenc ? "p1" : "veryfast", 0);
-    // nvenc 没有 tune 选项，强行设置会打 "Unable to parse option value" 告警
-    if (!isNvenc) {
+    // 低延迟/实时参数：不同编码器私有参数差别很大，无脑 set 会打一堆 "Unable to parse option value"。
+    // 这里按编码器族做白名单：
+    //   - libopenh264 / libx264        : preset + tune + rc 全套
+    //   - *_nvenc                      : preset（p1） + rc（无 tune）
+    //   - *_mf (Microsoft Media Foundation) : 完全不吃 x264 风格 opt，只走 bit_rate；
+    //   - *_videotoolbox (Apple)       : 同上，只认 "realtime"/"allow_sw"（这里保守全跳过）
+    //   - *_amf (AMD) / *_qsv (Intel)  : 有自己的 preset/profile，跳过 x264 风格 opt
+    const bool isNvenc        = m_codecName.find("nvenc") != std::string::npos;
+    const bool isMediaFound   = m_codecName.find("_mf") != std::string::npos;        // h264_mf / hevc_mf
+    const bool isVideoToolbox = m_codecName.find("videotoolbox") != std::string::npos;
+    const bool isAmf          = m_codecName.find("_amf") != std::string::npos;
+    const bool isQsv          = m_codecName.find("_qsv") != std::string::npos;
+    const bool isHwFamily     = isNvenc || isMediaFound || isVideoToolbox || isAmf || isQsv;
+
+    if (!isMediaFound && !isVideoToolbox && !isAmf && !isQsv) {
+        av_opt_set(m_ctx->priv_data, "preset", isNvenc ? "p1" : "veryfast", 0);
+    }
+    // tune 只对 x264 / openh264 一类生效，其他编码器一律跳过（nvenc 等私有参数单独设）
+    if (!isHwFamily) {
         av_opt_set(m_ctx->priv_data, "tune", "zerolatency", 0);
     }
-    av_opt_set(m_ctx->priv_data, "rc", "cbr", 0);
-    if (!params.vExtParams.empty()) {
+    if (!isMediaFound && !isVideoToolbox) {
+        // mf/videotoolbox 的 bitrate 走 m_ctx->bit_rate；rc opt 它们不认
+        av_opt_set(m_ctx->priv_data, "rc", "cbr", 0);
+    }
+    // x264-params 只能喂给 libx264；其他家喂了就是 warning，没副作用但很吵
+    if (!params.vExtParams.empty() && m_codecName == "libx264") {
         av_opt_set(m_ctx->priv_data, "x264-params", params.vExtParams.c_str(), 0);
     }
 
@@ -439,7 +457,7 @@ void VideoEncoder::Loop(std::stop_token token)
             continue;
         }
         if (EncodeOne(*item) < 0) {
-            TG_LOGW("VideoEncoder: 编码一帧失败");
+            TG_LOGW("VideoEncoder: 编码一帧失败 codec=%s", m_codecName.c_str());
         }
     }
     DrainLocked();
@@ -447,9 +465,11 @@ void VideoEncoder::Loop(std::stop_token token)
 
 void VideoEncoder::OnThreadExit()
 {
-    TG_LOGI("VideoEncoder: 线程退出 encoded=%llu dropped=%llu",
+    TG_LOGI("VideoEncoder: 线程退出 codec=%s encoded=%llu dropped=%llu latency_us=%lld",
+            m_codecName.c_str(),
             static_cast<unsigned long long>(m_encoded.load()),
-            static_cast<unsigned long long>(m_dropped.load()));
+            static_cast<unsigned long long>(m_dropped.load()),
+            static_cast<long long>(m_encodeLatencyUs.load()));
 }
 
 int VideoEncoder::EncodeOne(const core::FramePtr& frame)
@@ -523,6 +543,16 @@ int VideoEncoder::EncodeOne(const core::FramePtr& frame)
     }
 
     m_encoded.fetch_add(1);
+    // 端到端编码延迟 EMA（μs）：capture → encode out；captureUs 无效时跳过。
+    // α=1/8：抗抖动但也能快速跟新；首次采样直接写入
+    if (frame->captureUs != AV_NOPTS_VALUE) {
+        const int64_t latencyUs = core::MonotonicClock::NowUs() - frame->captureUs;
+        if (latencyUs >= 0 && latencyUs < 10000000) {   // >10s 视为异常忽略
+            int64_t cur = m_encodeLatencyUs.load();
+            int64_t next = (cur == 0) ? latencyUs : (cur + (latencyUs - cur) / 8);
+            m_encodeLatencyUs.store(next);
+        }
+    }
     return 0;
 }
 
@@ -696,6 +726,15 @@ bool VideoEncoder::FillFromCpuFrame(const core::FramePtr& src, core::AVFramePtr&
     const AVPixelFormat dstFmt = static_cast<AVPixelFormat>(avFrame->format);
     avFrame->width = m_ctx->width;
     avFrame->height = m_ctx->height;
+
+    // NV12/YUV420 子采样要求宽高为偶数：奇数 stride 会让 sws_scale 把末列截掉。
+    // 这里不丢帧（下游时间轴依赖持续产出），但限频告警出来便于定位画面"莫名错位/发绿"
+    // （对齐 MediaX FillFrom*** 的奇数尺寸告警）
+    if ((srcW & 1) || (srcH & 1) || (src->strides[0] > 0 && (src->strides[0] & 1))) {
+        TG_LOGW_THROTTLED(5000000,
+                          "VideoEncoder: 奇数源尺寸/步幅 src=%dx%d stride[0]=%d dst=%dx%d，sws 会截末列",
+                          srcW, srcH, src->strides[0], m_ctx->width, m_ctx->height);
+    }
 
     // 归一化层的输出已经是编码器的尺寸与目标格式时，直接拷平面，
     // 不要再过一遍 sws_scale —— GPU 回退路径上这一帧可能几十 MB，省一次全帧搬运很值。
