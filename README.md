@@ -832,6 +832,9 @@ Linux 没有原生采集，但是**整条编码 / 封装 / 混流 / 音画同步
 | `--audio2-volume <f>` | 0.1 | 第 2 路相对音量（线性缩放 S16 样本） |
 | `--video-loops <n>` / `--audio1-loops` / `--audio2-loops` | 1 / 1 / 0 | 各路独立循环次数（`0` = 无限） |
 | `--audio1-speed <f>` / `--audio2-speed <f>` | 1.0 / 1.0 | 推送速度倍率（`>1`=过快，`<1`=过慢，详见下文） |
+| `--audio-pts-jitter-ms <N>` | 0 | 音频 PTS ±N ms 随机抖动（模拟采集端时间戳不准） |
+| `--audio-pts-back-every <K>` | 0 | 每 K 个音频帧将 PTS 回退 1 帧时长（模拟设备时钟回退） |
+| `--video-stall-start <s> --video-stall-dur <s>` | 0 0 | 视频从第 s 秒起暂停 dur 秒不推帧 |
 | `--out <url>` | out.flv | 输出（`.flv` / `.ts` / `rtmp://…` / `srt://…`） |
 | `--seconds <n>` | 10 | 运行秒数；`0` = 直到视频 EOF |
 | `--w --h --fps --bitrate` | 1280 720 30 3000000 | 编码参数 |
@@ -922,6 +925,18 @@ cd build/linux-x86_64
 `a2+ / a1+` 比值应接近 `audio2-speed / audio1-speed`（本例 `1383/1227≈1.126 ≈ 1.07/0.95`）。
 
 **运行期告警**：每 3 秒节流一条 `混流取不到数据（当前通道数 N，帧长 1024）` 是**正常运行节律**（Mix 消费率略高于补货率时，MixLoop 轻度 sleep 等待），不是错误。
+
+#### 故障注入矩阵（压测用）
+
+| 场景 | 命令片段 | 预期心跳信号 |
+| - | - | - |
+| **A** 基线 | （不加故障参数） | `ch burst=0 jump=0 under=2` 全程 0 |
+| **B** 音频 drift | `--audio1-speed 0.95 --audio2-speed 1.05` | 慢路 `under` 持续线性增长（如 2069），视频侧 `forceSync` 累加 |
+| **C** 音频 PTS 抖动 | `--audio-pts-jitter-ms 100` | `ch drift≈±15ms burst≈120 jump≈1200 drop≈239ms` |
+| **D** 音频 PTS 回退 | `--audio-pts-back-every 100` | `ch comp≈100ms drop≈104ms`（样本级补偿） |
+| **E** 视频卡顿 | `--video-stall-start 20 --video-stall-dur 5` | 视频 `stall=20 jump=1 force=12`，`avDiff` 卡顿后翻负 |
+
+每种故障**都有专属响应字段**：如果某场景跑出来跟 baseline 完全一样，说明通路没正确传递 PTS。
 
 #### 已知时间轴行为
 
