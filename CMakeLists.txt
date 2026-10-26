@@ -27,7 +27,7 @@ if(CMAKE_GENERATOR MATCHES "Visual Studio|Xcode")
 endif()
 
 # ---------------------------------------------------------------- 选项
-set(TG_PLATFORM "windows" CACHE STRING "目标平台: windows|android|ios")
+set(TG_PLATFORM "windows" CACHE STRING "目标平台: windows|linux|android|ios")
 set(TG_ABI "x64" CACHE STRING "ABI: x64 | arm64-v8a | armeabi-v7a | x86_64 | fat")
 set(TG_3RD_ROOT "" CACHE PATH "TGCapture3rd 根目录（FfmpegCompileShell 的产出目录）")
 option(TG_BUILD_DEMO "编译测试 demo" ON)
@@ -108,6 +108,12 @@ elseif(TG_PLATFORM STREQUAL "ios")
         "-framework CoreFoundation" "-framework CoreVideo" "-framework CoreMedia"
         "-framework VideoToolbox" "-framework AudioToolbox" "-framework AVFoundation"
         "-framework ReplayKit" "-framework UIKit")
+elseif(TG_PLATFORM STREQUAL "linux")
+    # Linux 暂无原生采集实现（屏幕需 X11 / PipeWire，音频需 PulseAudio / ALSA）：
+    # IsSupported() 一律返回 false，Create*Capture / Enable*Capture 返回负值。
+    # 编码 / 封装 / 音画同步 / 混流与外灌帧（PushExternal*Frame）是全平台通用的，照常可用。
+    # pthread/dl/m：ffmpeg（openssl、srt）静态链进来后需要的系统库。
+    list(APPEND TG_PLATFORM_LIBS pthread dl m)
 endif()
 
 add_library(tgcapture STATIC ${TG_CORE_SOURCES} ${TG_PLATFORM_SOURCES})
@@ -167,6 +173,13 @@ if(TG_BUILD_DEMO AND TG_PLATFORM STREQUAL "windows")
             VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:tg_capture_demo>"
             VS_DEBUGGER_ENVIRONMENT "PATH=$<TARGET_FILE_DIR:tg_capture_demo>;%PATH%")
     endif()
+endif()
+
+# Linux demo：本机没有采集设备也能验证"编码 → 封装"链路（走外灌帧，不依赖采集）。
+# 同时也是唯一的链接自检 —— 只编静态库不会触发链接，ffmpeg 依赖链不对照不出来。
+if(TG_BUILD_DEMO AND TG_PLATFORM STREQUAL "linux")
+    add_executable(tg_capture_demo demo/linux/main.cpp)
+    target_link_libraries(tg_capture_demo PRIVATE tgcapture)
 endif()
 
 # ---------------------------------------------------------------- 安装

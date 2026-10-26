@@ -36,10 +36,18 @@ function(tg_link_thirdparty target platform abi root)
     target_link_directories(${target} PUBLIC "${ffmpeg_dir}/lib")
 
     # ffmpeg 组件（Windows 为 import lib，其它平台为 .a）
-    target_link_libraries(${target} PUBLIC avcodec avformat avutil swresample swscale)
+    #
+    # 顺序不能随便排：静态库用 GNU ld 是**单遍解析**，依赖方必须在被依赖方之前。
+    # avformat 会引用 avcodec 的内部符号（av_parser_init/parse2/close、ff_toupper4、
+    # avpriv_pix_fmt_find、ff_ac3_channel_layout_tab、ff_mpa_freq_tab…），
+    # 写成 avcodec 在前的话，这些符号轮到 avcodec 时还没出现，直接 undefined reference。
+    # 这与 ffmpeg 自己的 pkg-config 顺序（avformat → avcodec → swresample → avutil）一致。
+    target_link_libraries(${target} PUBLIC avformat avcodec swscale swresample avutil)
 
     # 其余开播依赖（静态库）
-    foreach(lib openh264 fdk-aac srt libyuv openssl)
+    # zlib：ffmpeg 的 png / gzip 路径依赖它，静态链接时必须显式带上
+    # （Windows 下 ffmpeg 是 DLL，z 已并入；重复链一个不需要的静态库不会有副作用）
+    foreach(lib openh264 fdk-aac srt libyuv openssl zlib)
         _tg_dep_dir(dir "${root}" "${lib}" "${platform}" "${abi}")
         if(NOT dir)
             # libyuv 是应用直接链接的独立库，缺了必然链接失败；
@@ -59,7 +67,7 @@ function(tg_link_thirdparty target platform abi root)
     endforeach()
 
     # 静态链接这些库（libyuv 由应用直接链接；其余已静态并入 ffmpeg，重复链无符号需求时不会引入目标文件）
-    target_link_libraries(${target} PUBLIC openh264 fdk-aac srt yuv ssl crypto)
+    target_link_libraries(${target} PUBLIC openh264 fdk-aac srt yuv ssl crypto z)
 
     # 导出给上层：Windows 下 ffmpeg 的 DLL 在 <ffmpeg>/bin，用于 demo 的调试环境与产物拷贝
     if(EXISTS "${ffmpeg_dir}/bin")

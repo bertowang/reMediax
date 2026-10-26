@@ -1,7 +1,8 @@
 ﻿# TGCapture —— 开播内核（C++20）
 
 用 C++20 重写的开播（采集 → 编码 → 封装 → 推流）内核，**对外接口保持不变**，
-仍然基于 FFmpeg API 实现，支持 Windows / Android / iOS 三端。
+仍然基于 FFmpeg API 实现，支持 Windows / Linux / Android / iOS。
+（Linux 目前**只有内核、没有原生采集**，见 §11。）
 
 采集、混流、同步、性能模式都是**可独立阅读的模块**，依赖 `TGCapture3rd`
 （由 `FfmpegCompileShell` 编译产出：ffmpeg / openssl / srt / fdk-aac / openh264 / libyuv / zlib）。
@@ -655,6 +656,7 @@ vp.vCodec = "h264_nvenc";
 
 ```powershell
 python scripts/build.py --platform windows --abi x64
+python scripts/build.py --platform linux --3rd ~/TGCapture3rd-linux   # 需先编出 linux 版依赖
 python scripts/build.py --platform android --abi arm64-v8a --ndk $ANDROID_NDK_HOME
 python scripts/build.py --platform ios
 # 开关：--clean / --build-type Debug|Release / --no-demo / --3rd <依赖目录> / --ide
@@ -694,6 +696,7 @@ Windows 产物是 `flat` 布局（无 abi 层），`cmake/Deps.cmake` 按 abi �
 
 | 平台 | 产物 |
 | - | - |
+| Linux | `build/linux-x86_64/libtgcapture.a`、`tg_capture_demo`（外灌帧 demo，不依赖采集设备） |
 | Windows | `build/windows-x64/Release/tgcapture.lib`、`tg_capture_demo.exe`（+ 同目录 ffmpeg DLL） |
 | Android | `libtgcapture.a`（gradle 输出到 `ide/android/app/build/…`） |
 | iOS | `build/ios-fat/libtgcapture.a` |
@@ -815,6 +818,11 @@ ffplay out.flv                      # 实际播放确认音画同步
 
 * **GPU 模式不做缩放**：显存内只做同尺寸拷贝，因此 GPU 模式**编码分辨率 = 采集分辨率**
   （4K 屏即 2160x3840）；需要降分辨率推流用 CPU 模式。后续可在显存内加 D3D11 VideoProcessor / `scale_d3d11`。
+* **Linux：有内核、无原生采集** —— 屏幕需 X11 / PipeWire、音频需 PulseAudio / ALSA，
+  当前均未实现，因此 `IsSupported()` 一律返回 false、`Create*Capture` / `Enable*Capture`
+  返回空 / 负值。编码 → 封装 → 音画同步 → 混流与外灌帧（`PushExternal*Frame`）照常可用，
+  `demo/linux` 即用它验证（2~3 秒可录出 `h264 + aac` 的 flv）。
+  要真正开播，需补 Linux 采集源，或用 `PushExternalVideoFrame` 从上层喂帧。
 * **Android / iOS 尚未在各自平台编译验证**（本机只有 Windows 工具链）：
   `src/platform/android/*`、`src/platform/ios/*` 与 `TGCaptureSystemCapture.java`
   需在有 SDK/NDK/Xcode 的环境跑一次。

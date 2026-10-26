@@ -28,6 +28,7 @@ DEFAULT_BUILD_DIR = PROJECT_ROOT / "build"
 
 PLATFORM_ABI = {
     "windows": "x64",
+    "linux": "x86_64",
     "android": "arm64-v8a",
     "ios": "fat",
 }
@@ -72,7 +73,7 @@ def open_in_ide(platform: str, build_dir: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="构建 TGCapture")
-    parser.add_argument("-p", "--platform", required=True, choices=["windows", "android", "ios"])
+    parser.add_argument("-p", "--platform", required=True, choices=["windows", "linux", "android", "ios"])
     parser.add_argument("--abi", default=None, help="ABI（默认按平台）")
     parser.add_argument("--3rd", dest="third", default=None,
                         help="依赖根目录；不给则由 CMake 解析（环境变量 TG_3RD_ROOT > 同级 TGCapture3rd）")
@@ -100,7 +101,7 @@ def main() -> int:
         f"-DCMAKE_BUILD_TYPE={args.build_type}",
         f"-DTG_PLATFORM={args.platform}",
         f"-DTG_ABI={abi}",
-        f"-DTG_BUILD_DEMO={'OFF' if (args.no_demo or args.platform != 'windows') else 'ON'}",
+        f"-DTG_BUILD_DEMO={'OFF' if (args.no_demo or args.platform not in ('windows', 'linux')) else 'ON'}",
     ]
     if args.third:
         # 显式指定才透传；不给时由 CMakeLists.txt 按 环境变量 > 同级目录 解析
@@ -151,10 +152,11 @@ def main() -> int:
     run(["cmake", "--build", build_dir, "--config", args.build_type, "--parallel"])
 
     print(f"\n构建完成: {build_dir}")
-    if args.platform == "windows" and not args.no_demo:
-        exe = build_dir / args.build_type / "tg_capture_demo.exe"
+    if args.platform in ("windows", "linux") and not args.no_demo:
+        name = "tg_capture_demo.exe" if args.platform == "windows" else "tg_capture_demo"
+        exe = build_dir / args.build_type / name
         if not exe.exists():
-            exe = build_dir / "tg_capture_demo.exe"
+            exe = build_dir / name
         print(f"demo: {exe if exe.exists() else '(见 build 目录)'}")
     return 0
 

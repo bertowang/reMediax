@@ -16,6 +16,15 @@
 #include "platform/ios/IOSScreenCapture.h"
 #endif
 
+// 有原生采集实现的平台。Linux 等平台没有（屏幕需 X11/PipeWire、音频需 PulseAudio/ALSA）：
+// 采集接口一律返回不支持，但编码 / 封装 / 外灌帧不依赖它，故必须能编译通过。
+// 没有这个宏时，下面那些 `#else return` 分支之后仍会引用未声明的 source，编译不过。
+#if defined(_WIN32) || defined(__ANDROID__) || defined(__APPLE__)
+#define TG_HAS_NATIVE_CAPTURE 1
+#else
+#define TG_HAS_NATIVE_CAPTURE 0
+#endif
+
 namespace TGCapture
 {
 
@@ -82,11 +91,15 @@ int TGCapturer::EnableMicrophoneCapture(bool usingGVoice)
     auto source = std::make_shared<platform::AndroidAudioCapture>(TypeOfSelfMicphone, false);
 #elif defined(__APPLE__)
     auto source = std::make_shared<platform::IOSAudioCapture>(TypeOfSelfMicphone);
-#else
-    return -1;
 #endif
+
+#if TG_HAS_NATIVE_CAPTURE
     m_ownedAudioSources.push_back(source);
     return AddAudioSource(source.get());
+#else
+    TG_LOGW("TGCapturer: 当前平台无麦克风采集实现（外部注入请用 PushExternalAudioFrame）");
+    return -1;
+#endif
 }
 
 int TGCapturer::EnableSpeakerCapture()
@@ -124,12 +137,16 @@ IVideoSource* TGCapturer::CreateScreenCapture(int index, VideoCapMode mode, Vide
     source->SetProjection(m_mediaProjection);
 #elif defined(__APPLE__)
     auto source = std::make_shared<platform::IOSScreenCapture>(strategy);
-#else
-    return nullptr;
 #endif
+
+#if TG_HAS_NATIVE_CAPTURE
     m_ownedVideoSources.push_back(source);
     m_videoSource = source.get();
     return source.get();
+#else
+    TG_LOGW("TGCapturer: 当前平台无屏幕采集实现（外部注入请用 PushExternalVideoFrame）");
+    return nullptr;
+#endif
 }
 
 IVideoSource* TGCapturer::CreateWindowCapture(void* handle, VideoCapMode mode, VideoScaleStrategy strategy)
