@@ -247,6 +247,25 @@ void TGCapturer::StopAudioMixer()
         m_audioClock->SetCompensationUs(m_videoParams.audioCompensationUs);
     }
     if (m_mixer) {
+        const auto ms = m_mixer->Stats();
+        TG_LOGI("TGCapturer: 混流汇总 out=%llu wait=%llu reanchor=%llu/%lldms",
+                static_cast<unsigned long long>(ms.outputFrames),
+                static_cast<unsigned long long>(ms.waitTimeouts),
+                static_cast<unsigned long long>(ms.reanchors),
+                static_cast<long long>(ms.reanchorUs / 1000));
+        auto diags = m_mixer->AllDiagnostics();
+        for (size_t i = 0; i < diags.size(); ++i) {
+            const auto& d = diags[i];
+            TG_LOGI("TGCapturer: 混流通道 %zu under=%llu comp=%lldms drop=%lldms ovf=%lldms "
+                    "drift=%lldus/5s tsBad=%llu fallback=%d jump=%llu",
+                    i, static_cast<unsigned long long>(d.underrun),
+                    static_cast<long long>(d.compensationUs / 1000),
+                    static_cast<long long>(d.productionDropUs / 1000),
+                    static_cast<long long>(d.overflowDropUs / 1000),
+                    static_cast<long long>(d.residualDriftUs),
+                    static_cast<unsigned long long>(d.tsAnomalies), d.tsFallback ? 1 : 0,
+                    static_cast<unsigned long long>(d.clock.jumpCount));
+        }
         m_mixer->Reset();
     }
 }
@@ -257,17 +276,21 @@ void TGCapturer::MixLoop(std::stop_token token)
     // 而不是只在 Stop 时才有一次最终聚合
     const int64_t kHeartbeatUs = 10 * 1000000LL;
     int64_t lastBeatUs = core::MonotonicClock::NowUs();
+    int64_t lastOutputUs = lastBeatUs;
     while (!token.stop_requested()) {
         std::shared_ptr<uint8_t> data;
         int64_t ptsUs = 0;
         if (!m_mixer->Mix(m_audioFrameSize, data, ptsUs)) {
-            // 所有混流通道都没凑够一帧数据：限频提示，避免"音频时间轴悄悄停住"却没有任何迹象。
-            // "通道数" 指当前挂载的混流通道总数，不是通道号 —— 之前文案 "通道 N" 容易被误读
-            TG_LOGW_THROTTLED(3000000, "TGCapturer: 混流取不到数据（当前通道数 %zu，帧长 %d）",
-                              m_mixer->ChannelCount(), m_audioFrameSize);
+            // 混流按输出时钟出帧，轮询时取不到数据是常态；只有持续 500ms 没有任何输出才提示
+            // （全部通道断流 / 未推数据，音频时间轴停住）
+            if (core::MonotonicClock::NowUs() - lastOutputUs > 500000) {
+                TG_LOGW_THROTTLED(3000000, "TGCapturer: 混流超过 500ms 无输出（当前通道数 %zu，全部断流或未推数据）",
+                                  m_mixer->ChannelCount());
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
         }
+        lastOutputUs = core::MonotonicClock::NowUs();
 
         // ---- 心跳：10s/次 I 级累计状态 ----
         const int64_t nowUs = core::MonotonicClock::NowUs();
@@ -282,24 +305,26 @@ void TGCapturer::MixLoop(std::stop_token token)
             per.reserve(128);
             for (size_t i = 0; i < diags.size(); ++i) {
                 const auto& d = diags[i];
-                char buf[192];
+                char buf[256];
                 std::snprintf(buf, sizeof(buf),
-                              " ch%zu[drift=%lldms pi=%llu burst=%llu force=%llu "
-                              "jump=%llu under=%llu comp=%lldms drop=%lldms buf=%zu]",
+                              " ch%zu[drift=%lldus/5s jump=%llu under=%llu comp=%lldms drop=%lldms "
+                              "ovf=%lldms tsBad=%llu%s buf=%zu]",
                               i,
-                              static_cast<long long>(d.clock.driftUs / 1000),
-                              static_cast<unsigned long long>(d.clock.piCount),
-                              static_cast<unsigned long long>(d.clock.burstCount),
-                              static_cast<unsigned long long>(d.clock.forceCount),
+                              static_cast<long long>(d.residualDriftUs),
                               static_cast<unsigned long long>(d.clock.jumpCount),
                               static_cast<unsigned long long>(d.underrun),
                               static_cast<long long>(d.compensationUs / 1000),
                               static_cast<long long>(d.productionDropUs / 1000),
+                              static_cast<long long>(d.overflowDropUs / 1000),
+                              static_cast<unsigned long long>(d.tsAnomalies),
+                              d.tsFallback ? "(wall)" : "",
                               m_mixer->BufferedFrames(static_cast<int>(i)));
                 per += buf;
             }
+            const auto ms = m_mixer->Stats();
             TG_LOGI("TGCapturer: 心跳 avDiff=%lldms force=%llu adapt=%llu clamp=%llu "
-                    "stall=%llu skip=%llu jump=%llu staleReset=%llu|%s",
+                    "stall=%llu skip=%llu jump=%llu staleReset=%llu bpDrop=%llu "
+                    "mix[out=%llu wait=%llu reanchor=%llu/%lldms]|%s",
                     static_cast<long long>(vs.avDiffUs / 1000),
                     static_cast<unsigned long long>(vs.forceSynced),
                     static_cast<unsigned long long>(vs.adapted),
@@ -308,6 +333,11 @@ void TGCapturer::MixLoop(std::stop_token token)
                     static_cast<unsigned long long>(vs.skipped),
                     static_cast<unsigned long long>(vs.jumpWarns),
                     static_cast<unsigned long long>(vs.staleResets),
+                    static_cast<unsigned long long>(m_bpDropped.load()),
+                    static_cast<unsigned long long>(ms.outputFrames),
+                    static_cast<unsigned long long>(ms.waitTimeouts),
+                    static_cast<unsigned long long>(ms.reanchors),
+                    static_cast<long long>(ms.reanchorUs / 1000),
                     per.c_str());
         }
 
@@ -512,6 +542,7 @@ int TGCapturer::Prepare()
     m_videoOnlyTimeline->Reset();
     m_videoIntervalUs = m_videoParams.fps > 0 ? static_cast<int64_t>(1000000.0 / m_videoParams.fps) : 33333;
     m_syncDropped = 0;
+    m_bpDropped.store(0);
     m_audioWaitStartUs = 0;
     // 首帧标志必须复位，否则第二轮不再触发 EsCap_Notify_Fisrt_Frame_OK
     m_firstFrameSent.store(false);
@@ -704,7 +735,7 @@ void TGCapturer::Stop()
     m_sync->Reset();
     if (m_videoPtsGen) {
         const auto st = m_videoPtsGen->stats();
-        TG_LOGI("TGCapturer: 音画同步 avDiff=%lldms clamp=%llu forceSync=%llu adapt=%llu stall=%llu skip=%llu jump=%llu staleReset=%llu syncDrop=%llu",
+        TG_LOGI("TGCapturer: 音画同步 avDiff=%lldms clamp=%llu forceSync=%llu adapt=%llu stall=%llu skip=%llu jump=%llu staleReset=%llu syncDrop=%llu bpDrop=%llu",
                 static_cast<long long>(st.avDiffUs / 1000),
                 static_cast<unsigned long long>(st.clamped),
                 static_cast<unsigned long long>(st.forceSynced),
@@ -713,7 +744,8 @@ void TGCapturer::Stop()
                 static_cast<unsigned long long>(st.skipped),
                 static_cast<unsigned long long>(st.jumpWarns),
                 static_cast<unsigned long long>(st.staleResets),
-                static_cast<unsigned long long>(m_syncDropped));
+                static_cast<unsigned long long>(m_syncDropped),
+                static_cast<unsigned long long>(m_bpDropped.load()));
     }
     m_state.store(State::Idle);
     if (m_onStop) {
@@ -770,8 +802,9 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
     // 背压：编码器积压过多则丢帧，保证直播实时性
     constexpr size_t kMaxEncoderPending = 8;
     if (m_videoEncoder->Pending() >= kMaxEncoderPending) {
-        TG_LOGW_THROTTLED(2000000, "TGCapturer: 编码器积压 %zu，丢帧（编码跟不上采集）",
-                          m_videoEncoder->Pending());
+        const auto n = m_bpDropped.fetch_add(1) + 1;
+        TG_LOGW_THROTTLED(2000000, "TGCapturer: 编码器积压 %zu，丢帧（编码跟不上采集，bpDrop=%llu）",
+                          m_videoEncoder->Pending(), static_cast<unsigned long long>(n));
         return;
     }
 
@@ -799,7 +832,7 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
     //
     // 关键：判活用 IsFresh(audioTimeoutMs) 而不是 Valid()。Valid() 是单向开关
     // （第一次 Advance/Reserve 后永远 true），音频长时间断流时 ReferencePtsUs()
-    // 会一直返回最后一次推进的旧 PTS —— VideoPtsGenerator 的 stallFrames 虽然能
+    // 会一直返回最后一次推进的旧 PTS —— VideoPtsGenerator 的停滞判定虽然能
     // clamp 到 audio+maxLead，但那个 audio 已经是几秒钟前的值，视频 PTS 会相对
     // 墙钟永久落后一个 drift。IsFresh 按"最近 N ms 内有过真实推进"判活，断流后
     // 会自然走到下面的 wall-clock fallback 分支。
@@ -844,10 +877,10 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
     }
 
     if (useAudioClock) {
-        const int64_t pts = m_videoPtsGen->Next(audioRef, m_videoIntervalUs, true);
+        const int64_t pts = m_videoPtsGen->Next(audioRef, m_videoIntervalUs, true, m_audioClock->IdleUs());
         if (pts == core::kInvalidPtsUs) {
-            ++m_syncDropped;   // 音频停滞且已 clamp 到上限：本帧不编码
-            TG_LOGW_THROTTLED(2000000, "TGCapturer: 音频停滞且视频已到超前上限，丢帧（syncDrop=%llu）",
+            ++m_syncDropped;   // 音频停滞已到超前上限 / 视频突发超前音频：本帧不编码
+            TG_LOGW_THROTTLED(2000000, "TGCapturer: 视频超前音频（突发到达或音频停滞），丢帧（syncDrop=%llu）",
                               static_cast<unsigned long long>(m_syncDropped));
             return;
         }
@@ -1101,14 +1134,19 @@ std::string TGCapturer::GetStatsInfo(StatsInfoType type)
         std::string out = "[";
         for (size_t i = 0; i < diags.size(); ++i) {
             const auto& d = diags[i];
-            char item[320];
+            char item[384];
             snprintf(item, sizeof(item),
-                     "%s{\"underrun\":%llu,\"comp_us\":%lld,\"drop_us\":%lld,"
+                     "%s{\"underrun\":%llu,\"comp_us\":%lld,\"drop_us\":%lld,\"overflow_us\":%lld,"
+                     "\"drift_us_per_5s\":%lld,\"ts_anomalies\":%llu,\"ts_fallback\":%s,"
                      "\"pi\":%llu,\"burst\":%llu,\"force\":%llu,\"drift_us\":%lld}",
                      i == 0 ? "" : ",",
                      static_cast<unsigned long long>(d.underrun),
                      static_cast<long long>(d.compensationUs),
                      static_cast<long long>(d.productionDropUs),
+                     static_cast<long long>(d.overflowDropUs),
+                     static_cast<long long>(d.residualDriftUs),
+                     static_cast<unsigned long long>(d.tsAnomalies),
+                     d.tsFallback ? "true" : "false",
                      static_cast<unsigned long long>(d.clock.piCount),
                      static_cast<unsigned long long>(d.clock.burstCount),
                      static_cast<unsigned long long>(d.clock.forceCount),

@@ -24,6 +24,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <random>
 #include <cerrno>
 #include <csignal>
@@ -34,6 +37,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <sys/types.h>
+#include <signal.h>
 
 #include "TGCapture/ITGCapturer.h"
 
@@ -54,19 +60,21 @@ struct Options
     int         audio1Loops = 1;
     int         audio2Loops = 0;                              // 默认跟 audio2Loop=true 等价（无限）
     // 推送速度倍率（压测用）：>1 模拟源产太快，<1 模拟源产太慢
-    //   内核 AudioMixer 参考时钟是 wallclock、内部 PTS 按采样数累加，
-    //   speed!=1 时 wallclock 推进与采样推进出现偏差 → ChannelClock 看到 drift，
-    //   触发 PI → BURST → ForceAlign 层级校正，日志里可观测
+    //   每块 1024 采样按 wallclock 间隔 1024/sr/speed 推送，ptsUs 传推送时刻（墙钟），
+    //   内核据"时间戳流逝 vs 样本时长"测出设备漂移并在样本域补偿（≤0.5% 可完全补偿，更大由欠载/丢弃吸收）
     float       audio1Speed = 1.0f;
     float       audio2Speed = 1.0f;
     // 故障注入（压测用，默认全关）：
     //   --audio-pts-jitter-ms <N>  音频 PTS 加 ±N ms 的随机抖动（模拟采集端时间戳不准）
-    //   --audio-pts-back-every <K> 每 K 帧对音频 PTS 回退 1 帧时长（模拟设备时钟回退，触发 jumpWarns/staleReset）
-    //   --video-stall-start <s> --video-stall-dur <s>  视频在 start 秒后暂停 dur 秒不推帧
+    //   --audio-pts-back-every <K> 每 K 帧对音频 PTS 回退 1 帧时长（模拟设备时钟回退）
+    //   --video-stall-start <s> --video-stall-dur <s>  视频在 start 秒后暂停 dur 秒
+    //   --video-stall-mode freeze|burst  freeze=卡顿期间的帧丢失（真实采集卡死）；
+    //                                    burst=卡顿期间的帧积压，恢复后一次性灌入（默认）
     int         audioPtsJitterMs    = 0;
     int         audioPtsBackEvery   = 0;
     int         videoStallStartSec  = 0;
     int         videoStallDurSec    = 0;
+    bool        videoStallBurst     = true;
 
     // 编码/封装
     std::string out      = "out.flv";
@@ -104,6 +112,7 @@ void PrintUsage()
            "    --audio-pts-jitter-ms <N>  音频 PTS ±N ms 随机抖动，默认 0\n"
            "    --audio-pts-back-every <K> 每 K 个音频帧将 PTS 回退 1 帧时长，默认 0（关）\n"
            "    --video-stall-start <s> --video-stall-dur <s>  视频从第 s 秒起暂停 dur 秒不推帧\n"
+           "    --video-stall-mode <m>     freeze=卡顿期间帧丢失 / burst=恢复后积压帧一次性灌入，默认 burst\n"
            "  输出:\n"
            "    --out <url>             out.flv / out.ts / rtmp:// / srt://，默认 out.flv\n"
            "    --seconds <n>           运行秒数，0 = 直到视频结束，默认 10\n"
@@ -138,6 +147,14 @@ Options ParseArgs(int argc, char** argv)
         else if (a == "--audio-pts-back-every") { if (auto* v = next(i, "--audio-pts-back-every")) opt.audioPtsBackEvery   = std::atoi(v); }
         else if (a == "--video-stall-start")    { if (auto* v = next(i, "--video-stall-start"))    opt.videoStallStartSec  = std::atoi(v); }
         else if (a == "--video-stall-dur")      { if (auto* v = next(i, "--video-stall-dur"))      opt.videoStallDurSec    = std::atoi(v); }
+        else if (a == "--video-stall-mode") {
+            if (auto* v = next(i, "--video-stall-mode")) {
+                const std::string m = v;
+                if (m == "freeze") { opt.videoStallBurst = false; }
+                else if (m == "burst") { opt.videoStallBurst = true; }
+                else { printf("--video-stall-mode 只支持 freeze|burst\n"); opt.showHelp = true; }
+            }
+        }
         else if (a == "--video")   { if (auto* v = next(i, "--video"))   opt.video = v; }
         else if (a == "--audio1")  { if (auto* v = next(i, "--audio1"))  opt.audio1 = v; }
         else if (a == "--audio2")  { if (auto* v = next(i, "--audio2"))  opt.audio2 = v; }
@@ -176,10 +193,18 @@ public:
     bool Open(const std::string& cmd)
     {
         m_cmd = cmd;
-        m_fp = ::popen(cmd.c_str(), "r");
+        // 先输出 shell 自身 pid 再 exec：exec 后该 pid 就是 ffmpeg，Close() 时可以直接 kill。
+        // 必要性：本进程忽略了 SIGPIPE，子进程继承后读端关闭只会收到 EPIPE；ffmpeg 随后进入
+        // 退出 flush，而 aloop=loop=-1 会无限产出 —— 子进程永不退出，pclose 永远阻塞
+        const std::string wrapped = "echo $$; exec " + cmd;
+        m_fp = ::popen(wrapped.c_str(), "r");
         if (!m_fp) {
             printf("[demo] popen 失败: %s (errno=%d)\n", cmd.c_str(), errno);
             return false;
+        }
+        char line[32] = {0};
+        if (std::fgets(line, sizeof(line), m_fp) != nullptr) {
+            m_pid = static_cast<pid_t>(std::atol(line));
         }
         return true;
     }
@@ -199,22 +224,134 @@ public:
         return true;
     }
     bool Eof() const { return m_eof; }
+    // 只发信号不碰 FILE*：可以在读线程仍阻塞于 fread 时调用，fread 随即返回 EOF。
+    // pclose 之前子进程尚未被回收（最多是僵尸），pid 不会被复用
+    void Kill()
+    {
+        if (m_pid > 0) {
+            ::kill(m_pid, SIGKILL);   // 只要裸数据，不需要 ffmpeg 优雅收尾
+            m_pid = -1;
+        }
+    }
     void Close()
     {
-        if (m_fp) { ::pclose(m_fp); m_fp = nullptr; }
+        if (!m_fp) { return; }
+        Kill();
+        ::pclose(m_fp);
+        m_fp = nullptr;
     }
     ~FfmpegPipe() { Close(); }
 
 private:
     FILE*       m_fp = nullptr;
+    pid_t       m_pid = -1;
     bool        m_eof = false;
     std::string m_cmd;
+};
+
+// 预读器：每路一个读线程 + 有界队列，主循环只从队列取块，不会被某一路的管道阻塞拖住其它路
+// （旧实现单线程阻塞 fread：ffmpeg 解码抖动 / 循环 seek 时三路一起停，节奏被打乱）
+class Prefetcher
+{
+public:
+    Prefetcher(FfmpegPipe& pipe, size_t chunkBytes, size_t capacity)
+        : m_pipe(pipe), m_chunkBytes(chunkBytes), m_capacity(capacity > 0 ? capacity : 1) {}
+    ~Prefetcher() { Stop(); }
+
+    void Start()
+    {
+        m_thread = std::thread([this] {
+            for (;;) {
+                std::vector<uint8_t> buf(m_chunkBytes);
+                const bool ok = m_pipe.ReadFull(buf.data(), buf.size());
+                std::unique_lock<std::mutex> lk(m_mutex);
+                if (!ok) { m_eof = true; m_cv.notify_all(); return; }
+                m_cv.wait(lk, [this] { return m_stop || m_queue.size() < m_capacity; });
+                if (m_stop) { return; }
+                m_queue.push_back(std::move(buf));
+            }
+        });
+    }
+    // 非阻塞取一块；返回 false 时用 Eof() 区分"暂时没数据"和"已结束"
+    bool TryPop(std::vector<uint8_t>& out)
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        if (m_queue.empty()) { return false; }
+        out.swap(m_queue.front());
+        m_queue.pop_front();
+        m_cv.notify_all();
+        ++m_popped;
+        return true;
+    }
+    bool Eof()
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        return m_eof && m_queue.empty();
+    }
+    uint64_t Underflows() const { return m_underflows; }
+    void CountUnderflow() { ++m_underflows; }
+    size_t Size()
+    {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        return m_queue.size();
+    }
+    void Stop()
+    {
+        {
+            std::lock_guard<std::mutex> lk(m_mutex);
+            m_stop = true;
+        }
+        m_cv.notify_all();
+        // 读线程要么阻塞在 cv（被 m_stop 唤醒），要么阻塞在 fread（先杀子进程让它拿到 EOF）；
+        // 先 join 再关管道 —— 另一个线程还在 fread 时 pclose 同一个 FILE* 是未定义行为
+        m_pipe.Kill();
+        if (m_thread.joinable()) { m_thread.join(); }
+        m_pipe.Close();
+    }
+
+private:
+    FfmpegPipe&                        m_pipe;
+    size_t                             m_chunkBytes;
+    size_t                             m_capacity;
+    std::thread                        m_thread;
+    std::mutex                         m_mutex;
+    std::condition_variable            m_cv;
+    std::deque<std::vector<uint8_t>>   m_queue;
+    bool                               m_eof = false;
+    bool                               m_stop = false;
+    uint64_t                           m_popped = 0;
+    uint64_t                           m_underflows = 0;
 };
 
 int64_t ElapsedUs(const std::chrono::steady_clock::time_point& t0)
 {
     return std::chrono::duration_cast<std::chrono::microseconds>(
                std::chrono::steady_clock::now() - t0).count();
+}
+
+// 单调时钟（微秒）：PushExternalAudioFrame 的 ptsUs 约定 = 单调时钟域的采集时刻
+int64_t MonotonicNowUs()
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// 用同目录的 ffprobe 取首路音频时长（秒），失败返回 0
+double ProbeDurationSec(const std::string& ffmpegBin, const std::string& path)
+{
+    std::string probe = "ffprobe";
+    const auto slash = ffmpegBin.rfind('/');
+    if (slash != std::string::npos) {
+        probe = ffmpegBin.substr(0, slash + 1) + "ffprobe";
+    }
+    const std::string cmd = probe + " -v error -select_streams a:0 -show_entries format=duration "
+                            "-of csv=p=0 " + ShellQuote(path) + " 2>/dev/null";
+    FILE* fp = ::popen(cmd.c_str(), "r");
+    if (!fp) { return 0.0; }
+    char buf[64] = {0};
+    const bool ok = std::fgets(buf, sizeof(buf), fp) != nullptr;
+    ::pclose(fp);
+    return ok ? std::atof(buf) : 0.0;
 }
 
 // 按比例缩 S16 样本（第 2 路音量调节），不开根号、不做限幅：0..1 范围内不会溢出
@@ -343,19 +480,29 @@ int main(int argc, char** argv)
     if (!videoPipe.Open(cmdbuf)) { ITGCapturer::Destroy(capturer); ITGCapturerMgr::UnInit(); return 1; }
 
     if (opt.audio) {
-        std::snprintf(cmdbuf, sizeof(cmdbuf),
-                      "%s -nostdin -loglevel error %s -i %s -map 0:a:0 "
-                      "-ar %d -ac %d -f s16le - 2>/dev/null",
-                      opt.ffmpegBin.c_str(), streamLoopArg(opt.audio1Loops).c_str(),
-                      ShellQuote(opt.audio1).c_str(), sr, ch);
-        if (!audio1Pipe.Open(cmdbuf)) { ITGCapturer::Destroy(capturer); ITGCapturerMgr::UnInit(); return 1; }
-
-        std::snprintf(cmdbuf, sizeof(cmdbuf),
-                      "%s -nostdin -loglevel error %s -i %s -map 0:a:0 "
-                      "-ar %d -ac %d -f s16le - 2>/dev/null",
-                      opt.ffmpegBin.c_str(), streamLoopArg(opt.audio2Loops).c_str(),
-                      ShellQuote(opt.audio2).c_str(), sr, ch);
-        if (!audio2Pipe.Open(cmdbuf)) { ITGCapturer::Destroy(capturer); ITGCapturerMgr::UnInit(); return 1; }
+        // 循环播放的音频：首尾 10ms 淡入淡出后用 aloop 循环，避免接缝处波形突变产生咔声
+        // （-stream_loop 直接首尾硬拼，短素材如 iqiyi.ts 4.96s 每 5s 一声"咔"，会被误判成混流卡顿）
+        auto audioCmd = [&](const std::string& path, int loops) -> std::string {
+            const double dur = loops == 1 ? 0.0 : ProbeDurationSec(opt.ffmpegBin, path);
+            char b[1024];
+            if (dur > 0.1) {
+                std::snprintf(b, sizeof(b),
+                              "%s -nostdin -loglevel error -i %s -map 0:a:0 "
+                              "-af \"aresample=%d,afade=t=in:d=0.01,afade=t=out:st=%.3f:d=0.01,"
+                              "aloop=loop=%d:size=2147483647\" -ac %d -f s16le - 2>/dev/null",
+                              opt.ffmpegBin.c_str(), ShellQuote(path).c_str(), sr, dur - 0.01,
+                              loops <= 0 ? -1 : loops - 1, ch);
+            } else {
+                std::snprintf(b, sizeof(b),
+                              "%s -nostdin -loglevel error %s -i %s -map 0:a:0 "
+                              "-ar %d -ac %d -f s16le - 2>/dev/null",
+                              opt.ffmpegBin.c_str(), streamLoopArg(loops).c_str(),
+                              ShellQuote(path).c_str(), sr, ch);
+            }
+            return b;
+        };
+        if (!audio1Pipe.Open(audioCmd(opt.audio1, opt.audio1Loops))) { ITGCapturer::Destroy(capturer); ITGCapturerMgr::UnInit(); return 1; }
+        if (!audio2Pipe.Open(audioCmd(opt.audio2, opt.audio2Loops))) { ITGCapturer::Destroy(capturer); ITGCapturerMgr::UnInit(); return 1; }
     }
 
     printf("[demo] video=%s loops=%d\n"
@@ -368,18 +515,39 @@ int main(int argc, char** argv)
            opt.out.c_str(), w, h, opt.fps, opt.bitrate / 1000, sr, ch);
 
     // -------------------------------------------------------------------- 灌帧
-    const int64_t frameUs  = static_cast<int64_t>(1000000.0 / opt.fps);
-    const int64_t audioUs  = static_cast<int64_t>(1000000.0 * samplesPerPush / sr);  // 采样数时间轴
+    const int64_t audioUs  = static_cast<int64_t>(1000000.0 * samplesPerPush / sr);  // 一块的样本时长
     const int64_t totalUs  = static_cast<int64_t>(opt.seconds) * 1000000LL;           // 0 = 不限
-    // speed>1 → wallclock 触发间隔变小（1s wallclock 推送 speed 秒的采样数据）
-    //   内核 AudioMixer 的参考时钟是真实 wallclock，内部 PTS 按采样数累加，
-    //   触发间隔 ≠ 采样时长 时，ChannelClock 会观察到 drift 并触发 PI/BURST/ForceAlign。
-    const int64_t a1TrigUs = static_cast<int64_t>(audioUs / std::max(0.001f, opt.audio1Speed));
-    const int64_t a2TrigUs = static_cast<int64_t>(audioUs / std::max(0.001f, opt.audio2Speed));
+    // speed>1 → wallclock 触发间隔变小（1s wallclock 推送 speed 秒的采样数据），模拟设备时钟偏快。
+    // 步长用浮点、due 按"序号 × 步长"计算：整数步长逐次累加会截断（44.1kHz 下 23219 vs 23219.95us），
+    // 等于给 demo 自己注入了 -41ppm 的漂移
+    const double vStepUs  = 1000000.0 / opt.fps;
+    const double a1StepUs = 1000000.0 * samplesPerPush / sr / std::max(0.001f, opt.audio1Speed);
+    const double a2StepUs = 1000000.0 * samplesPerPush / sr / std::max(0.001f, opt.audio2Speed);
+    // 主循环最多落后 kMaxLagUs（被调度 / 管道读慢拖住）：超过就丢弃积压、按当前时刻重新对齐，
+    // 不再一口气补推（旧实现追帧无上限，一次卡顿后几十帧在 1ms 内灌入，本身就是故障注入）
+    const int64_t kMaxLagUs = 200000;
 
-    std::vector<uint8_t> nv12(static_cast<size_t>(frameBytes));
-    std::vector<int16_t> pcm1(static_cast<size_t>(samplesPerPush) * ch);
-    std::vector<int16_t> pcm2(static_cast<size_t>(samplesPerPush) * ch);
+    // 预读 ~500ms：每路一个读线程，主循环非阻塞取块
+    const size_t vCap = std::max<size_t>(2, static_cast<size_t>(500000.0 / vStepUs));
+    const size_t aCap = std::max<size_t>(4, static_cast<size_t>(500000 / std::max<int64_t>(1, audioUs)));
+    Prefetcher videoQ(videoPipe, static_cast<size_t>(frameBytes), vCap);
+    Prefetcher audio1Q(audio1Pipe, static_cast<size_t>(pcmChunkBytes), aCap);
+    Prefetcher audio2Q(audio2Pipe, static_cast<size_t>(pcmChunkBytes), aCap);
+    videoQ.Start();
+    if (opt.audio) {
+        audio1Q.Start();
+        audio2Q.Start();
+    }
+    // 预热：等各路队列预读到一半再开始计时，避免开头就欠载（最多等 2s）
+    for (int i = 0; i < 400; ++i) {
+        const bool vOk = videoQ.Size() >= vCap / 2 || videoQ.Eof();
+        const bool aOk = !opt.audio || ((audio1Q.Size() >= aCap / 2 || audio1Q.Eof()) &&
+                                        (audio2Q.Size() >= aCap / 2 || audio2Q.Eof()));
+        if (vOk && aOk) { break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    std::vector<uint8_t> vbuf, a1buf, a2buf;
 
     // 故障注入状态
     std::mt19937 jitterRng{20261026};
@@ -388,13 +556,11 @@ int main(int argc, char** argv)
         if (opt.audioPtsJitterMs > 0) {
             std::uniform_int_distribution<int> dist(-opt.audioPtsJitterMs, opt.audioPtsJitterMs);
             out += static_cast<int64_t>(dist(jitterRng)) * 1000LL;
-            if (out < 0) { out = 0; }
         }
         if (opt.audioPtsBackEvery > 0 && frameSeq > 0 && (frameSeq % opt.audioPtsBackEvery) == 0) {
             out -= audioUs;              // 回退 1 帧时长
-            if (out < 0) { out = 0; }
         }
-        return out;
+        return out < 0 ? 0 : out;
     };
     const int64_t stallStartUs = static_cast<int64_t>(opt.videoStallStartSec) * 1000000LL;
     const int64_t stallEndUs   = stallStartUs + static_cast<int64_t>(opt.videoStallDurSec) * 1000000LL;
@@ -402,15 +568,36 @@ int main(int argc, char** argv)
     bool stallExitedLogged  = false;
 
     const auto t0 = std::chrono::steady_clock::now();
-    int64_t videoDue   = 0;
-    int64_t audio1Due  = 0, audio1Pts = 0;   // Due = wallclock 触发时刻，Pts = 采样数时间轴
-    int64_t audio2Due  = 0, audio2Pts = 0;
+    // ptsUs 约定：单调时钟域的采集时刻。demo 里"采集时刻" = 该块的计划推送时刻（墙钟 due）。
+    // 旧实现传"按采样数累加"的 PTS → 时间戳与样本时长恒等，内核测出的漂移恒为 0，补偿永不生效。
+    const int64_t monoBaseUs = MonotonicNowUs() - ElapsedUs(t0);
+    // 节拍器：due = 序号 × 浮点步长（不累加整数步长，避免截断误差变成人为漂移）
+    struct Pacer
+    {
+        double  stepUs = 0;
+        int64_t seq = 0;
+        int64_t Due() const { return static_cast<int64_t>(static_cast<double>(seq) * stepUs); }
+        void    Advance() { ++seq; }
+    };
+    Pacer videoP{vStepUs}, audio1P{a1StepUs}, audio2P{a2StepUs};
     int pushedVideo = 0, pushedAudio1 = 0, pushedAudio2 = 0, rejected = 0;
-    // 推送进度心跳：长压测时需要确认 demo 自身仍在供帧（而不是被 fread 卡住）
+    uint64_t lagResyncs = 0, stallDropped = 0;
+    // 推送进度心跳：长压测时需要确认 demo 自身仍在供帧
     const int64_t kDemoBeatUs = 30 * 1000000LL;
     int64_t lastBeatUs = 0;
     int lastPushedVideo = 0, lastPushedAudio1 = 0, lastPushedAudio2 = 0;
     bool videoDone = false, audio1Done = !opt.audio, audio2Done = !opt.audio;
+
+    // 主循环落后过多：把 due 拉到 now（丢弃追赶），返回是否发生了重新对齐
+    auto resyncIfLagging = [&](Pacer& p, int64_t now) -> bool {
+        const int64_t lag = now - p.Due();
+        if (lag > kMaxLagUs) {
+            p.seq += static_cast<int64_t>(static_cast<double>(lag) / p.stepUs);   // 丢掉整数个步长，保持相位
+            ++lagResyncs;
+            return true;
+        }
+        return false;
+    };
 
     while (!errored.load()) {
         if (s_stop.load()) { printf("[demo] 收到退出信号，刷 trailer\n"); break; }
@@ -422,10 +609,15 @@ int main(int argc, char** argv)
             const int dv = pushedVideo  - lastPushedVideo;
             const int d1 = pushedAudio1 - lastPushedAudio1;
             const int d2 = pushedAudio2 - lastPushedAudio2;
-            printf("[demo] t=%lld.%03llds video+%d(=%d) a1+%d(=%d) a2+%d(=%d) rej=%d\n",
+            printf("[demo] t=%lld.%03llds video+%d(=%d) a1+%d(=%d) a2+%d(=%d) rej=%d "
+                   "resync=%llu underflow=v%llu/a%llu/a%llu\n",
                    static_cast<long long>(now / 1000000),
                    static_cast<long long>((now % 1000000) / 1000),
-                   dv, pushedVideo, d1, pushedAudio1, d2, pushedAudio2, rejected);
+                   dv, pushedVideo, d1, pushedAudio1, d2, pushedAudio2, rejected,
+                   static_cast<unsigned long long>(lagResyncs),
+                   static_cast<unsigned long long>(videoQ.Underflows()),
+                   static_cast<unsigned long long>(audio1Q.Underflows()),
+                   static_cast<unsigned long long>(audio2Q.Underflows()));
             std::fflush(stdout);
             lastBeatUs = now;
             lastPushedVideo  = pushedVideo;
@@ -434,75 +626,96 @@ int main(int argc, char** argv)
         }
         // 视频 EOF 作为整体结束条件（音频无限循环场景下不应等 audio pipe EOF，否则永不退出）
         if (videoDone) { break; }
-        if (audio1Done && audio2Done && !opt.audio) { break; }
 
         // ---- 视频 ----
-        // 视频卡顿注入：进入 [stallStart, stallEnd) 窗口时暂停推送（不前进 videoDue）
         const bool inVideoStall = opt.videoStallDurSec > 0 &&
                                   now >= stallStartUs && now < stallEndUs;
         if (inVideoStall && !stallEnteredLogged) {
-            printf("[demo][inject] t=%.3fs 进入视频卡顿窗口（dur=%ds）\n",
-                   now / 1e6, opt.videoStallDurSec);
+            printf("[demo][inject] t=%.3fs 进入视频卡顿窗口（dur=%ds mode=%s）\n",
+                   now / 1e6, opt.videoStallDurSec, opt.videoStallBurst ? "burst" : "freeze");
             stallEnteredLogged = true;
         }
         if (!inVideoStall && stallEnteredLogged && !stallExitedLogged) {
-            printf("[demo][inject] t=%.3fs 退出视频卡顿窗口\n", now / 1e6);
+            printf("[demo][inject] t=%.3fs 退出视频卡顿窗口（freeze 丢弃 %llu 帧）\n", now / 1e6,
+                   static_cast<unsigned long long>(stallDropped));
             stallExitedLogged = true;
         }
-        if (!videoDone && !inVideoStall && now >= videoDue) {
-            if (videoPipe.ReadFull(nv12.data(), frameBytes)) {
-                if (capturer->PushExternalVideoFrame(nv12.data(), w, h, w, videoDue) == 0) {
+        if (inVideoStall && !opt.videoStallBurst) {
+            // freeze：卡顿期间的帧直接丢失（真实采集卡死），恢复后从当前时刻继续
+            while (now >= videoP.Due() && videoQ.TryPop(vbuf)) {
+                videoP.Advance();
+                ++stallDropped;
+            }
+        }
+        if (!inVideoStall) {
+            // burst 模式卡顿结束后不做 resync：积压帧一次性灌入正是要注入的故障
+            const bool burstRecovering = opt.videoStallBurst && stallEnteredLogged &&
+                                         now - stallEndUs < 2 * kMaxLagUs + opt.videoStallDurSec * 1000000LL;
+            if (!burstRecovering) {
+                resyncIfLagging(videoP, now);
+            }
+            while (now >= videoP.Due()) {
+                if (!videoQ.TryPop(vbuf)) {
+                    if (videoQ.Eof()) { videoDone = true; }
+                    else { videoQ.CountUnderflow(); }
+                    break;
+                }
+                if (capturer->PushExternalVideoFrame(vbuf.data(), w, h, w, monoBaseUs + videoP.Due()) == 0) {
                     ++pushedVideo;
                 } else {
                     ++rejected;
                 }
-                videoDue += frameUs;
-            } else {
-                videoDone = true;  // 视频 EOF 即结束整体演示
-            }
-        }
-        // ---- 音频 1：原音量，走 Micphone 通道 ----
-        if (!audio1Done && now >= audio1Due) {
-            if (audio1Pipe.ReadFull(pcm1.data(), pcmChunkBytes)) {
-                const int64_t pts = applyPtsInjection(audio1Pts, pushedAudio1);
-                if (capturer->PushExternalAudioFrame(TypeOfGameMicphone4Slave,
-                        reinterpret_cast<const uint8_t*>(pcm1.data()),
-                        pcmChunkBytes, sr, ch, pts) == 0) {
-                    ++pushedAudio1;
-                } else { ++rejected; }
-                audio1Due += a1TrigUs;   // wallclock 节奏（受 speed 影响）
-                audio1Pts += audioUs;    // PTS 按采样数推进（不受 speed 影响）
-            } else {
-                audio1Done = true;
-            }
-        }
-        // ---- 音频 2：按比例缩音量，走 Audio 通道（与音频 1 独立，内核会 mix）----
-        if (!audio2Done && now >= audio2Due) {
-            if (audio2Pipe.ReadFull(pcm2.data(), pcmChunkBytes)) {
-                ScalePcm(pcm2.data(), samplesPerPush, ch, opt.audio2Volume);
-                const int64_t pts = applyPtsInjection(audio2Pts, pushedAudio2);
-                if (capturer->PushExternalAudioFrame(TypeOfGameAudio4Slave,
-                        reinterpret_cast<const uint8_t*>(pcm2.data()),
-                        pcmChunkBytes, sr, ch, pts) == 0) {
-                    ++pushedAudio2;
-                } else { ++rejected; }
-                audio2Due += a2TrigUs;
-                audio2Pts += audioUs;
-            } else {
-                audio2Done = true;
+                videoP.Advance();
+                if (!burstRecovering) { break; }   // 正常节奏一次一帧
             }
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // ---- 音频：每路按自身节奏推送，ptsUs = 该块的计划推送时刻（单调时钟） ----
+        auto pumpAudio = [&](Prefetcher& q, std::vector<uint8_t>& buf, Pacer& p,
+                             int& pushed, bool& done, AudioCapSourceType type, float gain) {
+            if (done) { return; }
+            resyncIfLagging(p, now);
+            while (now >= p.Due()) {
+                if (!q.TryPop(buf)) {
+                    if (q.Eof()) { done = true; } else { q.CountUnderflow(); }
+                    return;
+                }
+                auto* pcm = reinterpret_cast<int16_t*>(buf.data());
+                ScalePcm(pcm, samplesPerPush, ch, gain);
+                const int64_t pts = applyPtsInjection(monoBaseUs + p.Due(), pushed);
+                if (capturer->PushExternalAudioFrame(type, buf.data(), pcmChunkBytes, sr, ch, pts) == 0) {
+                    ++pushed;
+                } else {
+                    ++rejected;
+                }
+                p.Advance();
+            }
+        };
+        // 音频 1：原音量，走 Micphone 通道；音频 2：按比例缩音量，走 Audio 通道（内核 mix）
+        pumpAudio(audio1Q, a1buf, audio1P, pushedAudio1, audio1Done, TypeOfGameMicphone4Slave, 1.0f);
+        pumpAudio(audio2Q, a2buf, audio2P, pushedAudio2, audio2Done, TypeOfGameAudio4Slave, opt.audio2Volume);
+
+        // 睡到最近一个 due（最多 2ms），不空转
+        int64_t nextDue = videoP.Due();
+        if (!audio1Done) { nextDue = std::min(nextDue, audio1P.Due()); }
+        if (!audio2Done) { nextDue = std::min(nextDue, audio2P.Due()); }
+        const int64_t waitUs = std::clamp<int64_t>(nextDue - ElapsedUs(t0), 200, 2000);
+        std::this_thread::sleep_for(std::chrono::microseconds(waitUs));
     }
 
-    videoPipe.Close();
-    audio1Pipe.Close();
-    audio2Pipe.Close();
+    videoQ.Stop();
+    audio1Q.Stop();
+    audio2Q.Stop();
 
     capturer->Stop();
-    printf("[demo] 输出=%s 视频帧=%d 音频1=%d 音频2=%d 拒绝=%d\n",
-           opt.out.c_str(), pushedVideo, pushedAudio1, pushedAudio2, rejected);
+    printf("[demo] 输出=%s 视频帧=%d 音频1=%d 音频2=%d 拒绝=%d resync=%llu freeze丢帧=%llu "
+           "预读欠载=v%llu/a%llu/a%llu\n",
+           opt.out.c_str(), pushedVideo, pushedAudio1, pushedAudio2, rejected,
+           static_cast<unsigned long long>(lagResyncs),
+           static_cast<unsigned long long>(stallDropped),
+           static_cast<unsigned long long>(videoQ.Underflows()),
+           static_cast<unsigned long long>(audio1Q.Underflows()),
+           static_cast<unsigned long long>(audio2Q.Underflows()));
 
     ITGCapturer::Destroy(capturer);
     ITGCapturerMgr::UnInit();

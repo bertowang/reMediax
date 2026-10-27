@@ -15,14 +15,23 @@
 //     - 某路数据没到（卡顿/静音）→ 该路按静音补齐，不拖住整体时间轴
 //     - 采样率/声道不一致时用 swresample 归一到输出格式
 //
-// 输出时间轴策略（对齐 MediaX ReferenceClockManager::CheckAndCorrectPts 的"校正值写回 pts"）：
+// 出帧条件（输出时钟）：
 //
-//   以"主通道"（第一个加入的 active 通道）的 corrected PTS 为输出时间轴基准 ——
-//   这样 PI/BURST 校正真正生效在下游（之前仅做统计，Mix 的 outPtsUs 自推进，
-//   校正量完全没落到时间戳上，表现为"统计看着在收敛、实际多路漂移从没纠正"）。
+//   所有"活跃通道"（kChannelIdleUs 内推过数据）都凑够一帧才出帧；有通道迟到时最多等
+//   kMixWaitFrames 帧（墙钟超时 或 就绪通道已积压 kMixWaitFrames 帧，二者任一），超时后
+//   迟到通道本帧按静音处理、已有的残余数据保留到下一帧（不丢样本）。
+//   旧实现"任一路凑够即出帧 + 欠载路清空"在多路相位错开时会让每路各自触发出帧，
+//   输出帧数≈各路帧数之和（60s 墙钟产出 114s 音频），且真实内容中间夹静音。
 //
-//   主通道掉线/断流兜底：若主通道 clock 本轮未推进，fallback 到 m_outputPtsUs
-//   按输出采样率线性推进，保证整体时间轴不被断流冻结。
+// 输出时间轴：
+//
+//   输出 PTS = 输出样本数线性累加（PTS 与实际样本数严格一致，编码器/播放器不会看到时间轴
+//   与内容错位）。各路设备时钟相对墙钟的漂移在样本域纠正：swr_set_compensation 平滑伸缩
+//   （每秒最多 5ms，≈0.5% 变速，不可闻），不再改写 PTS、也不再尾部复制/截断样本（会出咔声）。
+//   全部通道断流超过 kReanchorGapUs 后恢复时，按墙钟把输出 PTS 前移到真实时间（只前移不回退），
+//   保证视频（由音频时钟反推）不会因为音频断流而整体滞后。
+//
+// AudioChannelClock 的 PI/BURST 结果保留为诊断统计（drift/jump），不再写入输出 PTS。
 #ifndef TGCAPTURE_CORE_AUDIO_MIXER_H
 #define TGCAPTURE_CORE_AUDIO_MIXER_H
 
@@ -112,13 +121,26 @@ public:
     struct ChannelDiag
     {
         AudioChannelClock::Stats clock{};
-        uint64_t underrun = 0;              // 数据没到被静音补齐的次数
-        int64_t compensationUs = 0;         // 累计少产补偿（本路慢，复制样本填充）
-        int64_t productionDropUs = 0;       // 累计多产丢弃（本路快，丢弃样本）
+        uint64_t underrun = 0;              // 活跃但迟到、本帧按静音处理的次数
+        int64_t compensationUs = 0;         // 累计补偿（本路慢，swr 拉伸多产的样本时长）
+        int64_t productionDropUs = 0;       // 累计丢弃（本路快，swr 压缩少产的样本时长）
+        int64_t overflowDropUs = 0;         // 缓冲超上限丢弃的最旧样本时长
+        int64_t residualDriftUs = 0;        // 最近一个漂移窗口（5s）测得的原始漂移
+        uint64_t tsAnomalies = 0;           // 时间戳异常次数（回退 / 速率偏离 > 5%）
+        bool tsFallback = false;            // 是否已因时间戳异常改用墙钟
     };
     [[nodiscard]] ChannelDiag ChannelDiagnostic(int id) const;
     // 便捷接口：按 index 顺序取全部通道诊断，供 TGCapturer::GetStatsInfo 序列化
     [[nodiscard]] std::vector<ChannelDiag> AllDiagnostics() const;
+
+    struct MixerStats
+    {
+        uint64_t outputFrames = 0;   // 已输出帧数
+        uint64_t waitTimeouts = 0;   // 等待迟到通道超时后出帧的次数
+        uint64_t reanchors = 0;      // 全路断流恢复后按墙钟前移输出 PTS 的次数
+        int64_t reanchorUs = 0;      // 累计前移量
+    };
+    [[nodiscard]] MixerStats Stats() const;
 
     // 运行期通道增益（线性，0.0 ~ 4.0；clamp 由 Mixer 内部完成，不停流不重建管线）
     void SetChannelGain(int id, float gain);
@@ -131,37 +153,75 @@ private:
         int channels = 0;
         bool active = false;
         AudioChannelClock clock;
-        std::deque<int16_t> pcm;      // 交错 S16
-        SwrContext* swr = nullptr;    // 采样率/声道归一到输出格式
-        uint64_t underrun = 0;        // 数据没到的次数
+        std::deque<int16_t> pcm;      // 交错 S16（已归一到输出格式）
+        SwrContext* swr = nullptr;    // 归一到输出格式 + 漂移补偿（始终创建，强制走重采样器）
+        uint64_t underrun = 0;        // 活跃但迟到的次数
         float gain = 1.0f;            // 运行期增益（SetChannelGain）
+        int64_t lastPushWallUs = 0;   // 最近一次 Push 的墙钟（判定通道是否活跃）
 
-        // 样本级补偿（对齐 MediaX FrameProductionDiag::accumulatedCompensationUs / pendingProductionDrop）
-        // 限速 COMP_FORCE_RATE_LIMIT_US = 5000us/s：每秒最多补 / 丢 5ms 样本，避免瞬间抽变音
-        //
-        // 累加语义采用 "delta 累加"（Review 后保守方案）：
-        //   pendingCompUs += (当前帧 drift - 上一帧 drift)
-        //   PI 稳态下 driftUs 近似常数，delta≈0，不会把 PI 已经维持住的稳态偏差再累一遍；
-        //   ForceAlign / BURST 把时间戳一次性"跳齐"后，driftUs 的瞬时跳变不代表"新增偏差"，
-        //   由 Push 侧检测跳变并刷新 prevDriftUs 跳过累加，避免双重补偿。
-        int64_t pendingCompUs = 0;        // 本路 drift 累加器（正=本路慢，待补；负=本路快，待丢）
-        int64_t prevDriftUs = 0;          // 上一帧 driftUs 快照（用于 delta 累加）
-        bool    driftBaselineSet = false; // 首帧时 drift 不是"新增"，不参与 delta 计算
-        int64_t lastCompUs = 0;           // 上一次做补偿的系统时间
-        int64_t compensationUs = 0;       // 累计实际补偿量（统计用）
-        int64_t productionDropUs = 0;     // 累计实际丢弃量（统计用）
+        // 漂移测量：offset_i = (ts_i - ts_origin) - 已推样本时长_i，按 5s 窗口取平均，
+        // 相邻窗口平均值之差即本窗口的速率漂移（抖动被平均掉，不随时间累积）。
+        // 时间戳断档 / 通道停推后恢复时重置原点（断流不是速率漂移，不能补）。
+        bool    winValid = false;
+        int64_t originTsUs = 0;
+        int64_t cumSamples = 0;       // 自原点起已推样本数（输入采样率）
+        int64_t winStartTsUs = 0;
+        int64_t winStartWallUs = 0;
+        int64_t winOffsetSum = 0;
+        int64_t winCount = 0;
+        bool    havePrevAvg = false;
+        int64_t prevAvgOffsetUs = 0;
+        int64_t lastTsUs = 0;         // 上一帧时间戳
+        int64_t lastFrameDurUs = 0;   // 上一帧时长
+        int64_t residualDriftUs = 0;  // 最近一个窗口测得的漂移（诊断）
+
+        // 时间戳合理性：回退或推进速率偏离墙钟 > 5% 时判为不可信，本路此后改用墙钟
+        bool     tsUntrusted = false;
+        uint64_t tsAnomalies = 0;
+
+        // 样本域补偿：pendingCompUs > 0 本路慢（样本不够）需拉伸；< 0 本路快需压缩。
+        // 通过 swr_set_compensation 在 1s 内平滑完成，每次最多 5ms。
+        int64_t pendingCompUs = 0;
+        int64_t lastCompWallUs = 0;       // 上一次下发补偿的墙钟
+        int64_t compensationUs = 0;       // 累计拉伸量（统计用）
+        int64_t productionDropUs = 0;     // 累计压缩量（统计用）
+        int64_t overflowDropUs = 0;       // 缓冲超上限丢弃量（统计用）
     };
 
     Channel* Find(int id);
     const Channel* Find(int id) const;
+    // 漂移测量 + 样本域补偿；返回本帧实际采用的时间戳（调用方时间戳 或 墙钟兜底）
+    int64_t MeasureDriftAndCompensate(Channel& ch, int frames, int64_t captureUs, int64_t wallUs,
+                                      bool callerTs, bool resumed);
+    static void FallbackToWall(Channel& ch, const char* reason, int64_t valueUs);
+    static void ResetChannelRuntime(Channel& ch);
 
     // Push 来自采集线程、Mix 来自混流线程，必须串行化
     mutable std::mutex m_mutex;
 
     int m_outSampleRate = 0;
     int m_outChannels = 0;
-    int64_t m_outputPtsUs = 0;
+    int64_t m_outputPtsUs = 0;        // 下一帧输出 PTS = base + samples / SR
+    int64_t m_outputPtsBaseUs = 0;
+    int64_t m_outputSamples = 0;      // 自 base 起已输出样本数（按样本累加，避免逐帧取整误差累积）
     std::vector<Channel> m_channels;
+
+    // 输出时钟
+    bool m_outputStarted = false;
+    int64_t m_waitStartWallUs = 0;    // 开始等待迟到通道的墙钟（0=未在等待）
+    int64_t m_anchorWallUs = 0;       // 墙钟锚点：首帧输出时的墙钟，对应 PTS = m_anchorPtsUs
+    int64_t m_anchorPtsUs = 0;
+    int64_t m_lagWinStartWallUs = 0;  // 最小 lag 统计窗口
+    int64_t m_lagWinMinUs = 0;
+    MixerStats m_stats{};
+
+    void ShiftOutputTimeline(int64_t shiftUs);
+
+public:
+    AudioMixer() = default;
+    ~AudioMixer();
+    AudioMixer(const AudioMixer&) = delete;
+    AudioMixer& operator=(const AudioMixer&) = delete;
 };
 
 }  // namespace TGCapture::core

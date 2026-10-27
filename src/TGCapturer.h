@@ -144,6 +144,8 @@ private:
     std::shared_ptr<core::VideoOnlyTimeline> m_videoOnlyTimeline;
     int64_t m_videoIntervalUs = 33333;
     uint64_t m_syncDropped = 0;
+    // 编码前背压丢帧（编码器积压 >= kMaxEncoderPending）：之前不计数，E 场景丢 117 帧统计里不可见
+    std::atomic<uint64_t> m_bpDropped{0};
     // 音频主时钟首帧等待：音频未就绪时视频不发帧（避免就绪后 PTS 回退被整段丢弃）
     // 对齐 MediaX：fallback 判定每帧独立进行，不保留"已降级"状态；
     // 只保留一个 **节流**日志闸门避免刷屏，不影响后续"音频恢复 → 自动切回主时钟"。

@@ -85,6 +85,16 @@ public:
     // 视频：pixelBuffer 在 iOS 为 CVPixelBufferRef，Android 为 nullptr（走 Surface）
     virtual int PushExternalVideoFrame(const uint8_t* data, int width, int height, int stride,
                                        int64_t ptsUs, void* pixelBuffer = nullptr) = 0;
+    // 音频：data 为交错 S16 PCM，size 为字节数。
+    //
+    // ptsUs 约定（内核据此测量各路设备时钟相对墙钟的漂移并在样本域补偿）：
+    //   - 单位微秒，取本块第一个采样的**采集时刻**；
+    //   - 与内核同一时钟域：单调时钟（Linux/Android CLOCK_MONOTONIC，iOS mach_absolute_time 换算，
+    //     Windows QueryPerformanceCounter 换算），起点任意，只看差值；
+    //   - 严格递增；推进速率须与墙钟一致（不要传"按采样数累加"的 PTS —— 那样漂移恒为 0，补偿永不生效）；
+    //   - 不知道采集时刻时传 -1，内核用到达时刻代替。
+    // 合理性校验：时间戳不递增，或 5s 窗口内推进速率偏离墙钟 > 5% 时，内核告警一次并对该路改用到达时刻。
+    // 输出音频 PTS 由内核按输出样本数生成，不直接使用 ptsUs。
     virtual int PushExternalAudioFrame(AudioCapSourceType type, const uint8_t* data, int size,
                                        int sampleRate, int channels, int64_t ptsUs) = 0;
 };
