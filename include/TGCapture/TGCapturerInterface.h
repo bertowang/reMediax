@@ -55,6 +55,23 @@ enum NotifyMsgType
     EsCap_Notify_LocalFile_EOF = 21,
 };
 
+// OnErrorCallback 的 what 取值。
+// 负数；Prepare 阶段的错误同时就是 Prepare() 的返回值（除 NotConfigured 外，见各项注释）。
+// 回调在内核的事件分发线程上触发（Prepare 阶段的错误除外：在调用 Prepare 的线程上同步触发），
+// 回调里允许调用 Stop() / 销毁对象。
+enum TGCaptureError : int32_t
+{
+    TGErr_NotConfigured = -1,         // 编码器 / 封装器参数没有设置全（Prepare 返回 -2）
+    TGErr_OpenVideoEncoder = -3,      // 视频编码器打开失败（Prepare 返回 -3）
+    TGErr_OpenAudioEncoder = -4,      // 音频编码器打开失败（Prepare 返回 -4）
+    TGErr_OpenMuxer = -5,             // 封装器 / 推流地址打开失败（Prepare 返回 -5）
+    // ---- 运行期（Start 之后）----
+    TGErr_MuxWriteFailed = -101,      // 写包持续失败超过阈值：推流断开 / 网络阻塞 / 磁盘写满。
+                                      // extra = 持续失败的毫秒数。
+                                      // 内核不会自动重连：FFmpeg 的 I/O 错误是粘性的，出错后同一个连接
+                                      // 不会再写成功。宿主应 Stop() 后重新 Prepare/Start（Stop 不会被卡住）
+};
+
 enum VideoCapMode
 {
     NONE = -1,
@@ -241,6 +258,12 @@ struct MuxerParams
     std::string muxerOutput;          // rtmp:// srt:// 或文件路径
     // 音视频交织阈值：领先的一方暂停写入，等落后的一方追上（0 = 关闭）
     int interleaveMs = 350;
+    // 连接 / 握手阶段（Prepare 里打开输出）的最长等待。超时 Prepare 返回 -5，不会一直卡住。0 = 用默认 10000
+    int connectTimeoutMs = 10000;
+    // 运行期单次写包的最长阻塞。网络卡死时超时打断，Stop 不会被卡住。0 = 用默认 5000
+    int ioTimeoutMs = 5000;
+    // 写包持续失败多久后上报 TGErr_MuxWriteFailed。0 = 用默认 3000
+    int writeFailReportMs = 3000;
 };
 
 struct PauseParams

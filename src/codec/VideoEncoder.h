@@ -32,8 +32,6 @@ struct ID3D11Texture2D;
 
 namespace TGCapture
 {
-class Muxer;
-
 namespace codec
 {
 
@@ -47,7 +45,6 @@ public:
     int Open(const VideoEncoderParams& params, const core::VideoMediaType& srcType);
     void Close();
 
-    void SetMuxer(Muxer* muxer) noexcept { m_muxer = muxer; }
     void SetSyncClock(std::shared_ptr<core::AVSync> sync) { m_sync = std::move(sync); }
     void SetMaxLagUs(int64_t us) noexcept { m_maxLagUs = us; }
 
@@ -64,12 +61,12 @@ public:
     // GPU 模式下，需要变换或分辨率不一致时是否允许回读到内存处理
     void SetGpuReadbackFallback(bool allow) noexcept { m_gpuReadbackFallback = allow; }
 
-    // BusNode
+    // BusNode：编码后的包经 Forward 交给链上的下一个节点（muxer）；
+    // 下游积压用基类的 DownstreamPending() 查询，用于背压
     bool Submit(core::FramePtr frame) override;
-    size_t Pending() const override;
-
-    // 背压：下游（muxer）积压过多时上游可减速
-    size_t DownstreamPending() const;
+    [[nodiscard]] size_t Pending() const override;
+    // Flush：丢弃编码队列积压；RequestKeyFrame：下一帧强制输出 IDR
+    bool OnCommand(const core::BusCommand& command) override;
 
     [[nodiscard]] AVCodecContext* CodecContext() const noexcept { return m_ctx; }
     [[nodiscard]] bool IsOpened() const noexcept { return m_ctx != nullptr; }
@@ -140,7 +137,7 @@ private:
     std::shared_ptr<core::AVSync> m_sync;
     int64_t m_maxLagUs = 120000;  // 视频落后音频超过 120ms 则丢帧
 
-    Muxer* m_muxer = nullptr;  // 非拥有
+    std::atomic_bool m_forceKeyFrame{false};   // RequestKeyFrame 置位，EncodeOne 消费
 
     std::atomic<uint64_t> m_encoded{0};
     std::atomic<uint64_t> m_dropped{0};

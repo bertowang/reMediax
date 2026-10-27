@@ -44,17 +44,29 @@ TGCapturer::TGCapturer(GameID gameId) : m_gameId(gameId)
     m_videoEncoder->SetSyncClock(m_sync);
     m_audioEncoder->SetSyncClock(m_sync);
 
-    // 总线：采集 -> 编码器 -> 封装
+    // 总线拓扑：采集 → video_encoder / audio_encoder → muxer
+    // 数据、命令、事件都走这一条总线（见 core/Bus.h）；拓扑只在这里建立，运行期只读
     m_bus.Register("video_encoder", m_videoEncoder);
     m_bus.Register("audio_encoder", m_audioEncoder);
-    m_videoEncoder->LinkNext(nullptr);  // 编码器直接投递给 muxer
-    m_audioEncoder->LinkNext(nullptr);
+    m_bus.Register("muxer", m_muxer);
+    const bool linked = m_bus.Link("video_encoder", "muxer") && m_bus.Link("audio_encoder", "muxer");
+    if (!linked) {
+        TG_LOGE("TGCapturer: 总线拓扑建立失败（video/audio_encoder → muxer）");
+    }
+    m_videoIn = m_bus.Get("video_encoder");
+    m_audioIn = m_bus.Get("audio_encoder");
+
+    // 事件：错误 / 通知 / 生命周期统一从总线分发，OnBusEvent 里做联动并转给宿主回调
+    m_bus.Subscribe([this](const core::BusEvent& event) { OnBusEvent(event); });
 }
 
 TGCapturer::~TGCapturer()
 {
     Stop();
     ReleaseAll();
+    // 先停事件分发再销毁成员：订阅者捕获了 this。
+    // 若本析构就发生在某个宿主回调里（分发线程内），Shutdown 会分离线程而不是 join 自己
+    m_bus.Events().Shutdown();
 }
 
 // ------------------------------------------------------------------ 采集源
@@ -324,7 +336,7 @@ void TGCapturer::MixLoop(std::stop_token token)
             const auto ms = m_mixer->Stats();
             TG_LOGI("TGCapturer: 心跳 avDiff=%lldms force=%llu adapt=%llu clamp=%llu "
                     "stall=%llu skip=%llu jump=%llu staleReset=%llu bpDrop=%llu "
-                    "mix[out=%llu wait=%llu reanchor=%llu/%lldms]|%s",
+                    "bus[pend=%zu evDrop=%llu] mix[out=%llu wait=%llu reanchor=%llu/%lldms]|%s",
                     static_cast<long long>(vs.avDiffUs / 1000),
                     static_cast<unsigned long long>(vs.forceSynced),
                     static_cast<unsigned long long>(vs.adapted),
@@ -334,6 +346,8 @@ void TGCapturer::MixLoop(std::stop_token token)
                     static_cast<unsigned long long>(vs.jumpWarns),
                     static_cast<unsigned long long>(vs.staleResets),
                     static_cast<unsigned long long>(m_bpDropped.load()),
+                    m_bus.TotalPending(),
+                    static_cast<unsigned long long>(m_bus.Events().Dropped()),
                     static_cast<unsigned long long>(ms.outputFrames),
                     static_cast<unsigned long long>(ms.waitTimeouts),
                     static_cast<unsigned long long>(ms.reanchors),
@@ -363,7 +377,7 @@ void TGCapturer::MixLoop(std::stop_token token)
             m_audioClock->AdvanceTo(ptsUs + static_cast<int64_t>(m_audioFrameSize) * 1000000LL /
                                                 sampleRate);
         }
-        m_bus.Dispatch("audio_encoder", std::move(frame));
+        m_audioIn->Submit(std::move(frame));
     }
 }
 
@@ -404,11 +418,31 @@ int TGCapturer::SetupMuxer(const MuxerParams& params)
     return 0;
 }
 
-void TGCapturer::SetOnPreparedCallback(OnPreparedCallback cb) { m_onPrepared = std::move(cb); }
-void TGCapturer::SetOnErrorCallback(OnErrorCallback cb) { m_onError = std::move(cb); }
-void TGCapturer::SetOnStartCallback(OnStartCallback cb) { m_onStart = std::move(cb); }
-void TGCapturer::SetOnStopCallback(OnStopCallback cb) { m_onStop = std::move(cb); }
-void TGCapturer::SetOnNotifyCallback(OnNotifyCallback cb) { m_onNotify = std::move(cb); }
+void TGCapturer::SetOnPreparedCallback(OnPreparedCallback cb)
+{
+    std::lock_guard<std::mutex> lock(m_callbackMutex);
+    m_onPrepared = std::move(cb);
+}
+void TGCapturer::SetOnErrorCallback(OnErrorCallback cb)
+{
+    std::lock_guard<std::mutex> lock(m_callbackMutex);
+    m_onError = std::move(cb);
+}
+void TGCapturer::SetOnStartCallback(OnStartCallback cb)
+{
+    std::lock_guard<std::mutex> lock(m_callbackMutex);
+    m_onStart = std::move(cb);
+}
+void TGCapturer::SetOnStopCallback(OnStopCallback cb)
+{
+    std::lock_guard<std::mutex> lock(m_callbackMutex);
+    m_onStop = std::move(cb);
+}
+void TGCapturer::SetOnNotifyCallback(OnNotifyCallback cb)
+{
+    std::lock_guard<std::mutex> lock(m_callbackMutex);
+    m_onNotify = std::move(cb);
+}
 
 void TGCapturer::SetPrivateData(const std::string& key, void* data)
 {
@@ -436,9 +470,28 @@ void TGCapturer::SetPrivateData(const std::string& key, void* data)
 }
 
 // ------------------------------------------------------------------ 生命周期
+// 生命周期入口只做"加锁 → 干活 → 解锁 → 通知"：宿主回调（Prepared / Error / Started / Stopped）
+// 一律在解锁之后、经总线触发。之前回调在持锁状态下被调用，宿主若在回调里等待另一个
+// 同样要调用本对象接口的线程，就会死锁。
+// 回调仍然在调用方线程上同步执行（宿主在 Prepared 回调里调 Start 的用法保持不变）。
 int TGCapturer::Prepare()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_lifecycleMutex);
+    PrepareError err;
+    int ret;
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_lifecycleMutex);
+        ret = PrepareLocked(err);
+    }
+    if (ret == 0) {
+        m_bus.PublishSync(core::BusEventType::Prepared, "capturer", 0, {});
+    } else if (err.what != 0) {
+        m_bus.PublishSync(core::BusEventType::Error, "capturer", err.what, err.message);
+    }
+    return ret;
+}
+
+int TGCapturer::PrepareLocked(PrepareError& err)
+{
     // 检查与置位在同一个临界区内原子完成：并发两次 Prepare 只有一个能进
     State expected = State::Idle;
     if (!m_state.compare_exchange_strong(expected, State::Preparing)) {
@@ -447,7 +500,7 @@ int TGCapturer::Prepare()
     }
 
     if (!m_videoParamsSet || !m_audioParamsSet || !m_muxParamsSet) {
-        FireError(-1, 0, "encoders or muxer not configured");
+        err = {TGErr_NotConfigured, "encoders or muxer not configured"};
         m_state.store(State::Idle);
         return -2;
     }
@@ -590,7 +643,7 @@ int TGCapturer::Prepare()
     audioType.SetFrameSize(1024);
 
     if (m_videoEncoder->Open(m_videoParams, videoType) < 0) {
-        FireError(-3, 0, "open video encoder failed");
+        err = {TGErr_OpenVideoEncoder, "open video encoder failed"};
         m_state.store(State::Idle);
         return -3;
     }
@@ -609,7 +662,7 @@ int TGCapturer::Prepare()
 #endif
     if (m_audioEnabled) {
         if (m_audioEncoder->Open(m_audioParams, audioType) < 0) {
-            FireError(-4, 0, "open audio encoder failed");
+            err = {TGErr_OpenAudioEncoder, "open audio encoder failed"};
             m_state.store(State::Idle);
             return -4;
         }
@@ -617,12 +670,9 @@ int TGCapturer::Prepare()
         TG_LOGI("TGCapturer: 纯视频模式（audio disabled）");
     }
 
-    m_videoEncoder->SetMuxer(m_muxer.get());
-    m_audioEncoder->SetMuxer(m_muxer.get());
-
     if (m_muxer->Open(m_muxParams, m_videoEncoder->CodecContext(),
                       m_audioEnabled ? m_audioEncoder->CodecContext() : nullptr) < 0) {
-        FireError(-5, 0, "open muxer failed");
+        err = {TGErr_OpenMuxer, "open muxer failed"};
         m_state.store(State::Idle);
         return -5;
     }
@@ -648,21 +698,26 @@ int TGCapturer::Prepare()
     }
 
     m_state.store(State::Prepared);
-    if (m_onPrepared) {
-        m_onPrepared(this);
-    }
     return 0;
 }
 
 int TGCapturer::Start()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_lifecycleMutex);
-    State expected = State::Prepared;
-    if (!m_state.compare_exchange_strong(expected, State::Starting)) {
-        TG_LOGW("TGCapturer: Start 状态错误 state=%d", static_cast<int>(m_state.load()));
-        return -1;
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_lifecycleMutex);
+        State expected = State::Prepared;
+        if (!m_state.compare_exchange_strong(expected, State::Starting)) {
+            TG_LOGW("TGCapturer: Start 状态错误 state=%d", static_cast<int>(m_state.load()));
+            return -1;
+        }
+        StartLocked();
     }
+    m_bus.PublishSync(core::BusEventType::Started, "capturer", 0, {});
+    return 0;
+}
 
+void TGCapturer::StartLocked()
+{
     if (!m_muxer->Start()) {
         TG_LOGW("TGCapturer: muxer 线程启动异常（可能上一轮未停止干净）");
     }
@@ -685,23 +740,36 @@ int TGCapturer::Start()
     }
 
     m_state.store(State::Running);
-    if (m_onStart) {
-        m_onStart();
-    }
     TG_LOGI("TGCapturer: 已启动");
-    return 0;
 }
 
 void TGCapturer::Stop()
 {
-    // 与 Prepare / Start 共用同一把锁：三者不会交错执行，
-    // 从根上消除"Stop 跑完时 Start 还没启动线程"造成的野线程。
-    std::lock_guard<std::recursive_mutex> lock(m_lifecycleMutex);
-    const State cur = m_state.load();
-    if (cur == State::Idle || cur == State::Stopping) {
-        return;
+    {
+        // 与 Prepare / Start 共用同一把锁：三者不会交错执行，
+        // 从根上消除"Stop 跑完时 Start 还没启动线程"造成的野线程。
+        std::lock_guard<std::recursive_mutex> lock(m_lifecycleMutex);
+        const State cur = m_state.load();
+        if (cur == State::Idle || cur == State::Stopping) {
+            return;
+        }
+        StopLocked();
     }
+    // 解锁之后：先让运行期积压的错误 / 通知被宿主看到，再告知已停止 ——
+    // 保证宿主看到的顺序是"…错误…Stopped"，而不是 Stopped 之后又冒出错误。
+    // （本函数若就在事件分发线程里被调用，Drain 会直接返回，不会等自己）
+    m_bus.Events().Drain();
+    m_bus.PublishSync(core::BusEventType::Stopped, "capturer", 0, {});
+}
+
+void TGCapturer::StopLocked()
+{
     m_state.store(State::Stopping);
+
+    // 封装层正在持续写失败（网络已断）：直接打断 I/O，别让收尾（写尾、关闭连接）再各等一个超时
+    if (m_muxer && m_muxer->IsFailing()) {
+        m_bus.Send("muxer", core::BusCommand{core::BusCommandType::Abort, 0});
+    }
 
     // 按数据流向逆序停止：先停采集，再 drain 编码器，最后收尾封装
     if (m_videoSource) {
@@ -748,9 +816,6 @@ void TGCapturer::Stop()
                 static_cast<unsigned long long>(m_bpDropped.load()));
     }
     m_state.store(State::Idle);
-    if (m_onStop) {
-        m_onStop(0);
-    }
     TG_LOGI("TGCapturer: 已停止");
 }
 
@@ -801,10 +866,11 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
 
     // 背压：编码器积压过多则丢帧，保证直播实时性
     constexpr size_t kMaxEncoderPending = 8;
-    if (m_videoEncoder->Pending() >= kMaxEncoderPending) {
+    const size_t encoderPending = m_videoIn->Pending();
+    if (encoderPending >= kMaxEncoderPending) {
         const auto n = m_bpDropped.fetch_add(1) + 1;
         TG_LOGW_THROTTLED(2000000, "TGCapturer: 编码器积压 %zu，丢帧（编码跟不上采集，bpDrop=%llu）",
-                          m_videoEncoder->Pending(), static_cast<unsigned long long>(n));
+                          encoderPending, static_cast<unsigned long long>(n));
         return;
     }
 
@@ -813,7 +879,7 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
         const int frameW = frame->width;
         const int frameH = frame->height;
         const int64_t framePts = frame->ptsUs;
-        if (!m_bus.Dispatch("video_encoder", std::move(frame))) {
+        if (!m_videoIn->Submit(std::move(frame))) {
             return;
         }
         if (!m_firstFrameSent.exchange(true)) {
@@ -899,7 +965,7 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
     const int height = frame->height;
     const int64_t pts = frame->ptsUs;
 
-    if (!m_bus.Dispatch("video_encoder", std::move(frame))) {
+    if (!m_videoIn->Submit(std::move(frame))) {
         return;
     }
 
@@ -1224,18 +1290,80 @@ float TGCapturer::GetTrafficStats()
 }
 
 // ------------------------------------------------------------------ 回调
+// 门面自己的错误 / 通知：异步发布，由总线的事件分发线程投递。
+// 采集 / 编码线程调用这里不会被宿主回调阻塞
 void TGCapturer::FireError(int32_t what, int32_t extra, const std::string& msg)
 {
-    TG_LOGE("TGCapturer: error what=%d extra=%d msg=%s", what, extra, msg.c_str());
-    if (m_onError) {
-        m_onError(what, extra, msg.c_str());
-    }
+    m_bus.Publish(core::BusEventType::Error, "capturer", what, msg, extra);
 }
 
 void TGCapturer::FireNotify(NotifyMsgType type, const std::string& content, int64_t data)
 {
-    if (m_onNotify) {
-        m_onNotify(type, content, data);
+    m_bus.Publish(core::BusEventType::Notify, "capturer", static_cast<int32_t>(type), content, 0, data);
+}
+
+// 总线事件的唯一出口：转给宿主回调（回调拷贝出来在锁外执行）。
+// 内核自己要对事件做联动反应时（例如收到 X 就给某个节点发命令），也加在这里。
+void TGCapturer::OnBusEvent(const core::BusEvent& event)
+{
+    switch (event.type) {
+        case core::BusEventType::Error: {
+            TG_LOGE("TGCapturer: error source=%s what=%d extra=%d msg=%s", event.source.c_str(),
+                    event.code, event.extra, event.message.c_str());
+            OnErrorCallback cb;
+            {
+                std::lock_guard<std::mutex> lock(m_callbackMutex);
+                cb = m_onError;
+            }
+            if (cb) {
+                cb(event.code, event.extra, event.message.c_str());
+            }
+            break;
+        }
+        case core::BusEventType::Notify: {
+            OnNotifyCallback cb;
+            {
+                std::lock_guard<std::mutex> lock(m_callbackMutex);
+                cb = m_onNotify;
+            }
+            if (cb) {
+                cb(static_cast<NotifyMsgType>(event.code), event.message, event.data);
+            }
+            break;
+        }
+        case core::BusEventType::Prepared: {
+            OnPreparedCallback cb;
+            {
+                std::lock_guard<std::mutex> lock(m_callbackMutex);
+                cb = m_onPrepared;
+            }
+            if (cb) {
+                cb(this);
+            }
+            break;
+        }
+        case core::BusEventType::Started: {
+            OnStartCallback cb;
+            {
+                std::lock_guard<std::mutex> lock(m_callbackMutex);
+                cb = m_onStart;
+            }
+            if (cb) {
+                cb();
+            }
+            break;
+        }
+        case core::BusEventType::Stopped: {
+            OnStopCallback cb;
+            {
+                std::lock_guard<std::mutex> lock(m_callbackMutex);
+                cb = m_onStop;
+            }
+            if (cb) {
+                cb(event.code);
+            }
+            break;
+        }
     }
 }
 

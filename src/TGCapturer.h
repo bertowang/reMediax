@@ -86,11 +86,25 @@ private:
         Stopping,
     };
 
+    // Prepare 的实际工作（持生命周期锁）。失败时通过 err 带出要上报的错误，
+    // 由外层在**解锁之后**同步触发 —— 宿主回调永远不在内部锁里被调用
+    struct PrepareError
+    {
+        int32_t what = 0;
+        std::string message;
+    };
+    int PrepareLocked(PrepareError& err);
+    void StartLocked();
+    void StopLocked();
+
     void OnVideoFrame(core::FramePtr frame);
     // 外部注入的音频（PushExternalAudioFrame）也进混流器
     void OnAudioFrame(AudioCapSourceType type, core::FramePtr frame);
+    // 经总线发布（异步：由事件分发线程投递，永不阻塞调用线程）
     void FireError(int32_t what, int32_t extra, const std::string& msg);
     void FireNotify(NotifyMsgType type, const std::string& content, int64_t data);
+    // 总线事件 → 内核自身的联动反应 + 宿主回调
+    void OnBusEvent(const core::BusEvent& event);
     void ReleaseAll();
 
     // 多路音频（麦克风 + 扬声器 …）：统一进 AudioMixer，由混音线程产出一路
@@ -151,14 +165,21 @@ private:
     // 只保留一个 **节流**日志闸门避免刷屏，不影响后续"音频恢复 → 自动切回主时钟"。
     int64_t m_audioWaitStartUs = 0;
 
-    // 内核
+    // 总线：必须声明在所有节点之前 —— 成员按声明逆序析构，总线最后销毁，
+    // 节点线程退出过程中发布的事件才不会落在已销毁的对象上
+    core::Bus m_bus;
+
+    // 内核（总线节点）。数据流：采集 → video_encoder / audio_encoder → muxer
     std::shared_ptr<codec::VideoEncoder> m_videoEncoder;
     std::shared_ptr<codec::AudioEncoder> m_audioEncoder;
     std::shared_ptr<Muxer> m_muxer;
     std::shared_ptr<core::AVSync> m_sync;
-    core::Bus m_bus;
+    // 热路径入口缓存：每帧不再按字符串名查表
+    core::BusNodePtr m_videoIn;
+    core::BusNodePtr m_audioIn;
 
-    // 回调
+    // 宿主回调：设置与调用可能在不同线程，用互斥保护。调用时先拷贝出来再在锁外执行
+    std::mutex m_callbackMutex;
     OnPreparedCallback m_onPrepared;
     OnErrorCallback m_onError;
     OnStartCallback m_onStart;

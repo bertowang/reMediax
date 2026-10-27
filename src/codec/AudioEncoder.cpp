@@ -2,7 +2,6 @@
 
 #include "core/AvError.h"
 #include "core/Logger.h"
-#include "mux/Muxer.h"
 
 extern "C"
 {
@@ -238,11 +237,28 @@ int AudioEncoder::Drain()
     return 0;
 }
 
+bool AudioEncoder::OnCommand(const core::BusCommand& command)
+{
+    if (command.type == core::BusCommandType::Flush) {
+        if (m_queue) {
+            m_queue->Clear();
+        }
+        return true;
+    }
+    return false;
+}
+
 void AudioEncoder::DeliverPacket(core::AVPacketPtr packet)
 {
-    if (m_muxer && packet) {
-        m_muxer->SubmitAudioPacket(std::move(packet));
+    if (!packet) {
+        return;
     }
+    auto out = std::make_shared<core::Frame>();
+    out->kind = core::MediaKind::Packet;
+    out->streamKind = core::MediaKind::Audio;
+    out->keyFrame = true;   // 音频包都可独立解码
+    out->packet = std::move(packet);
+    Forward(std::move(out));
 }
 
 }  // namespace TGCapture::codec

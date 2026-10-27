@@ -5,7 +5,6 @@
 
 #include "core/AvError.h"
 #include "core/Logger.h"
-#include "mux/Muxer.h"
 
 #ifdef _WIN32
 #include <d3d11.h>
@@ -444,9 +443,20 @@ size_t VideoEncoder::Pending() const
     return m_queue ? m_queue->Size() : 0;
 }
 
-size_t VideoEncoder::DownstreamPending() const
+bool VideoEncoder::OnCommand(const core::BusCommand& command)
 {
-    return m_muxer ? m_muxer->VideoPending() : 0;
+    switch (command.type) {
+        case core::BusCommandType::Flush:
+            if (m_queue) {
+                m_queue->Clear();
+            }
+            return true;
+        case core::BusCommandType::RequestKeyFrame:
+            m_forceKeyFrame.store(true);
+            return true;
+        default:
+            return false;
+    }
 }
 
 void VideoEncoder::Loop(std::stop_token token)
@@ -519,6 +529,12 @@ int VideoEncoder::EncodeOne(const core::FramePtr& frame)
                 avFrame->format, avFrame->width, avFrame->height);
     }
 
+    // 总线命令 RequestKeyFrame：libopenh264 / nvenc / x264 等都认 pict_type=I 作为强制 IDR 的信号
+    if (m_forceKeyFrame.exchange(false)) {
+        avFrame->pict_type = AV_PICTURE_TYPE_I;
+        TG_LOGI("VideoEncoder: 响应 RequestKeyFrame，本帧强制关键帧");
+    }
+
     int ret = avcodec_send_frame(m_ctx, avFrame.get());
     if (ret < 0) {
         TG_LOGE_THROTTLED(1000000, "VideoEncoder: send_frame 失败 %d (%s)", ret, core::AvErr(ret));
@@ -579,9 +595,15 @@ int VideoEncoder::DrainLocked()
 
 void VideoEncoder::DeliverPacket(core::AVPacketPtr packet)
 {
-    if (m_muxer && packet) {
-        m_muxer->SubmitVideoPacket(std::move(packet));
+    if (!packet) {
+        return;
     }
+    auto out = std::make_shared<core::Frame>();
+    out->kind = core::MediaKind::Packet;
+    out->streamKind = core::MediaKind::Video;
+    out->keyFrame = (packet->flags & AV_PKT_FLAG_KEY) != 0;
+    out->packet = std::move(packet);
+    Forward(std::move(out));
 }
 
 core::AVFramePtr VideoEncoder::BuildAVFrame(const core::FramePtr& frame)

@@ -23,8 +23,6 @@ extern "C"
 
 namespace TGCapture
 {
-class Muxer;
-
 namespace codec
 {
 
@@ -37,11 +35,12 @@ public:
     int Open(const AudioEncoderParams& params, const core::AudioMediaType& srcType);
     void Close();
 
-    void SetMuxer(Muxer* muxer) noexcept { m_muxer = muxer; }
     void SetSyncClock(std::shared_ptr<core::AVSync> sync) { m_sync = std::move(sync); }
 
+    // BusNode：编码后的包经 Forward 交给链上的下一个节点（muxer）
     bool Submit(core::FramePtr frame) override;
-    size_t Pending() const override;
+    [[nodiscard]] size_t Pending() const override;
+    bool OnCommand(const core::BusCommand& command) override;   // 支持 Flush
 
     [[nodiscard]] AVCodecContext* CodecContext() const noexcept { return m_ctx; }
     [[nodiscard]] bool IsOpened() const noexcept { return m_ctx != nullptr; }
@@ -73,7 +72,6 @@ private:
     std::unique_ptr<core::BoundedQueue<core::FramePtr>> m_queue;
     std::shared_ptr<core::AVSync> m_sync;
 
-    Muxer* m_muxer = nullptr;
     std::atomic<uint64_t> m_encoded{0};
     std::atomic<int64_t> m_encodeLatencyUs{0};   // capture → encode out EMA（μs）
     std::atomic_bool m_opened{false};
