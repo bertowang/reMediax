@@ -41,8 +41,8 @@ ffplay out.flv
 | - | - |
 | 采集（系统原生，不接 GVoice / 第三方 SDK） | 屏幕（Win `DXGI`/`GDI`、Android `MediaProjection`、iOS `ReplayKit`）、窗口（仅 Win `WGC`/`WGC_No_TBar`）、麦克风（Win `WASAPI`、Android `AudioRecord`、iOS `AVAudioEngine`）、扬声器/系统内录（Win loopback、Android `AudioPlaybackCapture` API 29+） |
 | 多源混流 | N 路按采样点加和；单路也走混流器（享受时钟校正）；某路掉线按静音补齐 |
-| 时钟校正 | 每路独立：系统时钟跳变限幅 → ForceAlign（>5 帧）→ BURST 收敛（>3 帧）→ PI 微调 |
-| 音画同步 | 音频为主时钟；视频 PTS 由音频反推；停滞 clamp、渐进追赶、封装交织自愈 |
+| 时钟校正 | 每路独立：5s 窗口测"调用方时间戳推进速率 vs 墙钟"的原始漂移 → swr 拉伸/压缩样本补偿；时间戳不可信（回退 / 速率偏离 >5%）则整路改用墙钟 |
+| 音画同步 | 音频为主时钟；视频 PTS 由音频反推；EMA 滤波 + 比例追赶 + 停滞 clamp；突发到达丢帧而非压缩 PTS；封装交织自愈 |
 | 编码 | 软编 `libopenh264` + `libfdk_aac`；硬编 `h264_nvenc` / `h264_amf` / `h264_mf` / `h264_mediacodec` / `h264_videotoolbox` |
 | 封装 | `flv`（rtmp/rtmps/文件）、`mpegts`（srt/文件）；协议 file / http(s) / rtmp(s) / tls / srt |
 | 性能模式 | `Cpu`（默认，内存帧 + CPU 缩放）、`Gpu`（全链路 GPU：显存直拷硬编） |
@@ -214,6 +214,13 @@ capturer->PushExternalAudioFrame(TGCapture::TypeOfGameMicphone4Slave, pcm, bytes
   音画同步责任随之转移到调用方。
 - 外部注入的音频会**独占一条混流通道**（追加在内部源之后），
   不会和 0 号麦克风共用同一个通道时钟。
+- 音频的 `ptsUs` 是**调用方与内核的时钟契约**，见 `ITGCapturer::PushExternalAudioFrame` 注释：
+  - 单调时钟域、单位微秒、表示**采集时刻**，且必须**严格递增**；
+  - 推进速率要跟随墙钟（真实设备时钟有 ppm 级偏差，由内核测量并补偿，不用调用方自己校）；
+  - 不知道就传 `-1`，内核改用到达时刻；
+  - 输出 PTS 由内核生成，与传入值不是同一个时间轴。
+  - 违反"严格递增"或"速率偏离 >5%"时内核会告警并**整路改用墙钟**（心跳里 `tsBad` / `fallback`），
+    此时该路的漂移补偿不再基于调用方时间戳。
 
 ### 4.5 参数总表
 
@@ -492,7 +499,7 @@ demo：`--rotate <0|90|180|270>` / `--flip <h|v|both>` / `--crop <w,h>`。
 | - | - | - |
 | `AudioTimestampManager`（音频即主时钟，按采样数推进） | `AudioClock` + `AudioMixer` 输出时间轴 | 已对齐 |
 | `ReferenceClockManager`（系统时钟跳变限幅 + PI/BURST） | `AudioChannelClock` | 已对齐 |
-| `VideoPtsManager` · RangeNormal / RangeAdapt / RangeCatchUp | `VideoPtsGenerator` 三档（见 5.1） | 已对齐 |
+| `VideoPtsManager` · RangeNormal / RangeAdapt / RangeCatchUp | `VideoPtsGenerator` Normal / Adapt / ForceAlign / Pause 四档（见 5.1） | 已对齐（Adapt 改为比例控制 + 滞回） |
 | `VideoPtsManager` · ForceAlign | 偏离 > 6×帧间隔时跳齐 | 已对齐（阈值更激进：6 帧 vs MediaX 5 帧量级） |
 | `VideoPtsManager` · Pause | 音频停滞 → 视频封顶 `maxLead` | 已对齐 |
 | BreakV / BreakA 交织自愈 | `Muxer` 交织 + stall 超时推基准 | 已对齐 |
@@ -500,16 +507,30 @@ demo：`--rotate <0|90|180|270>` / `--flip <h|v|both>` / `--crop <w,h>`。
 
 ### 5.1 视频 PTS 生成规则
 
-`avDiff = 音频 PTS − 视频 PTS`，**>0 表示视频落后**。分档对齐 `VideoPtsManager`：
+`avDiff = 音频 PTS −（视频上一帧 PTS + 帧间隔）`，**>0 表示视频落后**。
+用"本帧按标称间隔推进后"的 PTS 计算：若用上一帧 PTS，偏差会系统性偏大一个帧间隔，
+控制器会把视频推到超前约 1 帧处才平衡（表现为基线稳态偏差 -20~-40ms 且不收敛）。
+
+音频时钟按 1024 样本离散推进（44.1kHz 下 23.2ms 一跳），单帧 `avDiff` 自带 ±12ms 量化抖动，
+所以**先做 EMA（1/8）再判档**，否则 1 帧门限会被抖动反复触发。
 
 | 档位 | 触发条件（30fps 示例） | 处理 |
 | - | - | - |
-| **RangeNormal** | \|avDiff\| ≤ 2×帧间隔（≤66ms） | 按帧间隔正常递增 |
-| **RangeAdapt** | 2× ~ 6×帧间隔（66~200ms） | 渐进追赶 / 减速：落后 150/300/500ms → ×1.1/1.2/1.3；超前 → ×0.9/0.8/0.7 |
-| **ForceAlign** | > 6×帧间隔（>200ms） | 直接跳齐到音频 PTS（**不允许回退**） |
-| **Pause** | 音频连续 2 拍不推进 | 视频按系统时钟继续走，最多超前 `videoMaxLeadUs`（500ms）后钉住；补帧连续被 clamp 3 次则停产出 |
+| **RangeNormal** | \|EMA\| ≤ 1×帧间隔（≤33ms） | 按帧间隔递增 + 持续微调 `EMA / trimGainFrames`（120 帧 ≈ 4s 时间常数），把 1 帧内的残余偏差拉回 0 |
+| **RangeAdapt** | \|EMA\| > 1×帧间隔，回到 1/4 帧间隔（8ms）内才退出（滞回） | 比例控制：每帧修正 `avDiff / adaptGainFrames`（15 帧 ≈ 0.5s），限幅 ±30% 帧间隔。修正量用原始 `avDiff` 不用 EMA（EMA 有滞后，用它驱动会过冲） |
+| **ForceAlign** | 视频落后 > 6×帧间隔（>200ms） | 直接跳齐到音频 PTS（**不允许回退**） |
+| **突发丢帧** | 视频超前 > 2×帧间隔，且本帧是突发到达（距上一产出帧 < 1/4 帧间隔） | 返回无效 PTS 让调用方丢帧，**不压缩 PTS**（压缩会挤出 <10ms 的间隔） |
+| **Pause** | 音频停滞：`AudioClock::IdleUs() > stallIdleUs`（100ms） | 视频按系统时钟继续走，最多超前 `videoMaxLeadUs`（500ms）后钉住；补帧连续被 clamp 3 次则停产出；突发帧同样丢弃 |
 | 首帧 | — | 取音频 PTS；超过 5s 视为上一轮残留时间轴，从 0 重起 |
 | 音频不可用 | `audioRef < 0` | **不用系统时间顶替**，返回无效 PTS，由调用方决定丢帧或降级 |
+
+停滞判定按**墙钟**（`AudioClock::IdleUs()`）而不是"连续几个视频帧间音频没推进"：
+后者会把视频突发（若干帧在几 ms 内到达）误判成音频停滞，进而让 Pause 档按真实间隔推进、
+挤出 <10ms 的 PTS 间隔。拿不到墙钟时（`audioIdleUs < 0`）才退回按帧计数（`stallFrames = 2`）。
+
+相关参数（`VideoPtsParams`）：`maxLeadUs` 500000、`adaptStartFactor` 1、`adaptGainFrames` 15、
+`adaptMaxPermille` 300、`trimGainFrames` 120、`forceSyncFactor` 6、`jumpWarnFactor` 5、
+`stallIdleUs` 100000、`stallFrames` 2、`maxConsecutiveClampFill` 3、`staleTimelineUs` 5000000。
 
 单调递增是硬约束：`clamp` / `forceSync` / 采集时钟回退都走 `ClampMonotonic`
 （最小步长 = 帧间隔/10，下限 1ms），编码器侧再兜一次 `m_lastPtsUs`，
@@ -532,7 +553,8 @@ demo：`--rotate <0|90|180|270>` / `--flip <h|v|both>` / `--crop <w,h>`。
 | | 单路 ↔ 多路切换 | 输出时间轴连续，`AddChannel` 动态建重采样上下文 | 无需重启 |
 | **视频侧** | 帧率 0 / 帧间隔 ≤ 0 | 兜底 33333us（30fps） | 不除零 |
 | | 帧率突变（动态 fps、分辨率切换） | 帧间隔固定 → avDiff 累积 → 先 RangeAdapt 渐进，过大则 ForceAlign | 自动收敛 |
-| | 背压丢帧（编码器 Pending ≥ 8） | PTS 不推进，avDiff 变大后由同步档位纠正 | 追实时性，不累积延迟 |
+| | 采集卡顿恢复后突发灌帧（若干帧在几 ms 内到达） | 突发帧在视频超前时丢弃，不压缩 PTS | 不产生 <10ms 间隔，也不被误判成音频停滞 |
+| | 背压丢帧（编码器 Pending ≥ 8） | PTS 不推进，avDiff 变大后由同步档位纠正；计入 `bpDrop` | 追实时性，不累积延迟 |
 | | forceSync / clamp 需要回退 | `ClampMonotonic` + 编码器 `m_lastPtsUs` 双重保护 | 单调，不写坏文件 |
 | | 视频 muted | 直接丢弃，不推进 PTS；恢复时靠 ForceAlign 跳齐 | 不产生空档 |
 | **封装侧** | 某一路领先超过 `interleaveMs`（350ms） | 暂停写该路，等另一路追上 | 交织均衡 |
@@ -546,7 +568,7 @@ demo：`--rotate <0|90|180|270>` / `--flip <h|v|both>` / `--crop <w,h>`。
 停止时打印一行，用来判断链路是否健康：
 
 ```
-TGCapturer: 音画同步 avDiff=-13ms clamp=0 forceSync=0 adapt=0 stall=0 skip=0 jump=0 staleReset=0 syncDrop=0
+TGCapturer: 音画同步 avDiff=-13ms clamp=0 forceSync=0 adapt=0 stall=0 skip=0 jump=0 staleReset=0 syncDrop=0 bpDrop=0
 ```
 
 | 字段 | 含义 | 健康区间 |
@@ -554,12 +576,13 @@ TGCapturer: 音画同步 avDiff=-13ms clamp=0 forceSync=0 adapt=0 stall=0 skip=0
 | `avDiff` | 音频 − 视频（>0 视频落后） | 绝对值 < 100ms |
 | `clamp` | 被 clamp 到 audio+maxLead 的次数 | 偶发可接受，持续增长说明音频长期停滞 |
 | `forceSync` | ForceAlign 直接跳齐的次数 | 少量正常，频繁说明音频时钟不稳 |
-| `adapt` | RangeAdapt 渐进追赶 / 减速的次数 | 少量正常；持续增长说明帧率与音频长期不匹配 |
+| `adapt` | RangeAdapt 步长确实被修正的次数 | 少量正常；持续增长说明帧率与音频长期不匹配 |
 | `stall` | 判定"音频停滞"的次数 | 纯静音场景会增长，属预期 |
-| `skip` | 建议丢弃的补帧 | 同上 |
+| `skip` | 建议丢弃的帧（补帧连续被 clamp + 视频突发超前） | 卡顿恢复期增长属预期 |
 | `jump` | 音频 PTS 跳变 / 回退告警 | 0 最佳 |
 | `staleReset` | 首帧命中残留时间轴的次数 | 0 最佳 |
-| `syncDrop` | 因音频停滞丢掉的视频帧 | 0 最佳 |
+| `syncDrop` | 视频超前音频（突发到达 / 音频停滞）被丢掉的帧 | 0 最佳 |
+| `bpDrop` | 编码器背压（Pending 超上限）丢掉的帧 | 0 最佳；非 0 说明 CPU 或码率跟不上 |
 
 ### 5.4 设计约束：同步只有一个决策点
 
@@ -588,16 +611,39 @@ TGCapturer: 音画同步 avDiff=-13ms clamp=0 forceSync=0 adapt=0 stall=0 skip=0
 | 能力 | 说明 |
 | - | - |
 | N 路混合 | 按采样点加和（32 位累加后饱和到 S16） |
-| 缺数据 | 该路按静音补齐，不拖停整体时间轴 |
-| 格式归一 | 采样率/声道不一致时用 swresample 归一到输出格式 |
-| 时间轴 | 输出 PTS 由**输出采样率固定推进** |
+| 缺数据 | 该路本帧按静音处理，已有残余数据保留到下一帧（不丢样本），不拖停整体时间轴 |
+| 格式归一 + 补偿 | swresample 始终创建（**即使格式一致也走重采样器**），归一 + 漂移补偿同在此处完成 |
+| 时间轴 | 输出 PTS = `base + 已输出样本数 / 输出采样率`，与实际样本数严格一致 |
 | 线程安全 | `Push`（采集线程）与 `Mix`（混流线程）之间加锁 |
 
-**时钟校正（AudioChannelClock，每路独立）**
+**出帧条件（输出时钟）**
+
+所有"活跃通道"（`kChannelIdleUs` = 200ms 内推过数据）都凑够一帧才出帧；有通道迟到时最多等
+`kMixWaitFrames` = 2 帧（墙钟超时 或 就绪通道已积压 2 帧，任一满足即出帧）。
+旧实现"任一路凑够即出帧"在多路相位错开时会让每路各自触发出帧，输出帧数 ≈ 各路帧数之和。
+
+**设备时钟漂移测量与补偿（每路独立）**
+
+各路设备时钟相对墙钟的漂移**在样本域纠正**，不改写 PTS、也不尾部复制/截断样本（会有咔声）：
+
+| 环节 | 做法 |
+| - | - |
+| 测量 | 5s 一个窗口，取窗口内"调用方时间戳 − 墙钟"偏移的平均值，相邻窗口均值之差即本窗口漂移（抖动被平均掉，不累积） |
+| 补偿 | 下发给 `swr_set_compensation` 平滑伸缩样本 |
+| 限速 | 每秒最多伸缩 5ms（≈0.5% 变速，不可闻）；`\|待补偿量\|` ≥ 2ms 才下发，两次下发至少间隔 1s，待补偿量上限 50ms |
+| 缓冲上限 | 每路 300ms，超出一次性丢到一半（减少断点次数），计入 `ovf` |
+| 超前上限 | 输出时间轴最多超前墙钟 200ms |
+| 全路断流恢复 | 输出落后墙钟 > 500ms 时按墙钟前移输出 PTS（只前移不回退），计 `reanchor` |
+
+**时间戳可信性**：调用方时间戳推进速率相对墙钟偏离 > 5%（`kTsRateTolPermille = 50`），
+或时间戳未严格递增时，判定该路时间戳不可信 —— 打一条 Warn 并**整路改用墙钟**驱动
+（`tsBad` / `fallback`），避免把错误的时钟域带进时间轴。
+
+**诊断统计（`AudioChannelClock` 的 PI/BURST 保留为诊断，不再写输出 PTS）**
 
 | 偏差 | 处理 | 计数 |
 | - | - | - |
-| 系统时钟跳变/冻结（>2s） | 限幅吸收，不一次性追赶 | `jumpCount` |
+| 系统时钟跳变/冻结（>2s） | 限幅吸收（单次参考时钟推进上限 2s），不一次性追赶 | `jumpCount` |
 | \|drift\| > 5×帧时长 | ForceAlign 直接对齐 | `forceCount` |
 | \|drift\| > 3×帧时长 | BURST 步进收敛，每次最多 1 帧时长 | `burstCount` |
 | 其余 | PI 微调（比例 + 积分），每帧最多修正 1/4 帧时长 | `piCount` |
@@ -782,7 +828,7 @@ cd build\windows-x64\Release
 
 ```
 [demo] 最终统计: {"codec":"...","encoded":N,"dropped":0,"pending":0}
-[TGCapturer] 音画同步 avDiff=…ms clamp=0 forceSync=0 adapt=0 stall=0 skip=0 jump=0 staleReset=0 syncDrop=0
+[TGCapturer] 音画同步 avDiff=…ms clamp=0 forceSync=0 adapt=0 stall=0 skip=0 jump=0 staleReset=0 syncDrop=0 bpDrop=0
 ```
 
 ### 10.3 产物校验
@@ -798,6 +844,9 @@ ffplay out.flv                      # 实际播放确认音画同步
 然后 `--out rtmp://127.0.0.1/live/stream`。
 
 ### 10.4 Windows 实测结果（当前版本）
+
+> 以下除"音画同步"一行外均为既有结果；音画同步的判据已随本次修复收紧
+> （基线稳态 `avDiff` 由 ±25ms 收敛到 ±12ms），Windows 侧待复测后更新数值。
 
 | 用例 | 结果 |
 | - | - |
@@ -835,6 +884,7 @@ Linux 没有原生采集，但是**整条编码 / 封装 / 混流 / 音画同步
 | `--audio-pts-jitter-ms <N>` | 0 | 音频 PTS ±N ms 随机抖动（模拟采集端时间戳不准） |
 | `--audio-pts-back-every <K>` | 0 | 每 K 个音频帧将 PTS 回退 1 帧时长（模拟设备时钟回退） |
 | `--video-stall-start <s> --video-stall-dur <s>` | 0 0 | 视频从第 s 秒起暂停 dur 秒不推帧 |
+| `--video-stall-mode <m>` | burst | `freeze` = 卡顿期间的帧直接丢弃；`burst` = 卡顿期间的帧积压，恢复后一次性灌入（模拟采集卡顿恢复） |
 | `--out <url>` | out.flv | 输出（`.flv` / `.ts` / `rtmp://…` / `srt://…`） |
 | `--seconds <n>` | 10 | 运行秒数；`0` = 直到视频 EOF |
 | `--w --h --fps --bitrate` | 1280 720 30 3000000 | 编码参数 |
@@ -846,8 +896,14 @@ Linux 没有原生采集，但是**整条编码 / 封装 / 混流 / 音画同步
 `--audio*-speed` 用于**压测音源节奏异常**（内核应持续吸收 drift）：
 - PTS 固定按采样数累加（`1024/44100 ≈ 23.22ms`/块），单调推进
 - wallclock 触发间隔 = `23.22ms / speed`，`speed>1` 加密触发（源产太快），`speed<1` 疏松触发（源产太慢）
-- Mixer `AudioChannelClock` 看到 `driftUs = refPts(wallclock) - currentPts(samples)`，按偏差大小分档 PI / BURST / ForceAlign 校正
-- VideoPtsGenerator 侧对视频 PTS 做 `adapt`（RangeAdapt 渐进追赶）/ `forceSync`（强制跳齐）
+- 混流器 5s 窗口测出该路漂移后，用 swr 平滑伸缩样本补偿（每秒最多 5ms），
+  补偿不掉的部分由欠载 / 缓冲上限吸收，统计落在 `drift` / `comp` / `drop` / `ovf`
+- VideoPtsGenerator 侧对视频 PTS 做 `adapt`（RangeAdapt 比例追赶）/ `forceSync`（强制跳齐）
+
+推送节奏本身用浮点步长（`due = seq × 帧长`）而非整数累加：整数累加的截断误差相当于
+凭空注入约 -41ppm 的漂移，会让本该干净的基线也出现 `adapt`。
+每路一个独立预读线程 + 有界队列（约 500ms），主循环只从队列取块，
+某一路管道抖动不会拖住其它路的节奏（旧实现单线程阻塞 `fread`，三路会一起停）。
 
 #### 典型用例
 
@@ -893,54 +949,77 @@ cd build/linux-x86_64
 **运行期心跳（10s / 条，MixLoop 发出）** — 长压测时在时间轴上就能看到 drift 分布，不用等 Stop 聚合：
 
 ```
-[I] TGCapturer: 心跳 avDiff=118ms force=193 adapt=898 clamp=0 stall=0 skip=0 jump=0 staleReset=0
-  | ch0[drift=0ms  pi=1636 burst=1 force=0 jump=0 under=1671 comp=0ms drop=0ms buf=0]
-  | ch1[drift=0ms  pi=1841 burst=2 force=0 jump=0 under=1465 comp=0ms drop=0ms buf=0]
+[I] TGCapturer: 心跳 avDiff=-1ms force=0 adapt=0 clamp=0 stall=0 skip=0 jump=0 staleReset=0 bpDrop=0
+    mix[out=2569 wait=0 reanchor=0/0ms]| ch0[drift=0us/5s jump=0 under=0 comp=0ms drop=0ms ovf=0ms tsBad=0 buf=1007]
+    ch1[drift=0us/5s jump=0 under=0 comp=0ms drop=0ms ovf=0ms tsBad=0 buf=1007]
 ```
 
-- 外层（视频 PTS 生成器）：`avDiff` < 1 帧时长 OK；`forceSync/adapt` 持续累加表明内核在吸收 drift
+- 外层（视频 PTS 生成器）：`avDiff` < 1 帧时长 OK；`force/adapt` 持续累加表明内核在吸收 drift
+- `mix[]`：`out` 已输出帧数；`wait` 等待迟到通道超时后出帧的次数；`reanchor` 断流恢复后前移时间轴的次数/累计量
 - `ch<N>`（每路音频独立）：
-  - `drift` 当前瞬时偏差（参考时钟 − 本路时钟）；稳态下近 0，`pi` 持续增长说明 PI 在吃掉偏差（校正真在工作）
-  - `burst/force` 一次性启动尖峰正常；稳态连增表示 drift 太大 PI 吃不下
-  - `under` 持续增长说明本路补货率 < Mix 消费率（部分段靠静音补齐）
-  - `comp/drop` 样本级补/丢累计（限速 5ms/s）
-  - `buf` 该路 pcm 积压；长期非 0 表示积压可能死锁
-- `clamp / stall / skip / jump / staleReset / syncDrop` 应恒为 0 — 任何非零都要查
+  - `drift` 最近一个 5s 窗口测得的漂移；稳态下近 0
+  - `under` 活跃但迟到的次数；持续增长说明本路补货率 < Mix 消费率（部分段按静音处理）
+  - `comp` / `drop` swr 拉伸 / 压缩的累计量（限速 5ms/s）；`ovf` 缓冲超上限丢弃量
+  - `tsBad` 时间戳不可信次数，带 `(wall)` 表示已改用墙钟驱动
+  - `buf` 该路 pcm 积压帧数；长期接近上限说明消费不过来
+- `clamp / force / adapt / stall / skip / jump / staleReset / bpDrop` 基线场景应恒为 0 — 任何非零都要查
 
 **结束聚合（Stop 时一次性输出）**：
 
 ```
-[I] TGCapturer: 音画同步 avDiff=85ms clamp=0 forceSync=8480 adapt=39482 stall=0 skip=0 jump=0 staleReset=0 syncDrop=0
-[I] VideoEncoder: 线程退出 codec=libopenh264 encoded=... dropped=0 latency_us=...
-[I] AudioEncoder: 线程退出 codec=libfdk_aac encoded=... latency_us=...
-[demo] 输出=... 视频帧=... 音频1=... 音频2=... 拒绝=...
+[I] TGCapturer: 混流汇总 out=2583 wait=0 reanchor=0/0ms
+[I] TGCapturer: 混流通道 0 under=0 comp=0ms drop=0ms ovf=0ms drift=0us/5s tsBad=0 fallback=0 jump=0
+[I] TGCapturer: 混流通道 1 under=0 comp=0ms drop=0ms ovf=0ms drift=0us/5s tsBad=0 fallback=0 jump=0
+[I] TGCapturer: 音画同步 avDiff=0ms clamp=0 forceSync=0 adapt=0 stall=0 skip=0 jump=0 staleReset=0 syncDrop=0 bpDrop=0
+[demo] 输出=A.flv 视频帧=1800 音频1=2584 音频2=2584 拒绝=0 resync=0 freeze丢帧=0 预读欠载=v0/a0/a0
 ```
 
 **demo 推送心跳（30s / 条）** — 验证 demo 自身仍在供帧 + 校核 speed 效果：
 
 ```
-[demo] t=60.001s video+901(=1801) a1+1227(=2455) a2+1383(=2766) rej=0
+[demo] t=30.000s video+901(=1801) a1+1227(=2455) a2+1383(=2766) rej=0 resync=0 underflow=v0/a0/a0
 ```
 
 `a2+ / a1+` 比值应接近 `audio2-speed / audio1-speed`（本例 `1383/1227≈1.126 ≈ 1.07/0.95`）。
+`underflow=v/a/a` 是三路预读队列被取空的次数（非 0 说明该路供给跟不上）；
+`resync` 是落后超过 200ms 后重新对齐系统时钟的次数。
 
-**运行期告警**：每 3 秒节流一条 `混流取不到数据（当前通道数 N，帧长 1024）` 是**正常运行节律**（Mix 消费率略高于补货率时，MixLoop 轻度 sleep 等待），不是错误。
+**运行期告警**：`混流超过 500ms 无输出（当前通道数 N，全部断流或未推数据）` 才是异常
+—— 只在持续 500ms 没有任何输出时才提示（3s 节流一条）。
+混流按输出时钟出帧，轮询时取空属于正常节律，不需要告警。
 
 #### 故障注入矩阵（压测用）
 
-| 场景 | 命令片段 | 预期心跳信号 |
+每个场景 60s，都带 `--video-loops 0 --audio1-loops 0`：
+
+| 场景 | 命令片段 | 预期信号（实测 60s） |
 | - | - | - |
-| **A** 基线 | （不加故障参数） | `ch burst=0 jump=0 under=2` 全程 0 |
-| **B** 音频 drift | `--audio1-speed 0.95 --audio2-speed 1.05` | 慢路 `under` 持续线性增长（如 2069），视频侧 `forceSync` 累加 |
-| **C** 音频 PTS 抖动 | `--audio-pts-jitter-ms 100` | `ch drift≈±15ms burst≈120 jump≈1200 drop≈239ms` |
-| **D** 音频 PTS 回退 | `--audio-pts-back-every 100` | `ch comp≈100ms drop≈104ms`（样本级补偿） |
-| **E** 视频卡顿 | `--video-stall-start 20 --video-stall-dur 5` | 视频 `stall=20 jump=1 force=12`，`avDiff` 卡顿后翻负 |
+| **A** 基线 | （不加故障参数） | 全部计数为 0；`avDiff` 全程 ≤ ±12ms；`drift=0us/5s` |
+| **B** 音频 drift | `--audio1-speed 0.95 --audio2-speed 1.05` | 慢路 `under=117 comp=249ms`（补静音），快路 `ovf=2650ms drop=249ms`；`drift=±250ms/5s` |
+| **C** 音频 PTS 抖动 | `--audio-pts-jitter-ms 100` | 两路 `tsBad=1 fallback=1`（时间戳未严格递增 → 改用墙钟）；之后 `drift≈0` |
+| **D** 音频 PTS 回退 | `--audio-pts-back-every 100` | 两路 `tsBad=1 fallback=1`；输出无断档（`aGap` 异常 0） |
+| **E** 视频卡顿 burst | `--video-stall-start 20 --video-stall-dur 5 --video-stall-mode burst` | `skip=140 force=1`；demo 侧 `预读欠载=v292`；卡顿期间 1 次 >100ms 间隔（卡顿本身） |
+| **E2** 视频卡顿 freeze | 同上 + `--video-stall-mode freeze` | demo 侧 `freeze丢帧=150`；内核 `skip=0`；`avDiff` 恢复后回 0 |
 
 每种故障**都有专属响应字段**：如果某场景跑出来跟 baseline 完全一样，说明通路没正确传递 PTS。
 
+#### 验收判据
+
+产物侧（用 `ffprobe` 导 `pts_time` 后统计）：
+
+| 指标 | 判据 |
+| - | - |
+| flv `Duration` | 接近 wallclock（能读到说明 trailer 正常写入；读不到说明进程没走完 `Stop`） |
+| 视频 PTS 间隔 < 10ms | **0 次**（这是本次修复的重点：突发帧压缩 PTS 会挤出这种间隔） |
+| 视频 PTS 间隔 > 100ms | 仅卡顿场景允许 1 次（卡顿本身） |
+| 音频 PTS 间隔异常（<16ms 或 >30ms） | 0 次 |
+| 最终 `avDiff` | ≤ ±12ms（音频时钟 1024 样本量化抖动下限） |
+
 #### 已知时间轴行为
 
-两路音频 `speed` 不同（相位错开触发 Mix）时，`AudioMixer::m_outputPtsUs` 以 Mix 调用频率累加，导致**输出 flv 的 Duration 元数据虚增**（本例 wallclock 29.8min → flv Duration 56:55）。`speed=1.0/1.0` 稳态下不触发（6s/10s 常态烟测 Duration ≈ wallclock）。推流链路里下游用的是实际 PTS 流而非 Duration 元数据，不影响推流本身；只有本地回放时间轴会偏。
+两路音频 `speed` 不同时，输出帧数由**输出时钟**决定而非各路之和
+（旧实现会让输出帧数 ≈ 各路帧数之和，60s 墙钟产出 114s 音频，flv Duration 虚增一倍）。
+改按 `base + 已输出样本数 / 采样率` 累加后，Duration 与 wallclock 一致（实测 60s → 60.02s）。
 
 ---
 
@@ -991,5 +1070,7 @@ cd build/linux-x86_64
 | 音频采集不填 `captureUs` | 通道时钟的参考时钟退化成常数，每帧触发 ForceAlign，drift 统计全废 | 三端音频采集都要填（`AudioMixer::Push` 有兜底，但采集端应主动填） |
 | `BoundedQueue::Close()` | 是**永久关闭**语义，不 `Reopen()` 的话后续 `Push` 全部失败 | 新增队列时在对应 `Open()` 里 `Reopen()`（见 4.7） |
 | 编码器里再加同步逻辑 | 与 `VideoPtsGenerator` 互相抵消 | 同步只有一个决策点，见 5.4 |
+| 本进程 `signal(SIGPIPE, SIG_IGN)` 后再起子进程 | 子进程继承 `SIG_IGN`，读端关闭时它只拿到 `EPIPE` 而不被终止；若子进程是无限循环源（如 `aloop=loop=-1`），`pclose` 会永久阻塞 | 退出路径要主动 kill 子进程再 `pclose`（见 `demo/linux/main.cpp` 的 `FfmpegPipe::Kill`）；跑完顺手确认没有残留 ffmpeg 占 CPU |
+| 算同步偏差时用"上一帧 PTS" | 偏差系统性偏大一个帧间隔，控制器会把视频推到超前约 1 帧处才平衡，基线永远不收敛 | 用"本帧按标称间隔推进后"的 PTS 计算，见 5.1 |
 | `Worker::Loop()` 抛异常 | 直接 `terminate`，不留日志 | 子类 `Loop` 目前没有 try/catch 兜底，新增循环体自己保证不抛 |
 | 改 `VideoEncoder::Close()` | 漏复位 `m_lastPtsUs` 会让重开的全视频帧被判成 PTS 回退丢弃 | 新增"随流状态"时一并考虑复位 |
