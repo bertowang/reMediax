@@ -51,6 +51,9 @@ public:
     ~WinAudioCapture() override;
 
     int Open(int sampleRate, int channels) override;
+    // 释放 WASAPI 端点与 COM。幂等；Close 之后再 Open 会重新走完整的 InitWASAPI。
+    // 没有它的话设备只在析构时才放，宿主 Stop 后设备仍被占用。
+    void Close() override;
     void SetVolume(float gain);
     void SetMuted(bool muted) noexcept { m_muted.store(muted); }
 
@@ -69,6 +72,9 @@ private:
 private:
     bool InitWASAPI();
     void ReleaseWASAPI();
+    // 释放端点相关对象（audioClient / captureClient / device / swr），保留 enumerator 与 COM 初始化。
+    // InitWASAPI 的失败分支与 RetryOpen 共用，避免两处各写一遍、各漏一点。
+    void ReleaseEndpoint();
     int  RetryOpen();                           // 对齐 MediaX::WinMMCapturer::RetryOpen，仅工作线程调用
     void RegisterDeviceNotify();                // 注册 IMMNotificationClient
     void UnregisterDeviceNotify();

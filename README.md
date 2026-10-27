@@ -68,14 +68,19 @@ TGCapture/
 │   ├── platform/ios/           ReplayKit 屏幕 + AVAudioEngine 麦克风（.mm）
 │   ├── TGCapturer.cpp          门面（状态机、回调、统计、背压）
 │   └── ITGCapturer.cpp         Create/Destroy/Init/UnInit
-├── demo/windows/               控制台测试 demo（第 10 节）
+├── demo/windows/ demo/linux/   控制台测试 demo（第 10 节）
+├── tests/                      单元测试 tg_tests（零依赖迷你框架，第 10.0 节）
 ├── cmake/Deps.cmake            TGCapture3rd 依赖定位
 ├── ide/android/                Android Studio 宿主工程（gradle + externalNativeBuild）
 ├── CMakeLists.txt
-└── scripts/build.py            构建脚本（windows/android/ios，含 --ide）
+├── CHANGELOG.md
+└── scripts/
+    ├── build.py                构建脚本（windows/android/ios/linux，含 --ide）
+    ├── accept_av.sh            音画同步验收（Linux demo，6 个场景自动判定）
+    └── ci.sh                   CI 入口（构建 → 单测 → 可选验收）
 ```
 
-数据流（总线串联，节点间有界队列 + 背压）：
+数据流（节点经 `Bus::Link` 串联，节点间有界队列 + 背压）：
 
 ```
 VideoSource ─┐
@@ -84,6 +89,29 @@ AudioSource ─┴─> AudioMixer ─> AudioEncoder ─┴─> Muxer ─> rtmp:/
                      ▲
               音频主时钟 ──> VideoPtsGenerator ──> 视频 PTS
 ```
+
+### 3.1 Bus：数据 / 命令 / 事件三个平面
+
+`core/Bus.h`。编码器与封装器都是 `BusNode`，由 `TGCapturer` 在构造时 `Register` + `Link`：
+`video_encoder → muxer`、`audio_encoder → muxer`。**节点之间不再互相持有指针**，新增节点
+（录制旁路、转码、统计）只需 `Register` + `Link`，不用改上游。
+
+| 平面 | 接口 | 语义 |
+| - | - | - |
+| 数据 | `BusNode::Submit(FramePtr)` / `Forward(FramePtr)` | 入队即返回；`Forward` 沿 `Link` 下游送；下游的积压通过 `DownstreamPending()` 反馈给背压 |
+| 命令 | `Bus::Send(name, cmd)` / `Broadcast(cmd)` | `Flush`（清队列）、`RequestKeyFrame`（视频编码器下一帧出 IDR）、`Abort`（Muxer 中断阻塞的 I/O）；节点在 `OnCommand` 里处理，不认识的返回 false |
+| 事件 | `BusNode::ReportError` / `ReportNotify` → `EventHub` | 异步分发线程 + 有界队列；`Publish` 永不阻塞，`PublishSync` 在调用线程执行 |
+
+事件平面的保证：
+
+- **Error 不丢**：队列满时先丢 Notify，Error 保留。
+- **订阅者抛异常不会杀死分发线程**。
+- `Drain` / `Shutdown` 可在订阅者内部调用（不会自己 join 自己）。
+- 宿主回调（Prepared / Error / Started / Stopped / Notify）**统一经事件平面触发，且不持有生命周期锁**
+  —— 回调里可以直接 `Stop()` / `Prepare()` / 销毁对象，不会死锁（见 4.7）。
+- 心跳日志里的 `bus[pend=… evDrop=…]` 是总线积压与事件丢弃数；`evDrop` 持续增长说明宿主回调太慢。
+
+> `m_bus` 在 `TGCapturer` 里声明在各节点之前，保证最后析构：节点析构时仍可能上报事件。
 
 ---
 
@@ -133,6 +161,20 @@ TGCapture::ITGCapturerMgr::UnInit();
 ```
 
 ### 4.2 生命周期与回调
+
+> 回调都不持有内部锁。线程：`OnPrepared` / `OnStart` / `OnStop`（以及 `Prepare` 失败时的 `Error`）在调用
+> `Prepare` / `Start` / `Stop` 的线程同步触发；运行期的 `Error` / `Notify` 在事件分发线程触发（见 3.1、4.7）。
+> `Error` 的 `what` 取自 `TGCaptureError`：
+>
+> | 码 | 含义 |
+> | - | - |
+> | `TGErr_NotConfigured` (-1) | 编码器 / 封装器参数没设全（`Prepare` 返回 -2） |
+> | `TGErr_OpenVideoEncoder` (-3) | 视频编码器打开失败 |
+> | `TGErr_OpenAudioEncoder` (-4) | 音频编码器打开失败 |
+> | `TGErr_OpenMuxer` (-5) | 封装器 / 推流地址打开失败 |
+> | `TGErr_MuxWriteFailed` (-101) | **运行期**写包持续失败超过 `writeFailReportMs`（断网 / 磁盘满 / 对端不收）；`extra` = 已持续毫秒数，每轮失败只上报一次 |
+>
+> 运行期出错**不会自动重连**：FFmpeg 的 I/O 错误是粘性的，宿主应 `Stop()` 后重新 `Prepare()`。
 
 | 阶段 | 方法 | 说明 |
 | - | - | - |
@@ -253,6 +295,9 @@ capturer->PushExternalAudioFrame(TGCapture::TypeOfGameMicphone4Slave, pcm, bytes
 | `muxer` | `flv` | `flv` / `mpegts` |
 | `muxerOutput` | — | `rtmp://` / `rtmps://` / `srt://` / 文件路径 |
 | `interleaveMs` | 350 | 音视频交织阈值，0 = 关闭 |
+| `connectTimeoutMs` | 10000 | 打开输出（含 RTMP 握手）的超时 |
+| `ioTimeoutMs` | 5000 | 单次读写超时（`rw_timeout` + 中断回调）；对端不收数据时 `Stop()` 最多等这么久 |
+| `writeFailReportMs` | 3000 | 写包持续失败多久后上报 `TGErr_MuxWriteFailed`；0 = 默认值 |
 
 ### 4.6 日志
 
@@ -397,9 +442,13 @@ Debug 日志在 Release 里也保留，好处是线上能临时打开排查。
 
 - `Prepare()` / `Start()` / `Stop()` / `ReleaseAll()` 由一把 `std::recursive_mutex` 串行化，
   状态转换用 `compare_exchange`，并发调用只有一个能生效。
-- **必须用 recursive_mutex**：`Prepare()` 内部会触发 `m_onPrepared` 回调，
-  而宿主的标准用法正是在回调里调 `Start()`（demo 就是这么写的），
-  同线程重入，普通 `std::mutex` 会自死锁。
+- **宿主回调不在锁内触发**：`Prepare` / `Start` / `Stop` 先在锁内完成状态切换，解锁后再通过
+  事件平面通知宿主，所以回调里调 `Start()`（demo 的写法）、`Stop()` 都是安全的。
+  `recursive_mutex` 仅为兼容同线程内部重入而保留。
+- `Stop()` 顺序：（Muxer 正处于写失败时先发 `Abort` 打断阻塞的 I/O）→ 逆序停各节点 → `EventHub::Drain`
+  → 触发 `OnStop`。因此 `OnStop` 一定排在此前所有 Error / Notify 之后。
+- 音频队列是 `DropOldest` 而不是 `Block`：封装器阻塞时若音频编码器堵在 `Submit` 里，
+  `Stop()` 先 join 它就会互等。
 - 帧回调（`OnVideoFrame` / `OnAudioFrameFrom`）与 `MixLoop` **不取锁**，
   只查 `m_state` 原子量 —— 否则停止流程 `join` 时会死锁。
 - 采集/编码/封装之间的队列本身是线程安全的（`BoundedQueue` 内部加锁）。
@@ -751,6 +800,17 @@ Windows 产物是 `flat` 布局（无 abi 层），`cmake/Deps.cmake` 按 abi �
 
 ## 10. 测试与验证
 
+### 10.0 自动化检查
+
+```bash
+python3 scripts/build.py --platform linux          # 同时编出 tg_tests 和 demo
+build/linux-x86_64/tg_tests                        # 单元测试（也可 ctest；可带名称过滤，如 tg_tests Bus）
+scripts/accept_av.sh                               # 音画同步验收（6 个场景并行，约 20s，失败返回非 0）
+```
+
+CI 平台里直接调 `scripts/ci.sh`（构建 → 单测；`TG_CI_ACCEPT=1` 再加验收，需要素材 `TG_MEDIA_DIR` 与系统 ffmpeg）。
+依赖目录由 `TG_3RD_ROOT` 指定（见 9.3）。仓库不绑定具体 CI 平台，没有提交 workflow 文件。
+
 ### 10.1 demo 参数
 
 ```powershell
@@ -1054,6 +1114,10 @@ cd build/linux-x86_64
   * **Android / iOS 的 `FrameWidth()` 是配置值而非真实尺寸**，
     与实际帧不一致时 GPU 路径会走回退（CPU 路径靠 sws 自适应）。
   * 摄像头源（`TypeOfSelfCamera`）枚举存在但**无实现**；`CreateLocalFileCapture` 是空壳。
+* **无自动重连**：封装器写失败后只上报 `TGErr_MuxWriteFailed`，由宿主决定 `Stop` + 重新 `Prepare`。
+  RTMP 真实断流（对端不收包、半开连接）下 `Stop()` 能否在 `ioTimeoutMs` 内返回，目前只用本地 TCP
+  黑洞服务验证过，未在真实 RTMP 服务上验证。
+* **Windows 未重新验证**：Bus 做实、回调出锁、Muxer 中断等改动目前只在 Linux 上构建并回归。
 * **并发**：`Prepare`/`Start`/`Stop` 已串行化（见 4.7），但 `Prepare()` 失败路径的回滚
   目前只覆盖 Muxer；新增模块时记得在自己的失败分支里收尾。
 
@@ -1072,5 +1136,10 @@ cd build/linux-x86_64
 | 编码器里再加同步逻辑 | 与 `VideoPtsGenerator` 互相抵消 | 同步只有一个决策点，见 5.4 |
 | 本进程 `signal(SIGPIPE, SIG_IGN)` 后再起子进程 | 子进程继承 `SIG_IGN`，读端关闭时它只拿到 `EPIPE` 而不被终止；若子进程是无限循环源（如 `aloop=loop=-1`），`pclose` 会永久阻塞 | 退出路径要主动 kill 子进程再 `pclose`（见 `demo/linux/main.cpp` 的 `FfmpegPipe::Kill`）；跑完顺手确认没有残留 ffmpeg 占 CPU |
 | 算同步偏差时用"上一帧 PTS" | 偏差系统性偏大一个帧间隔，控制器会把视频推到超前约 1 帧处才平衡，基线永远不收敛 | 用"本帧按标称间隔推进后"的 PTS 计算，见 5.1 |
+| 在节点里直接持有下游指针 | 绕开 Bus，Link 关系与背压反馈失效 | 一律 `Forward()`；背压看 `DownstreamPending()` |
+| 在 `m_lifecycleMutex` 里回调宿主 | 宿主回调里调 `Stop()` / 取别的锁时死锁 | 一律经 `m_bus.Publish*`，且在解锁后触发 |
+| 宿主回调慢 | 事件队列满后 Notify 被丢（Error 保留），`evDrop` 增长 | 回调里只做转发，别做重活 |
+| 日志里打印推流地址 | 地址常带鉴权 token / 密码 | 一律 `core::RedactUrl()` 后再打 |
+| `flush_packets` 设在 `priv_data` 上 | 对 flv / mpegts 没有效果 | 低延迟用 `AVFMT_FLAG_FLUSH_PACKETS`（设在 `AVFormatContext::flags`） |
 | `Worker::Loop()` 抛异常 | 直接 `terminate`，不留日志 | 子类 `Loop` 目前没有 try/catch 兜底，新增循环体自己保证不抛 |
 | 改 `VideoEncoder::Close()` | 漏复位 `m_lastPtsUs` 会让重开的全视频帧被判成 PTS 回退丢弃 | 新增"随流状态"时一并考虑复位 |

@@ -101,7 +101,8 @@ void ITGCapturerMgr::UnInit()
 
 const char* ITGCapturerMgr::GetVersion()
 {
-    return "1.0.0";
+    // 来自 CMakeLists.txt 的 project(VERSION)，单一事实来源
+    return TGCAPTURE_VERSION_STRING;
 }
 
 }  // namespace TGCapture

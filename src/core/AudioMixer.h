@@ -35,6 +35,7 @@
 #ifndef TGCAPTURE_CORE_AUDIO_MIXER_H
 #define TGCAPTURE_CORE_AUDIO_MIXER_H
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -108,11 +109,16 @@ public:
     // 混出 frameSamples 个样本（每声道），返回交错 S16；数据不够的通道按静音补齐
     bool Mix(int frameSamples, std::shared_ptr<uint8_t>& outData, int64_t& outPtsUs);
 
-    [[nodiscard]] int OutputSampleRate() const { return m_outSampleRate; }
-    [[nodiscard]] int OutputChannels() const { return m_outChannels; }
+    [[nodiscard]] int OutputSampleRate() const { return m_outSampleRate.load(); }
+    [[nodiscard]] int OutputChannels() const { return m_outChannels.load(); }
     [[nodiscard]] int64_t OutputPtsUs() const { return m_outputPtsUs; }
     [[nodiscard]] size_t BufferedFrames(int id) const;
-    [[nodiscard]] size_t ChannelCount() const { return m_channels.size(); }
+    // 加锁：m_channels 会被 AddChannel 扩容，而本接口在运行期由混流线程 / 采集线程读
+    [[nodiscard]] size_t ChannelCount() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_channels.size();
+    }
 
     // 各路校正统计（诊断用）
     [[nodiscard]] AudioChannelClock::Stats ChannelStats(int id) const;
@@ -199,8 +205,10 @@ private:
     // Push 来自采集线程、Mix 来自混流线程，必须串行化
     mutable std::mutex m_mutex;
 
-    int m_outSampleRate = 0;
-    int m_outChannels = 0;
+    // 原子：首路外灌音频到达时由采集线程 SetOutputFormat 写，混流线程同时在读。
+    // 写侧另外持 m_mutex，保证 (采样率, 声道数) 这一对对 Mix 而言是整体生效的。
+    std::atomic<int> m_outSampleRate{0};
+    std::atomic<int> m_outChannels{0};
     int64_t m_outputPtsUs = 0;        // 下一帧输出 PTS = base + samples / SR
     int64_t m_outputPtsBaseUs = 0;
     int64_t m_outputSamples = 0;      // 自 base 起已输出样本数（按样本累加，避免逐帧取整误差累积）

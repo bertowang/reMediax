@@ -1,11 +1,16 @@
 #include "mux/Muxer.h"
 
+#include <cstdio>
+#include <mutex>
+
 #include "core/AvError.h"
 #include "core/Clock.h"
 #include "core/Logger.h"
+#include "core/UrlRedact.h"
 
 extern "C"
 {
+#include <libavutil/dict.h>
 #include <libavutil/opt.h>
 #include <libavutil/time.h>
 }
@@ -19,10 +24,14 @@ namespace
 constexpr int64_t kNoPts = INT64_MIN / 4;
 }  // namespace
 
+// 音频队列也用 DropOldest：之前是 Block，封装线程卡在网络 I/O 时队列写满，
+// 音频编码线程会被反压卡死在 Submit 里 —— 此时 Stop() 先 join 编码线程，而唤醒它的 Close() 排在后面，
+// 形成互相等待。宁可丢最旧的音频包，也不能让一个坏掉的下游卡死上游线程。
 Muxer::Muxer(size_t queueCapacity)
-    : core::Worker("muxer"),
+    : core::BusNode("muxer"),
+      core::Worker("muxer"),
       m_videoQueue(std::make_unique<core::BoundedQueue<core::AVPacketPtr>>(queueCapacity, core::DropPolicy::DropOldest)),
-      m_audioQueue(std::make_unique<core::BoundedQueue<core::AVPacketPtr>>(queueCapacity, core::DropPolicy::Block))
+      m_audioQueue(std::make_unique<core::BoundedQueue<core::AVPacketPtr>>(queueCapacity, core::DropPolicy::DropOldest))
 {
 }
 
@@ -37,7 +46,13 @@ int Muxer::Open(const MuxerParams& params, AVCodecContext* videoCtx, AVCodecCont
     if (m_opened.load()) {
         return 0;
     }
-    avformat_network_init();
+    // 全局网络初始化是**带引用计数**的，而 Muxer 这边没有配对的 deinit
+    // （在 Close 里 deinit 会把宿主其它并存的 muxer 一起拆掉）。
+    // 原先每次 Open（含失败重试）都 +1 而永不 -1，计数单向增长。
+    // 这里收敛成进程级一次：正常路径由 ITGCapturerMgr::Init/UnInit 配对，
+    // 这一次只是兜住"宿主没调 Init 就直接推流"的用法，总量有界。
+    static std::once_flag s_networkOnce;
+    std::call_once(s_networkOnce, [] { avformat_network_init(); });
 
     // 重开：两条队列在 Close() 时被永久关闭，必须显式重开
     m_videoQueue->Reopen();
@@ -54,54 +69,104 @@ int Muxer::Open(const MuxerParams& params, AVCodecContext* videoCtx, AVCodecCont
     m_lastVideoPtsUs.store(kNoPts);
     m_lastAudioPtsUs.store(kNoPts);
 
+    m_abort.store(false);
+    m_opStartUs.store(0);
+    m_writeFail.Reset();
+    m_lastAvError.store(0);
+
     m_url = params.muxerOutput;
+    m_urlSafe = core::RedactUrl(m_url);
     m_format = params.muxer.empty() ? "flv" : params.muxer;
+    m_connectTimeoutUs = (params.connectTimeoutMs > 0 ? params.connectTimeoutMs : 10000) * 1000LL;
+    m_ioTimeoutUs = (params.ioTimeoutMs > 0 ? params.ioTimeoutMs : 5000) * 1000LL;
+    // 连续失败多久算故障；恢复观察期固定 1s —— AVIO 带缓冲，断流后紧接着的几次写
+    // 只是进了缓冲区，必须等缓冲刷过几轮仍然成功才算真的恢复
+    m_writeFail.Configure((params.writeFailReportMs > 0 ? params.writeFailReportMs : 3000) * 1000LL,
+                          1000000);
 
     int ret = avformat_alloc_output_context2(&m_fmt, nullptr, m_format.c_str(), m_url.c_str());
     if (ret < 0 || !m_fmt) {
         TG_LOGE("Muxer: 创建输出上下文失败 fmt=%s url=%s ret=%d (%s)", m_format.c_str(),
-                m_url.c_str(), ret, ret < 0 ? core::AvErr(ret) : "ctx=null");
+                m_urlSafe.c_str(), ret, ret < 0 ? core::AvErr(ret) : "ctx=null");
+        m_lastAvError.store(ret < 0 ? ret : AVERROR(EINVAL));
         Close();   // 回滚：否则重试 Prepare 会每失败一次泄漏一个 AVFormatContext
         return -1;
     }
 
+    // 建流失败必须让 Open 失败：原先只是跳过，结果是"流打开成功、每个包都被静默丢弃"，
+    // 表现为能连上但没有画面/声音，且全链路没有任何错误
     if (videoCtx) {
         m_videoStream = avformat_new_stream(m_fmt, nullptr);
-        if (m_videoStream) {
-            avcodec_parameters_from_context(m_videoStream->codecpar, videoCtx);
-            m_videoStream->time_base = AVRational{1, 1000000};
-            m_videoStream->codecpar->codec_tag = 0;
+        if (!m_videoStream) {
+            TG_LOGE("Muxer: 创建视频流失败 fmt=%s", m_format.c_str());
+            m_lastAvError.store(AVERROR(ENOMEM));
+            Close();
+            return -4;
         }
+        ret = avcodec_parameters_from_context(m_videoStream->codecpar, videoCtx);
+        if (ret < 0) {
+            TG_LOGE("Muxer: 拷贝视频流参数失败 ret=%d (%s)", ret, core::AvErr(ret));
+            m_lastAvError.store(ret);
+            Close();
+            return -4;
+        }
+        m_videoStream->time_base = AVRational{1, 1000000};
+        m_videoStream->codecpar->codec_tag = 0;
     }
     if (audioCtx) {
         m_audioStream = avformat_new_stream(m_fmt, nullptr);
-        if (m_audioStream) {
-            avcodec_parameters_from_context(m_audioStream->codecpar, audioCtx);
-            m_audioStream->time_base = AVRational{1, audioCtx->sample_rate};
-            m_audioStream->codecpar->codec_tag = 0;
+        if (!m_audioStream) {
+            TG_LOGE("Muxer: 创建音频流失败 fmt=%s", m_format.c_str());
+            m_lastAvError.store(AVERROR(ENOMEM));
+            Close();
+            return -5;
         }
+        ret = avcodec_parameters_from_context(m_audioStream->codecpar, audioCtx);
+        if (ret < 0) {
+            TG_LOGE("Muxer: 拷贝音频流参数失败 ret=%d (%s)", ret, core::AvErr(ret));
+            m_lastAvError.store(ret);
+            Close();
+            return -5;
+        }
+        m_audioStream->time_base = AVRational{1, audioCtx->sample_rate};
+        m_audioStream->codecpar->codec_tag = 0;
     }
 
-    // 低延迟
-    av_opt_set(m_fmt->priv_data, "fflags", "nobuffer", 0);
-    av_opt_set(m_fmt->priv_data, "flush_packets", "1", 0);
+    // 低延迟：每个包写完立刻 flush 到底层 I/O，而不是攒在 avio 缓冲里等下一个包。
+    // 注意 flush_packets 属于 AVFormatContext 而不是 flv/mpegts 的私有选项 ——
+    // 之前对 priv_data 设置会静默失败（返回值被忽略），低延迟配置实际没有生效。
+    m_fmt->flags |= AVFMT_FLAG_FLUSH_PACKETS;
+    m_fmt->flush_packets = 1;
+
+    // 所有可能阻塞的 I/O 都挂中断回调：超时 / Abort 命令都能把它打断
+    m_fmt->interrupt_callback.callback = &Muxer::InterruptCb;
+    m_fmt->interrupt_callback.opaque = this;
 
     if (!(m_fmt->oformat->flags & AVFMT_NOFILE)) {
-        ret = avio_open2(&m_fmt->pb, m_url.c_str(), AVIO_FLAG_WRITE, nullptr, nullptr);
+        // rw_timeout 是 URLContext 的通用选项，rtmp(tcp) / srt 等协议都认；对文件协议无副作用
+        AVDictionary* ioOptions = nullptr;
+        av_dict_set_int(&ioOptions, "rw_timeout", m_ioTimeoutUs, 0);
+        BeginOp(m_connectTimeoutUs);
+        ret = avio_open2(&m_fmt->pb, m_url.c_str(), AVIO_FLAG_WRITE, &m_fmt->interrupt_callback,
+                         &ioOptions);
+        EndOp();
+        av_dict_free(&ioOptions);
         if (ret < 0) {
-            TG_LOGE("Muxer: avio_open 失败 url=%s ret=%d (%s)", m_url.c_str(), ret,
+            TG_LOGE("Muxer: avio_open 失败 url=%s ret=%d (%s)", m_urlSafe.c_str(), ret,
                     core::AvErr(ret));
+            m_lastAvError.store(ret);
             Close();
             return -2;
         }
     }
 
-    AVDictionary* options = nullptr;
-    av_dict_set(&options, "fflags", "nobuffer", 0);
-    ret = avformat_write_header(m_fmt, &options);
-    av_dict_free(&options);
+    BeginOp(m_connectTimeoutUs);
+    ret = avformat_write_header(m_fmt, nullptr);
+    EndOp();
     if (ret < 0) {
-        TG_LOGE("Muxer: write_header 失败 ret=%d (%s) url=%s", ret, core::AvErr(ret), m_url.c_str());
+        TG_LOGE("Muxer: write_header 失败 ret=%d (%s) url=%s", ret, core::AvErr(ret),
+                m_urlSafe.c_str());
+        m_lastAvError.store(ret);
         Close();
         return -3;
     }
@@ -109,19 +174,100 @@ int Muxer::Open(const MuxerParams& params, AVCodecContext* videoCtx, AVCodecCont
     m_headerWritten.store(true);
     m_opened.store(true);
     m_lastStatUs = core::MonotonicClock::NowUs();
-    TG_LOGI("Muxer: 就绪 fmt=%s url=%s", m_format.c_str(), m_url.c_str());
+    TG_LOGI("Muxer: 就绪 fmt=%s url=%s connectTimeout=%lldms ioTimeout=%lldms", m_format.c_str(),
+            m_urlSafe.c_str(), static_cast<long long>(m_connectTimeoutUs / 1000),
+            static_cast<long long>(m_ioTimeoutUs / 1000));
     return 0;
+}
+
+int Muxer::InterruptCb(void* opaque)
+{
+    auto* self = static_cast<Muxer*>(opaque);
+    if (self->m_abort.load(std::memory_order_relaxed)) {
+        return 1;
+    }
+    const int64_t start = self->m_opStartUs.load(std::memory_order_relaxed);
+    const int64_t limit = self->m_opLimitUs.load(std::memory_order_relaxed);
+    if (start > 0 && limit > 0 && core::MonotonicClock::NowUs() - start > limit) {
+        return 1;
+    }
+    return 0;
+}
+
+void Muxer::BeginOp(int64_t limitUs)
+{
+    m_opLimitUs.store(limitUs);
+    m_opStartUs.store(core::MonotonicClock::NowUs());
+}
+
+void Muxer::EndOp()
+{
+    m_opStartUs.store(0);
+}
+
+bool Muxer::Submit(core::FramePtr frame)
+{
+    if (!frame || !frame->packet) {
+        return false;
+    }
+    if (frame->streamKind == core::MediaKind::Audio) {
+        SubmitAudioPacket(std::move(frame->packet));
+    } else {
+        SubmitVideoPacket(std::move(frame->packet));
+    }
+    return m_opened.load();
+}
+
+bool Muxer::OnCommand(const core::BusCommand& command)
+{
+    switch (command.type) {
+        case core::BusCommandType::Flush:
+            m_videoQueue->Clear();
+            m_audioQueue->Clear();
+            return true;
+        case core::BusCommandType::Abort:
+            // 拆除路径：之后所有 I/O（含 trailer）立即失败返回，不再各等一个超时
+            m_abort.store(true);
+            TG_LOGW("Muxer: 收到 Abort，打断进行中的 I/O");
+            return true;
+        default:
+            return false;
+    }
 }
 
 void Muxer::Close()
 {
     m_headerWritten.store(false);
+    // 先落下"已打开"标志，再碰 m_fmt。WriteOne 的守卫是 `!m_fmt || !m_opened`，
+    // 原先顺序相反（先 free 再清标志），写包线程存在一个窗口能通过守卫拿到已释放的上下文。
+    // 真正的保证仍然来自 StopLocked 先 join 写包线程再 Close()，这里只是不再自相矛盾。
+    const bool wasOpened = m_opened.exchange(false);
     if (m_fmt) {
-        if (m_opened.load()) {
-            av_write_trailer(m_fmt);
+        // 写尾失败 = 产出文件缺索引 / 时长不对（flv 的 duration、mp4 的 moov），
+        // 对宿主是"文件不可播"级别的问题，不能像以前那样丢掉返回值。
+        // Abort 之后的失败是拆除路径的预期结果（我们自己打断的），不上报。
+        int ret = 0;
+        if (wasOpened) {
+            BeginOp(m_ioTimeoutUs);
+            ret = av_write_trailer(m_fmt);
+            EndOp();
+            if (ret < 0 && !m_abort.load()) {
+                TG_LOGE("Muxer: 写文件尾失败 ret=%d (%s) url=%s", ret, core::AvErr(ret),
+                        m_urlSafe.c_str());
+                m_lastAvError.store(ret);
+                ReportError(TGErr_MuxTrailerFailed, "write trailer failed", ret);
+            } else if (ret < 0) {
+                TG_LOGW("Muxer: 写文件尾被中断（拆除路径）ret=%d", ret);
+            }
         }
         if (!(m_fmt->oformat->flags & AVFMT_NOFILE) && m_fmt->pb) {
-            avio_closep(&m_fmt->pb);
+            BeginOp(m_ioTimeoutUs);
+            ret = avio_closep(&m_fmt->pb);
+            EndOp();
+            if (ret < 0) {
+                // 关闭失败只影响已写出的数据能否落盘，单独记日志；错误码已由上面的写尾覆盖
+                TG_LOGW("Muxer: 关闭输出失败 ret=%d (%s)", ret, core::AvErr(ret));
+            }
         }
         avformat_free_context(m_fmt);
         m_fmt = nullptr;
@@ -132,7 +278,6 @@ void Muxer::Close()
     m_audioStream = nullptr;
     m_videoQueue->Close();
     m_audioQueue->Close();
-    m_opened.store(false);
 }
 
 void Muxer::SubmitVideoPacket(core::AVPacketPtr packet)
@@ -213,12 +358,23 @@ void Muxer::Loop(std::stop_token token)
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    // 退出前尽量把剩余包写出
-    while (auto packet = m_audioQueue->TryPop(std::chrono::milliseconds(1))) {
-        WriteOne(std::move(*packet), false);
+    // 退出前尽量把剩余包写出。
+    // 一旦写失败就停：下游已经坏了，剩下的包每个都要再等一个 ioTimeout，
+    // 队列里最多 128+128 个包，会把 Stop() 拖成几分钟
+    bool healthy = true;
+    while (healthy) {
+        auto packet = m_audioQueue->TryPop(std::chrono::milliseconds(1));
+        if (!packet) {
+            break;
+        }
+        healthy = WriteOne(std::move(*packet), false) >= 0;
     }
-    while (auto packet = m_videoQueue->TryPop(std::chrono::milliseconds(1))) {
-        WriteOne(std::move(*packet), true);
+    while (healthy) {
+        auto packet = m_videoQueue->TryPop(std::chrono::milliseconds(1));
+        if (!packet) {
+            break;
+        }
+        healthy = WriteOne(std::move(*packet), true) >= 0;
     }
 }
 
@@ -249,10 +405,15 @@ int Muxer::WriteOne(core::AVPacketPtr packet, bool isVideo)
         TG_LOGD("Muxer: 写包 stream=%d pts=%lld size=%d", stream->index,
                 static_cast<long long>(packet->pts), packet->size);
     }
+    const int64_t startUs = core::MonotonicClock::NowUs();
+    BeginOp(m_ioTimeoutUs);
+    const int packetSize = packet->size;
     int ret = av_interleaved_write_frame(m_fmt, packet.get());
+    EndOp();
     if (m_packets.load() < 3) {
         TG_LOGD("Muxer: 写包返回 ret=%d", ret);
     }
+    OnWriteResult(ret >= 0, ret, startUs, core::MonotonicClock::NowUs());
     if (ret < 0) {
         // 写包失败 = 数据丢失（文件截断 / 推流断流），是 Error 不是 Warn；
         // 但断流时会每包命中，所以限频，避免刷屏淹没其它日志
@@ -260,9 +421,43 @@ int Muxer::WriteOne(core::AVPacketPtr packet, bool isVideo)
                           core::AvErr(ret), isVideo ? 1 : 0, static_cast<long long>(ptsUs));
         return -3;
     }
-    UpdateBitrate(static_cast<size_t>(packet->size));
+    UpdateBitrate(static_cast<size_t>(packetSize));
     m_packets.fetch_add(1);
     return 0;
+}
+
+// 写包结果归集到统一的失败追踪器（core/Health.h）：连续失败超过 writeFailReportMs 上报一次
+// TGErr_MuxWriteFailed，extra = 底层 AVERROR（与全局 extra 约定一致，持续时长写在 message 里）。
+//
+// 注意 FFmpeg 的 AVIOContext 错误是粘性的：网络断开类的失败之后同一连接不会再写成功，
+// 所以"恢复"只可能发生在非粘性的瞬时错误（短暂磁盘忙等）上 —— 不对外承诺自动恢复。
+void Muxer::OnWriteResult(bool ok, int ret, int64_t startUs, int64_t endUs)
+{
+    if (ok) {
+        if (m_abort.load()) {
+            return;   // 中断之后写进 AVIO 缓冲的"成功"不代表链路恢复
+        }
+        const int64_t failingUs = m_writeFail.FailingUs(endUs);
+        const uint64_t lost = m_writeFail.RoundFailures();
+        if (m_writeFail.OnSuccess(endUs)) {
+            TG_LOGI("Muxer: 写包已恢复 失败持续=%lldms 期间丢包=%llu",
+                    static_cast<long long>(failingUs / 1000),
+                    static_cast<unsigned long long>(lost));
+        }
+        return;
+    }
+
+    m_lastAvError.store(ret);
+    const int64_t at = startUs > 0 ? startUs : endUs;
+    if (m_writeFail.OnFailure(at)) {
+        char message[160];
+        std::snprintf(message, sizeof(message),
+                      "mux write failing for %lldms, %llu packets lost (%s)",
+                      static_cast<long long>(m_writeFail.FailingUs(endUs) / 1000),
+                      static_cast<unsigned long long>(m_writeFail.RoundFailures()),
+                      core::AvErr(ret));
+        ReportError(TGErr_MuxWriteFailed, message, ret);
+    }
 }
 
 void Muxer::UpdateBitrate(size_t bytes)
@@ -285,12 +480,18 @@ float Muxer::TrafficBps() const
 
 std::string Muxer::Stats() const
 {
-    char buffer[256];
+    char buffer[512];
     snprintf(buffer, sizeof(buffer),
              "{\"format\":\"%s\",\"url\":\"%s\",\"bitrate_bps\":%.0f,\"packets\":%llu,"
-             "\"video_pending\":%zu,\"audio_pending\":%zu}",
-             m_format.c_str(), m_url.c_str(), TrafficBps(),
-             static_cast<unsigned long long>(m_packets.load()), VideoPending(), AudioPending());
+             "\"video_pending\":%zu,\"audio_pending\":%zu,"
+             "\"write_failed\":%llu,\"failing\":%d,\"last_averror\":%d,"
+             "\"video_dropped\":%llu,\"audio_dropped\":%llu}",
+             m_format.c_str(), m_urlSafe.c_str(), TrafficBps(),
+             static_cast<unsigned long long>(m_packets.load()), VideoPending(), AudioPending(),
+             static_cast<unsigned long long>(FailedPackets()), IsFailing() ? 1 : 0,
+             m_lastAvError.load(),
+             static_cast<unsigned long long>(m_videoQueue ? m_videoQueue->DroppedCount() : 0),
+             static_cast<unsigned long long>(m_audioQueue ? m_audioQueue->DroppedCount() : 0));
     return std::string(buffer);
 }
 

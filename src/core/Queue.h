@@ -2,6 +2,7 @@
 #ifndef TGCAPTURE_CORE_QUEUE_H
 #define TGCAPTURE_CORE_QUEUE_H
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -158,7 +159,8 @@ public:
 
     [[nodiscard]] bool Empty() const { return Size() == 0; }
     [[nodiscard]] size_t Capacity() const noexcept { return m_capacity; }
-    [[nodiscard]] uint64_t DroppedCount() const noexcept { return m_dropped; }
+    // 统计线程与生产线程不是同一个：计数必须是原子的，否则是数据竞争
+    [[nodiscard]] uint64_t DroppedCount() const noexcept { return m_dropped.load(); }
 
 private:
     size_t m_capacity;
@@ -168,7 +170,7 @@ private:
     std::condition_variable m_notFull;
     std::deque<T> m_queue;
     bool m_closed = false;
-    uint64_t m_dropped = 0;
+    std::atomic<uint64_t> m_dropped{0};
 };
 
 }  // namespace TGCapture::core

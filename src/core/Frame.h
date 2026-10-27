@@ -65,9 +65,10 @@ struct Frame
     std::shared_ptr<uint8_t> audioData;
     size_t audioBytes = 0;
 
-    // ---- 编码后 ----
+    // ---- 编码后（kind == Packet）----
     std::shared_ptr<AVPacket> packet;
     bool keyFrame = false;
+    MediaKind streamKind = MediaKind::Video;   // 该包属于视频流还是音频流，封装节点据此分流
 
     // ---- 元信息 ----
     int rotation = 0;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 
 #include "core/Logger.h"
 
@@ -44,17 +45,29 @@ TGCapturer::TGCapturer(GameID gameId) : m_gameId(gameId)
     m_videoEncoder->SetSyncClock(m_sync);
     m_audioEncoder->SetSyncClock(m_sync);
 
-    // 总线：采集 -> 编码器 -> 封装
+    // 总线拓扑：采集 → video_encoder / audio_encoder → muxer
+    // 数据、命令、事件都走这一条总线（见 core/Bus.h）；拓扑只在这里建立，运行期只读
     m_bus.Register("video_encoder", m_videoEncoder);
     m_bus.Register("audio_encoder", m_audioEncoder);
-    m_videoEncoder->LinkNext(nullptr);  // 编码器直接投递给 muxer
-    m_audioEncoder->LinkNext(nullptr);
+    m_bus.Register("muxer", m_muxer);
+    const bool linked = m_bus.Link("video_encoder", "muxer") && m_bus.Link("audio_encoder", "muxer");
+    if (!linked) {
+        TG_LOGE("TGCapturer: 总线拓扑建立失败（video/audio_encoder → muxer）");
+    }
+    m_videoIn = m_bus.Get("video_encoder");
+    m_audioIn = m_bus.Get("audio_encoder");
+
+    // 事件：错误 / 通知 / 生命周期统一从总线分发，OnBusEvent 里做联动并转给宿主回调
+    m_bus.Subscribe([this](const core::BusEvent& event) { OnBusEvent(event); });
 }
 
 TGCapturer::~TGCapturer()
 {
     Stop();
     ReleaseAll();
+    // 先停事件分发再销毁成员：订阅者捕获了 this。
+    // 若本析构就发生在某个宿主回调里（分发线程内），Shutdown 会分离线程而不是 join 自己
+    m_bus.Events().Shutdown();
 }
 
 // ------------------------------------------------------------------ 采集源
@@ -83,7 +96,7 @@ int TGCapturer::EnableMicrophoneCapture(bool usingGVoice)
     }
     if (!IsSupported(CaptureFeature::Microphone)) {
         TG_LOGE("TGCapturer: 当前平台不支持麦克风采集");
-        return -1;
+        return TGErr_NotSupported;
     }
 #if defined(_WIN32)
     auto source = std::make_shared<platform::WinAudioCapture>(TypeOfSelfMicphone, false);
@@ -98,7 +111,7 @@ int TGCapturer::EnableMicrophoneCapture(bool usingGVoice)
     return AddAudioSource(source.get());
 #else
     TG_LOGW("TGCapturer: 当前平台无麦克风采集实现（外部注入请用 PushExternalAudioFrame）");
-    return -1;
+    return TGErr_NotSupported;
 #endif
 }
 
@@ -106,7 +119,7 @@ int TGCapturer::EnableSpeakerCapture()
 {
     if (!IsSupported(CaptureFeature::Speaker)) {
         TG_LOGE("TGCapturer: 当前平台不支持扬声器/系统内录");
-        return -1;
+        return TGErr_NotSupported;
     }
 #if defined(_WIN32)
     auto source = std::make_shared<platform::WinAudioCapture>(TypeOfSpeaker, true);  // WASAPI loopback
@@ -120,7 +133,7 @@ int TGCapturer::EnableSpeakerCapture()
 #else
     // iOS 没有系统内录：需宿主 App 加 Broadcast Upload Extension 后走 PushExternalAudioFrame
     TG_LOGW("TGCapturer: 当前平台无扬声器/系统内录实现");
-    return -1;
+    return TGErr_NotSupported;
 #endif
 }
 
@@ -177,11 +190,13 @@ IVideoSource* TGCapturer::CreateLocalFileCapture(int index, const std::string& f
 int TGCapturer::AddAudioSource(IAudioSource* source)
 {
     if (!source) {
-        return -1;
+        TG_LOGE("TGCapturer: AddAudioSource 传入空指针");
+        return TGErr_InvalidArgument;
     }
     auto* base = dynamic_cast<capture::AudioSourceBase*>(source);
     if (!base) {
-        return -2;
+        TG_LOGE("TGCapturer: AddAudioSource 的对象不是本 SDK 创建的音频源");
+        return TGErr_InvalidArgument;
     }
     if (std::find(m_audioSources.begin(), m_audioSources.end(), base) != m_audioSources.end()) {
         return 0;   // 已添加
@@ -291,6 +306,7 @@ void TGCapturer::MixLoop(std::stop_token token)
             continue;
         }
         lastOutputUs = core::MonotonicClock::NowUs();
+        m_audioWatch.OnActivity(lastOutputUs);
 
         // ---- 心跳：10s/次 I 级累计状态 ----
         const int64_t nowUs = core::MonotonicClock::NowUs();
@@ -324,7 +340,7 @@ void TGCapturer::MixLoop(std::stop_token token)
             const auto ms = m_mixer->Stats();
             TG_LOGI("TGCapturer: 心跳 avDiff=%lldms force=%llu adapt=%llu clamp=%llu "
                     "stall=%llu skip=%llu jump=%llu staleReset=%llu bpDrop=%llu "
-                    "mix[out=%llu wait=%llu reanchor=%llu/%lldms]|%s",
+                    "bus[pend=%zu evDrop=%llu] mix[out=%llu wait=%llu reanchor=%llu/%lldms]|%s",
                     static_cast<long long>(vs.avDiffUs / 1000),
                     static_cast<unsigned long long>(vs.forceSynced),
                     static_cast<unsigned long long>(vs.adapted),
@@ -334,6 +350,8 @@ void TGCapturer::MixLoop(std::stop_token token)
                     static_cast<unsigned long long>(vs.jumpWarns),
                     static_cast<unsigned long long>(vs.staleResets),
                     static_cast<unsigned long long>(m_bpDropped.load()),
+                    m_bus.TotalPending(),
+                    static_cast<unsigned long long>(m_bus.Events().Dropped()),
                     static_cast<unsigned long long>(ms.outputFrames),
                     static_cast<unsigned long long>(ms.waitTimeouts),
                     static_cast<unsigned long long>(ms.reanchors),
@@ -363,18 +381,20 @@ void TGCapturer::MixLoop(std::stop_token token)
             m_audioClock->AdvanceTo(ptsUs + static_cast<int64_t>(m_audioFrameSize) * 1000000LL /
                                                 sampleRate);
         }
-        m_bus.Dispatch("audio_encoder", std::move(frame));
+        m_audioIn->Submit(std::move(frame));
     }
 }
 
 int TGCapturer::AddVideoSource(IVideoSource* source)
 {
     if (!source) {
-        return -1;
+        TG_LOGE("TGCapturer: AddVideoSource 传入空指针");
+        return TGErr_InvalidArgument;
     }
     auto* base = dynamic_cast<capture::VideoSourceBase*>(source);
     if (!base) {
-        return -2;
+        TG_LOGE("TGCapturer: AddVideoSource 的对象不是本 SDK 创建的视频源");
+        return TGErr_InvalidArgument;
     }
     m_videoSource = base;
     base->SetEmitCallback([this](core::FramePtr frame) { OnVideoFrame(std::move(frame)); });
@@ -382,33 +402,71 @@ int TGCapturer::AddVideoSource(IVideoSource* source)
 }
 
 // ------------------------------------------------------------------ 参数
+// 三个 Setup 都在这里做"明显非法"的校验并当场拒绝：
+// 坏参数若被记下来，故障会推迟到 Prepare 才以 OpenXxx 的形式冒出来，排障要多绕一圈。
+// 拒绝时**不记录**该组参数，于是后续 Prepare 会返回 TGErr_NotConfigured —— 语义上就是"没配过"。
 int TGCapturer::SetupAudioEncoder(const AudioEncoderParams& params)
 {
+    // enabled=false 是纯视频模式，此时采样率/声道数不参与校验
+    if (params.enabled && (params.sampleRate <= 0 || params.channels <= 0)) {
+        TG_LOGE("TGCapturer: SetupAudioEncoder 参数非法 sampleRate=%d channels=%d",
+                params.sampleRate, params.channels);
+        return TGErr_InvalidArgument;
+    }
     m_audioParams = params;
     m_audioParamsSet = true;
-    return 0;
+    return TGErr_OK;
 }
 
 int TGCapturer::SetupVideoEncoder(const VideoEncoderParams& params)
 {
+    if (params.width <= 0 || params.height <= 0 || params.fps <= 0.0f || params.vBitrate <= 0) {
+        TG_LOGE("TGCapturer: SetupVideoEncoder 参数非法 %dx%d fps=%.2f bitrate=%d", params.width,
+                params.height, params.fps, params.vBitrate);
+        return TGErr_InvalidArgument;
+    }
     m_videoParams = params;
     m_videoParamsSet = true;
     m_perfMode = params.perfMode;
-    return 0;
+    return TGErr_OK;
 }
 
 int TGCapturer::SetupMuxer(const MuxerParams& params)
 {
+    if (params.muxerOutput.empty()) {
+        TG_LOGE("TGCapturer: SetupMuxer 的 muxerOutput 为空");
+        return TGErr_InvalidArgument;
+    }
     m_muxParams = params;
     m_muxParamsSet = true;
-    return 0;
+    return TGErr_OK;
 }
 
-void TGCapturer::SetOnPreparedCallback(OnPreparedCallback cb) { m_onPrepared = std::move(cb); }
-void TGCapturer::SetOnErrorCallback(OnErrorCallback cb) { m_onError = std::move(cb); }
-void TGCapturer::SetOnStartCallback(OnStartCallback cb) { m_onStart = std::move(cb); }
-void TGCapturer::SetOnStopCallback(OnStopCallback cb) { m_onStop = std::move(cb); }
-void TGCapturer::SetOnNotifyCallback(OnNotifyCallback cb) { m_onNotify = std::move(cb); }
+void TGCapturer::SetOnPreparedCallback(OnPreparedCallback cb)
+{
+    std::lock_guard<std::mutex> lock(m_callbackMutex);
+    m_onPrepared = std::move(cb);
+}
+void TGCapturer::SetOnErrorCallback(OnErrorCallback cb)
+{
+    std::lock_guard<std::mutex> lock(m_callbackMutex);
+    m_onError = std::move(cb);
+}
+void TGCapturer::SetOnStartCallback(OnStartCallback cb)
+{
+    std::lock_guard<std::mutex> lock(m_callbackMutex);
+    m_onStart = std::move(cb);
+}
+void TGCapturer::SetOnStopCallback(OnStopCallback cb)
+{
+    std::lock_guard<std::mutex> lock(m_callbackMutex);
+    m_onStop = std::move(cb);
+}
+void TGCapturer::SetOnNotifyCallback(OnNotifyCallback cb)
+{
+    std::lock_guard<std::mutex> lock(m_callbackMutex);
+    m_onNotify = std::move(cb);
+}
 
 void TGCapturer::SetPrivateData(const std::string& key, void* data)
 {
@@ -436,20 +494,55 @@ void TGCapturer::SetPrivateData(const std::string& key, void* data)
 }
 
 // ------------------------------------------------------------------ 生命周期
+// 生命周期入口只做"加锁 → 干活 → 解锁 → 通知"：宿主回调（Prepared / Error / Started / Stopped）
+// 一律在解锁之后、经总线触发。之前回调在持锁状态下被调用，宿主若在回调里等待另一个
+// 同样要调用本对象接口的线程，就会死锁。
+// 回调仍然在调用方线程上同步执行（宿主在 Prepared 回调里调 Start 的用法保持不变）。
 int TGCapturer::Prepare()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_lifecycleMutex);
+    PrepareError err;
+    int ret;
+    {
+        std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+        // 等上一轮 Stop 彻底收尾：否则新一轮的 Prepared 事件可能排在上一轮的 Stopped 之前
+        WaitStopSettled(lock);
+        ret = PrepareLocked(err);
+    }
+    if (ret == 0) {
+        m_bus.PublishSync(core::BusEventType::Prepared, "capturer", 0, {});
+    } else {
+        // 失败一律上报：返回值与回调 what 是同一个码，宿主两条路径择一处理即可
+        m_bus.PublishSync(core::BusEventType::Error, "capturer", err.what, err.message, err.extra);
+    }
+    return ret;
+}
+
+int TGCapturer::PrepareLocked(PrepareError& err)
+{
     // 检查与置位在同一个临界区内原子完成：并发两次 Prepare 只有一个能进
     State expected = State::Idle;
     if (!m_state.compare_exchange_strong(expected, State::Preparing)) {
-        TG_LOGW("TGCapturer: Prepare 状态错误 state=%d", static_cast<int>(m_state.load()));
-        return -1;
+        const int32_t cur = static_cast<int32_t>(m_state.load());
+        TG_LOGW("TGCapturer: Prepare 状态错误 state=%d", cur);
+        // 原先这条路径静默返回 -1：既不在枚举里、也不上报，宿主只能靠猜
+        err = {TGErr_InvalidState, cur, "prepare called in wrong state"};
+        return TGErr_InvalidState;
     }
 
-    if (!m_videoParamsSet || !m_audioParamsSet || !m_muxParamsSet) {
-        FireError(-1, 0, "encoders or muxer not configured");
+    // 失败回滚：Prepare 中途失败时必须把已经打开的东西全部关掉再退回 Idle。
+    // 原先只改状态就 return，后果是双重的：
+    //   1) Stop() 在 Idle 态直接返回，StopLocked 永不执行 —— 宿主没有任何途径释放这些资源；
+    //   2) 编码器 Open() 开头有 `if (m_opened) return 0`，残留的已打开编码器会在下一轮
+    //      Prepare 被静默复用，新参数（分辨率/码率/采样率）被丢弃，表现为"第二次成功了但不生效"。
+    auto fail = [&](TGCaptureError code, int32_t extra, const char* message) {
+        err = {code, extra, message};
+        TeardownLocked();
         m_state.store(State::Idle);
-        return -2;
+        return static_cast<int>(code);
+    };
+
+    if (!m_videoParamsSet || !m_audioParamsSet || !m_muxParamsSet) {
+        return fail(TGErr_NotConfigured, 0, "encoders or muxer not configured");
     }
 
     // 视频类型：以配置为准，采集源尺寸作为兜底
@@ -501,9 +594,22 @@ int TGCapturer::Prepare()
     }
 #endif
     // ---- 采集源先打开：GPU 模式要确认采集侧真的走的是硬件路径 ----
-    if (m_videoSource
-        && m_videoSource->Open(m_videoParams.width, m_videoParams.height, m_videoParams.fps) < 0) {
-        TG_LOGW("TGCapturer: 视频源打开失败（外部注入模式可忽略）");
+    if (m_videoSource) {
+        const int openRet =
+            m_videoSource->Open(m_videoParams.width, m_videoParams.height, m_videoParams.fps);
+        if (openRet < 0) {
+            // 外部注入源（上层自己推帧）的 Open 失败无所谓；但宿主显式创建的**原生**采集源
+            // 打不开（设备被占用 / 权限未授予 / 无桌面复制通道）就必须让 Prepare 失败 ——
+            // 原先只打一条 Warn 就继续，结果是"推流成功但永远没有画面"，是最难排查的那类故障。
+            const VideoCapSourceType type = m_videoSource->GetVideoCapSourceType();
+            if (type == TypeOfGameEngine4Slave) {
+                TG_LOGW("TGCapturer: 视频源打开失败 ret=%d（外部注入模式，由上层推帧）", openRet);
+            } else {
+                TG_LOGE("TGCapturer: 原生视频源打开失败 type=%d ret=%d", static_cast<int>(type),
+                        openRet);
+                return fail(TGErr_OpenVideoSource, openRet, "open video capture source failed");
+            }
+        }
     }
 #if defined(_WIN32)
     if (m_perfMode == PerformanceMode::Gpu) {
@@ -541,12 +647,15 @@ int TGCapturer::Prepare()
     m_audioClock->SetCompensationUs(m_videoParams.audioCompensationUs);
     m_videoOnlyTimeline->Reset();
     m_videoIntervalUs = m_videoParams.fps > 0 ? static_cast<int64_t>(1000000.0 / m_videoParams.fps) : 33333;
-    m_syncDropped = 0;
+    m_syncDropped.store(0);
     m_bpDropped.store(0);
     m_audioWaitStartUs = 0;
     // 首帧标志必须复位，否则第二轮不再触发 EsCap_Notify_Fisrt_Frame_OK
     m_firstFrameSent.store(false);
-    m_lastVideoUs = 0;
+    m_lastRuntimeError.store(0);
+    // 断流看护的阈值在这里取用，Reset 留到 Start（Prepare 到 Start 之间的空档不算断流）
+    m_videoWatch.Configure(m_videoTimeoutMs.load() * 1000);
+    m_audioWatch.Configure(m_audioEnabled ? m_audioTimeoutMs.load() * 1000 : 0);
     // 编码器侧的"落后丢帧"只是最后一道兜底：阈值必须落在 VideoPtsGenerator 的
     // ForceAlign 区间之外（forceSyncFactor × 帧间隔 × 1.5）。
     // 否则会在 RangeAdapt 正常追赶期间（66~200ms @30fps）白白砍帧率，
@@ -590,9 +699,8 @@ int TGCapturer::Prepare()
     audioType.SetFrameSize(1024);
 
     if (m_videoEncoder->Open(m_videoParams, videoType) < 0) {
-        FireError(-3, 0, "open video encoder failed");
-        m_state.store(State::Idle);
-        return -3;
+        return fail(TGErr_OpenVideoEncoder, m_videoEncoder->LastAvError(),
+                    "open video encoder failed");
     }
     // 编码器没能建起硬件链路（hwdevice / hw_frames_ctx 初始化失败）时，采集侧必须一并退回系统内存。
     // 否则采集继续产出 GPU 纹理帧，而编码器走软件路径，BuildAVFrame 拿不到 planes[0]，
@@ -609,28 +717,27 @@ int TGCapturer::Prepare()
 #endif
     if (m_audioEnabled) {
         if (m_audioEncoder->Open(m_audioParams, audioType) < 0) {
-            FireError(-4, 0, "open audio encoder failed");
-            m_state.store(State::Idle);
-            return -4;
+            return fail(TGErr_OpenAudioEncoder, m_audioEncoder->LastAvError(),
+                        "open audio encoder failed");
         }
     } else {
         TG_LOGI("TGCapturer: 纯视频模式（audio disabled）");
     }
 
-    m_videoEncoder->SetMuxer(m_muxer.get());
-    m_audioEncoder->SetMuxer(m_muxer.get());
-
     if (m_muxer->Open(m_muxParams, m_videoEncoder->CodecContext(),
                       m_audioEnabled ? m_audioEncoder->CodecContext() : nullptr) < 0) {
-        FireError(-5, 0, "open muxer failed");
-        m_state.store(State::Idle);
-        return -5;
+        return fail(TGErr_OpenMuxer, m_muxer->LastAvError(), "open muxer failed");
     }
 
     if (m_audioEnabled) {
         for (auto* source : m_audioSources) {
             if (source && source->Open(m_audioParams.sampleRate, m_audioParams.channels) < 0) {
-                TG_LOGW("TGCapturer: 音频源打开失败（该路按静音处理）");
+                // 音频按"降级而非失败"处理（少一路声音仍可开播），但不能就这么算了：
+                // 开播后若混流器整体没有音频"输出"，断流看护会上报 TGErr_AudioCaptureStalled。
+                // 注意：部分平台的采集源在打开失败后仍会注入静音帧，此时混流照常出帧，
+                // 看护探测不到——这种"有声道但全静音"的情况只能靠日志排查，无法自动上报。
+                TG_LOGW("TGCapturer: 音频源 type=%d 打开失败，该路按静音处理",
+                        static_cast<int>(source->GetAudioCapSourceType()));
             }
         }
     }
@@ -648,73 +755,152 @@ int TGCapturer::Prepare()
     }
 
     m_state.store(State::Prepared);
-    if (m_onPrepared) {
-        m_onPrepared(this);
-    }
     return 0;
 }
 
 int TGCapturer::Start()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_lifecycleMutex);
-    State expected = State::Prepared;
-    if (!m_state.compare_exchange_strong(expected, State::Starting)) {
-        TG_LOGW("TGCapturer: Start 状态错误 state=%d", static_cast<int>(m_state.load()));
-        return -1;
+    PrepareError err;
+    int ret;
+    {
+        std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+        WaitStopSettled(lock);
+        State expected = State::Prepared;
+        if (!m_state.compare_exchange_strong(expected, State::Starting)) {
+            const int32_t cur = static_cast<int32_t>(m_state.load());
+            TG_LOGW("TGCapturer: Start 状态错误 state=%d", cur);
+            // 不在这里 PublishSync：它是同步派发，会在**持有 m_lifecycleMutex 的情况下**
+            // 直接执行宿主的 onError。宿主在回调里调 Stop()/Prepare() 就会重入这把锁，
+            // 或者等另一个正在调生命周期接口的线程 —— 跨线程死锁。统一到锁外上报。
+            err = {TGErr_InvalidState, cur, "start called in wrong state"};
+            ret = TGErr_InvalidState;
+        } else {
+            ret = StartLocked(err);
+        }
     }
+    if (ret == 0) {
+        m_bus.PublishSync(core::BusEventType::Started, "capturer", 0, {});
+    } else {
+        m_bus.PublishSync(core::BusEventType::Error, "capturer", err.what, err.message, err.extra);
+    }
+    return ret;
+}
 
+// 线程起不来意味着这一轮根本不会出流（通常是上一轮没停干净）：
+// 原先只打一条 Warn 然后照常返回 0，宿主会以为开播成功
+int TGCapturer::StartLocked(PrepareError& err)
+{
+    auto fail = [&](int32_t stage, const char* what) {
+        TG_LOGE("TGCapturer: %s 线程启动失败（上一轮可能未停止干净）", what);
+        err = {TGErr_StartFailed, stage, std::string("start failed: ") + what};
+        // 逆序停掉本轮已经起来的线程：只退状态不停线程的话，muxer / 视频编码线程会继续空转，
+        // 宿主若不 Stop 直接析构，它们就会在正在销毁的成员上继续发包
+        if (m_audioEncoder) {
+            m_audioEncoder->Stop();
+        }
+        if (m_videoEncoder) {
+            m_videoEncoder->Stop();
+        }
+        if (m_muxer) {
+            m_muxer->Stop();
+        }
+        m_state.store(State::Prepared);   // 退回可重试的状态，宿主可以 Stop 后重开
+        return static_cast<int>(TGErr_StartFailed);
+    };
     if (!m_muxer->Start()) {
-        TG_LOGW("TGCapturer: muxer 线程启动异常（可能上一轮未停止干净）");
+        return fail(1, "muxer");
     }
     if (!m_videoEncoder->Start()) {
-        TG_LOGW("TGCapturer: 视频编码线程启动异常（可能上一轮未停止干净）");
+        return fail(2, "video encoder");
     }
-    if (m_audioEnabled) {
-        m_audioEncoder->Start();
+    if (m_audioEnabled && !m_audioEncoder->Start()) {
+        return fail(3, "audio encoder");
     }
     if (m_videoSource) {
-        m_videoSource->Start();
+        m_videoSource->StartCapture();
     }
     if (m_audioEnabled) {
         for (auto* source : m_audioSources) {
             if (source) {
-                source->Start();
+                source->StartCapture();
             }
         }
         StartAudioMixer();   // 多于一路时合并（麦克风 + 扬声器）
     }
 
     m_state.store(State::Running);
-    if (m_onStart) {
-        m_onStart();
-    }
+    StartWatchdog();
     TG_LOGI("TGCapturer: 已启动");
-    return 0;
+    return TGErr_OK;
 }
 
 void TGCapturer::Stop()
 {
-    // 与 Prepare / Start 共用同一把锁：三者不会交错执行，
-    // 从根上消除"Stop 跑完时 Start 还没启动线程"造成的野线程。
-    std::lock_guard<std::recursive_mutex> lock(m_lifecycleMutex);
-    const State cur = m_state.load();
-    if (cur == State::Idle || cur == State::Stopping) {
-        return;
+    {
+        // 与 Prepare / Start 共用同一把锁：三者不会交错执行，
+        // 从根上消除"Stop 跑完时 Start 还没启动线程"造成的野线程。
+        std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+        if (!WaitStopSettled(lock)) {
+            return;   // 本线程就是正在停机的那个（宿主在 OnStop 里又调了 Stop）
+        }
+        if (m_state.load() == State::Idle) {
+            return;
+        }
+        StopLocked();
+        // 标记"停机尚未收尾"后才放锁：别的线程此刻虽能拿到锁，
+        // 但会在 WaitStopSettled 上等到收尾结束，不会误判成"已经停干净了"
+        m_stopping = true;
+        m_stopOwner = std::this_thread::get_id();
     }
-    m_state.store(State::Stopping);
+    // 解锁之后：先让运行期积压的错误 / 通知被宿主看到，再告知已停止 ——
+    // 保证宿主看到的顺序是"…错误…Stopped"，而不是 Stopped 之后又冒出错误。
+    // （本函数若就在事件分发线程里被调用，Drain 会直接返回，不会等自己）
+    m_bus.Events().Drain();
+    // code = 本轮最后一次上报的错误码：OnStopCallback(err) 这个参数以前恒为 0，等于废的
+    m_bus.PublishSync(core::BusEventType::Stopped, "capturer", m_lastRuntimeError.load(), {});
+    {
+        std::lock_guard<std::mutex> lock(m_lifecycleMutex);
+        m_stopping = false;
+        m_stopOwner = {};
+    }
+    m_stopSettled.notify_all();
+}
 
-    // 按数据流向逆序停止：先停采集，再 drain 编码器，最后收尾封装
+// 返回 false 表示"调用方自己就是正在停机的线程"，不应重复停。
+// 其余情况返回时保证没有别的线程正在停机（含锁外收尾）。
+bool TGCapturer::WaitStopSettled(std::unique_lock<std::mutex>& lock)
+{
+    if (m_stopping && m_stopOwner == std::this_thread::get_id()) {
+        return false;
+    }
+    m_stopSettled.wait(lock, [this] { return !m_stopping; });
+    return true;
+}
+
+void TGCapturer::TeardownLocked()
+{
+    // 先停看护：拆除过程中采集必然停止产出，否则会报出一个无意义的"断流"
+    StopWatchdog();
+
+    // 封装层正在持续写失败（网络已断）：直接打断 I/O，别让收尾（写尾、关闭连接）再各等一个超时
+    if (m_muxer && m_muxer->IsFailing()) {
+        m_bus.Send("muxer", core::BusCommand{core::BusCommandType::Abort, 0});
+    }
+
+    // 按数据流向逆序停止：先停采集，再 drain 编码器，最后收尾封装。
+    // StopCapture 现在是真正的回调栅栏（关闸 + join + 等在飞回调），返回后
+    // 下面拆编码器 / 混流器时不会再有采集线程闯进来。
     if (m_videoSource) {
         m_videoSource->StopCapture();
     }
-    StopAudioMixer();
-    if (m_audioEnabled) {
-        for (auto* source : m_audioSources) {
-            if (source) {
-                source->StopCapture();
-            }
+    // 不按 m_audioEnabled 过滤：Prepare 中途失败时它可能还是上一轮的值，
+    // 而已经 Open 过的音频源无论如何都得停。对没启动的源是无副作用的空操作。
+    for (auto* source : m_audioSources) {
+        if (source) {
+            source->StopCapture();
         }
     }
+    StopAudioMixer();
     if (m_videoEncoder) {
         m_videoEncoder->Stop();
     }
@@ -731,8 +917,25 @@ void TGCapturer::Stop()
     if (m_audioEncoder) {
         m_audioEncoder->Close();
     }
-
+    // 采集源的设备资源（摄像头/麦克风句柄、COM 对象、D3D 纹理、GDI 位图）最后放。
+    // 此时采集线程已 join、在飞回调已退出，Close 不会与产帧并发。
+    // 这一步以前完全缺失：设备只在采集源析构时才释放，而采集源是宿主持有的，
+    // 于是"Stop 之后设备仍被占用"，宿主换一路源重开就会撞上"设备被占用"。
+    if (m_videoSource) {
+        m_videoSource->Close();
+    }
+    for (auto* source : m_audioSources) {
+        if (source) {
+            source->Close();
+        }
+    }
     m_sync->Reset();
+}
+
+void TGCapturer::StopLocked()
+{
+    m_state.store(State::Stopping);
+    TeardownLocked();
     if (m_videoPtsGen) {
         const auto st = m_videoPtsGen->stats();
         TG_LOGI("TGCapturer: 音画同步 avDiff=%lldms clamp=%llu forceSync=%llu adapt=%llu stall=%llu skip=%llu jump=%llu staleReset=%llu syncDrop=%llu bpDrop=%llu",
@@ -744,19 +947,88 @@ void TGCapturer::Stop()
                 static_cast<unsigned long long>(st.skipped),
                 static_cast<unsigned long long>(st.jumpWarns),
                 static_cast<unsigned long long>(st.staleResets),
-                static_cast<unsigned long long>(m_syncDropped),
+                static_cast<unsigned long long>(m_syncDropped.load()),
                 static_cast<unsigned long long>(m_bpDropped.load()));
     }
     m_state.store(State::Idle);
-    if (m_onStop) {
-        m_onStop(0);
-    }
     TG_LOGI("TGCapturer: 已停止");
+}
+
+// ------------------------------------------------------------------ 断流看护
+// 采集类故障（设备被拔 / 权限被撤销 / DXGI 重建失败 / 上层停止推帧）在各平台的表现
+// 五花八门，但共同点是"不再有数据"。与其让每个平台实现各自上报（三端都要改、还容易漏），
+// 不如在内核侧统一按"多久没数据"判定 —— 顺带让 SetAVTimeout 这个接口真正生效。
+void TGCapturer::StartWatchdog()
+{
+    if (m_watchThread.joinable()) {
+        return;
+    }
+    const int64_t nowUs = core::MonotonicClock::NowUs();
+    m_videoWatch.Reset(nowUs);
+    m_audioWatch.Reset(nowUs);
+    m_watchThread = std::jthread([this](std::stop_token st) { WatchLoop(st); });
+}
+
+void TGCapturer::StopWatchdog()
+{
+    if (m_watchThread.joinable()) {
+        m_watchThread.request_stop();
+        m_watchThread.join();
+    }
+}
+
+void TGCapturer::WatchLoop(std::stop_token token)
+{
+    // 轮询周期取 200ms：断流阈值以秒计，这个粒度足够，且几乎不占 CPU
+    constexpr auto kTick = std::chrono::milliseconds(200);
+    int64_t videoStallSinceUs = 0;
+    int64_t audioStallSinceUs = 0;
+
+    auto handle = [&](core::StallWatch& watch, int64_t nowUs, int64_t& stallSinceUs,
+                      int32_t errCode, NotifyMsgType recovered, const char* name) {
+        switch (watch.Poll(nowUs)) {
+            case core::StallWatch::Transition::Stalled: {
+                const int64_t idleMs = watch.IdleUs(nowUs) / 1000;
+                stallSinceUs = nowUs - watch.IdleUs(nowUs);
+                char message[160];
+                std::snprintf(message, sizeof(message), "%s capture stalled for %lldms", name,
+                              static_cast<long long>(idleMs));
+                FireError(errCode, static_cast<int32_t>(idleMs), message);
+                break;
+            }
+            case core::StallWatch::Transition::Recovered: {
+                const int64_t downMs =
+                    stallSinceUs > 0 ? (nowUs - stallSinceUs) / 1000 : 0;
+                TG_LOGI("TGCapturer: %s 采集已恢复（断流 %lldms）", name,
+                        static_cast<long long>(downMs));
+                FireNotify(recovered, "capture recovered", downMs);
+                stallSinceUs = 0;
+                break;
+            }
+            case core::StallWatch::Transition::None:
+                break;
+        }
+    };
+
+    while (!token.stop_requested()) {
+        std::this_thread::sleep_for(kTick);
+        if (token.stop_requested() || m_state.load() != State::Running) {
+            continue;
+        }
+        const int64_t nowUs = core::MonotonicClock::NowUs();
+        handle(m_videoWatch, nowUs, videoStallSinceUs, TGErr_VideoCaptureStalled,
+               EsCap_Notify_VideoCapture_Recovered, "video");
+        handle(m_audioWatch, nowUs, audioStallSinceUs, TGErr_AudioCaptureStalled,
+               EsCap_Notify_AudioCapture_Recovered, "audio");
+    }
 }
 
 void TGCapturer::ReleaseAll()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_lifecycleMutex);
+    std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+    // 析构路径：必须等任何在途的 Stop 收尾完，否则这里开始销毁成员时
+    // 那个线程还在 PublishSync 里回调宿主
+    WaitStopSettled(lock);
     m_ownedVideoSources.clear();
     m_ownedAudioSources.clear();
     m_videoSource = nullptr;
@@ -776,6 +1048,11 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
     if (!frame || m_state.load() != State::Running) {
         return;
     }
+    // 看护判定的是"采集端还在不在产出"，而不是"这一帧最终有没有被编码"：
+    // 下面的 Mute 丢帧、硬件帧无法改写、音频主时钟未就绪而丢弃等分支都会提前 return，
+    // 但这些都不是采集故障，打点必须在它们之前，否则会误报断流。
+    m_videoWatch.OnActivity(core::MonotonicClock::NowUs());
+
     if (m_videoMuted.load()) {
         // 对齐 MediaX：MuteVideo 期间若设置了 pause 图片，用它替换像素但保留 PTS 继续推进；
         // 没设置图片就"冻结最后一帧"—— 当前 frame 本身即是最新一帧，拿去编码等效于冻结。
@@ -801,10 +1078,11 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
 
     // 背压：编码器积压过多则丢帧，保证直播实时性
     constexpr size_t kMaxEncoderPending = 8;
-    if (m_videoEncoder->Pending() >= kMaxEncoderPending) {
+    const size_t encoderPending = m_videoIn->Pending();
+    if (encoderPending >= kMaxEncoderPending) {
         const auto n = m_bpDropped.fetch_add(1) + 1;
         TG_LOGW_THROTTLED(2000000, "TGCapturer: 编码器积压 %zu，丢帧（编码跟不上采集，bpDrop=%llu）",
-                          m_videoEncoder->Pending(), static_cast<unsigned long long>(n));
+                          encoderPending, static_cast<unsigned long long>(n));
         return;
     }
 
@@ -813,7 +1091,7 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
         const int frameW = frame->width;
         const int frameH = frame->height;
         const int64_t framePts = frame->ptsUs;
-        if (!m_bus.Dispatch("video_encoder", std::move(frame))) {
+        if (!m_videoIn->Submit(std::move(frame))) {
             return;
         }
         if (!m_firstFrameSent.exchange(true)) {
@@ -821,7 +1099,6 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
                     static_cast<long long>(framePts));
             FireNotify(EsCap_Notify_Fisrt_Frame_OK, "first frame", 0);
         }
-        m_lastVideoUs = core::MonotonicClock::NowUs();
         return;
     }
 
@@ -879,9 +1156,10 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
     if (useAudioClock) {
         const int64_t pts = m_videoPtsGen->Next(audioRef, m_videoIntervalUs, true, m_audioClock->IdleUs());
         if (pts == core::kInvalidPtsUs) {
-            ++m_syncDropped;   // 音频停滞已到超前上限 / 视频突发超前音频：本帧不编码
+            // 音频停滞已到超前上限 / 视频突发超前音频：本帧不编码
+            const uint64_t dropped = m_syncDropped.fetch_add(1) + 1;
             TG_LOGW_THROTTLED(2000000, "TGCapturer: 视频超前音频（突发到达或音频停滞），丢帧（syncDrop=%llu）",
-                              static_cast<unsigned long long>(m_syncDropped));
+                              static_cast<unsigned long long>(dropped));
             return;
         }
         frame->ptsUs = pts;
@@ -899,7 +1177,7 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
     const int height = frame->height;
     const int64_t pts = frame->ptsUs;
 
-    if (!m_bus.Dispatch("video_encoder", std::move(frame))) {
+    if (!m_videoIn->Submit(std::move(frame))) {
         return;
     }
 
@@ -907,7 +1185,6 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
         TG_LOGI("TGCapturer: 首帧视频 %dx%d pts=%lld", width, height, static_cast<long long>(pts));
         FireNotify(EsCap_Notify_Fisrt_Frame_OK, "first frame", 0);
     }
-    m_lastVideoUs = core::MonotonicClock::NowUs();
 }
 
 // 外部注入的音频：同样进混流器（走 0 号通道，没有内部音频源时由它独占）
@@ -942,6 +1219,10 @@ void TGCapturer::OnAudioFrame(AudioCapSourceType type, core::FramePtr frame)
                 TG_LOGI("TGCapturer: 外部注入音频 type=%d 占用混流通道 %d（%dHz %dch）",
                         static_cast<int>(type), id, frame->sampleRate, frame->channels);
             } else {
+                // 通道建不起来 = 这一路音频被永久丢弃，原先静默 return，宿主完全无感
+                TG_LOGE("TGCapturer: 为外部音频 type=%d 创建混流通道失败",
+                        static_cast<int>(type));
+                FireError(TGErr_Internal, 0, "add audio mixer channel failed");
                 return;
             }
         }
@@ -959,7 +1240,7 @@ int TGCapturer::PushExternalVideoFrame(const uint8_t* data, int width, int heigh
                                        int64_t ptsUs, void* pixelBuffer)
 {
     if (m_state.load() != State::Running) {
-        return -1;
+        return TGErr_InvalidState;
     }
     auto frame = std::make_shared<core::Frame>();
     frame->kind = core::MediaKind::Video;
@@ -981,17 +1262,18 @@ int TGCapturer::PushExternalVideoFrame(const uint8_t* data, int width, int heigh
 #else
         frame->hwKind = core::HwKind::None;
         TG_LOGW_THROTTLED(3000000, "TGCapturer: 当前平台不支持外部注入硬件帧，该帧按无效处理");
-        return -4;
+        return TGErr_NotSupported;
 #endif
         // 硬件帧没有系统内存像素，pixFmt 无意义（与采集侧 GPU 帧保持一致）
         frame->pixFmt = AV_PIX_FMT_NONE;
     } else if (data) {
         if (width <= 0 || height <= 0) {
-            return -3;
+            return TGErr_InvalidArgument;
         }
         const int rowStride = stride > 0 ? stride : width;
         if (rowStride < width) {
-            return -3;   // stride 不能小于宽度，否则 Y 平面行会重叠
+            // stride 不能小于宽度，否则 Y 平面行会重叠
+            return TGErr_InvalidArgument;
         }
         // NV12 是两平面：Y(stride × h) + UV(stride × h/2)
         const size_t ySize = static_cast<size_t>(rowStride) * height;
@@ -1009,19 +1291,23 @@ int TGCapturer::PushExternalVideoFrame(const uint8_t* data, int width, int heigh
         frame->width = width & ~1;
         frame->height = height & ~1;
     } else {
-        return -2;
+        return TGErr_InvalidArgument;   // data 与 pixelBuffer 都为空
     }
     // 调用方自带时间轴时锁定 PTS，内核不再用音频主时钟改写（见 videoUseExternalPts）
     frame->ptsLocked = m_useExternalVideoPts && ptsUs >= 0;
     OnVideoFrame(std::move(frame));
-    return 0;
+    return TGErr_OK;
 }
 
 int TGCapturer::PushExternalAudioFrame(AudioCapSourceType type, const uint8_t* data, int size,
                                        int sampleRate, int channels, int64_t ptsUs)
 {
-    if (m_state.load() != State::Running || !data || size <= 0) {
-        return -1;
+    if (m_state.load() != State::Running) {
+        return TGErr_InvalidState;
+    }
+    if (!data || size <= 0 || sampleRate <= 0 || channels <= 0) {
+        // 原先这些参数错误与"未 Start"共用 -1，宿主无法区分是时序问题还是参数问题
+        return TGErr_InvalidArgument;
     }
     auto frame = std::make_shared<core::Frame>();
     frame->kind = core::MediaKind::Audio;
@@ -1040,7 +1326,7 @@ int TGCapturer::PushExternalAudioFrame(AudioCapSourceType type, const uint8_t* d
     frame->ptsUs = effectivePts;
     frame->captureUs = effectivePts;
     OnAudioFrame(type, std::move(frame));
-    return 0;
+    return TGErr_OK;
 }
 
 // ------------------------------------------------------------------ 运行期控制
@@ -1084,7 +1370,7 @@ int TGCapturer::SetPauseInfo(const PauseParams& params)
     const int h = m_videoParams.height > 0 ? m_videoParams.height : 720;
     if (!m_pauseFrame->Load(params.picture, w, h, params.rotate)) {
         TG_LOGE("TGCapturer: SetPauseInfo 加载失败 picture=%s", params.picture.c_str());
-        return -1;
+        return TGErr_InvalidArgument;
     }
     return 0;
 }
@@ -1104,18 +1390,26 @@ int TGCapturer::SetupWatermarkInfo(const WatermarkParams& params)
 
 int TGCapturer::SetAVTimeout(int64_t audioTimeoutMs, int64_t videoTimeoutMs)
 {
-    if (audioTimeoutMs > 0) {
-        m_audioTimeoutMs = audioTimeoutMs;
+    // 两个阈值都用于断流看护（见 WatchLoop）：超过阈值没有数据就上报 TGErr_*CaptureStalled。
+    // videoTimeoutMs 另外还是编码器侧"落后音频即丢帧"的兜底阈值。
+    if (audioTimeoutMs <= 0 || videoTimeoutMs <= 0) {
+        // 传 0 不能照单全收：maxLagUs=0 会让编码器把每一帧都判成"落后音频"而全部丢弃。
+        // 要关闭看护请显式传负数（见下）
+        TG_LOGE("TGCapturer: SetAVTimeout 入参无效 audio=%lld video=%lld（保留 %lld/%lld）",
+                static_cast<long long>(audioTimeoutMs), static_cast<long long>(videoTimeoutMs),
+                static_cast<long long>(m_audioTimeoutMs.load()),
+                static_cast<long long>(m_videoTimeoutMs.load()));
+        return TGErr_InvalidArgument;
     }
-    if (videoTimeoutMs > 0) {
-        m_videoTimeoutMs = videoTimeoutMs;
-        m_videoEncoder->SetMaxLagUs(videoTimeoutMs * 1000);
-    } else {
-        // 传 0 不能照单全收：maxLagUs=0 会让编码器把每一帧都判成"落后音频"而全部丢弃
-        TG_LOGW("TGCapturer: SetAVTimeout 的 videoTimeoutMs=%lld 无效，保留 %lldms",
-                static_cast<long long>(videoTimeoutMs), static_cast<long long>(m_videoTimeoutMs));
-    }
-    return 0;
+    m_audioTimeoutMs.store(audioTimeoutMs);
+    m_videoTimeoutMs.store(videoTimeoutMs);
+    m_videoEncoder->SetMaxLagUs(videoTimeoutMs * 1000);
+    // 运行期调用也立即生效
+    m_videoWatch.Configure(videoTimeoutMs * 1000);
+    m_audioWatch.Configure(m_audioEnabled ? audioTimeoutMs * 1000 : 0);
+    TG_LOGI("TGCapturer: SetAVTimeout audio=%lldms video=%lldms",
+            static_cast<long long>(audioTimeoutMs), static_cast<long long>(videoTimeoutMs));
+    return TGErr_OK;
 }
 
 // ------------------------------------------------------------------ 统计
@@ -1224,18 +1518,82 @@ float TGCapturer::GetTrafficStats()
 }
 
 // ------------------------------------------------------------------ 回调
+// 门面自己的错误 / 通知：异步发布，由总线的事件分发线程投递。
+// 采集 / 编码线程调用这里不会被宿主回调阻塞
 void TGCapturer::FireError(int32_t what, int32_t extra, const std::string& msg)
 {
-    TG_LOGE("TGCapturer: error what=%d extra=%d msg=%s", what, extra, msg.c_str());
-    if (m_onError) {
-        m_onError(what, extra, msg.c_str());
-    }
+    m_bus.Publish(core::BusEventType::Error, "capturer", what, msg, extra);
 }
 
 void TGCapturer::FireNotify(NotifyMsgType type, const std::string& content, int64_t data)
 {
-    if (m_onNotify) {
-        m_onNotify(type, content, data);
+    m_bus.Publish(core::BusEventType::Notify, "capturer", static_cast<int32_t>(type), content, 0, data);
+}
+
+// 总线事件的唯一出口：转给宿主回调（回调拷贝出来在锁外执行）。
+// 内核自己要对事件做联动反应时（例如收到 X 就给某个节点发命令），也加在这里。
+void TGCapturer::OnBusEvent(const core::BusEvent& event)
+{
+    switch (event.type) {
+        case core::BusEventType::Error: {
+            TG_LOGE("TGCapturer: error source=%s what=%d extra=%d msg=%s", event.source.c_str(),
+                    event.code, event.extra, event.message.c_str());
+            // 记下最后一个错误码，Stop 时带给 OnStopCallback，宿主能据此判断本轮是否正常收尾
+            m_lastRuntimeError.store(event.code);
+            OnErrorCallback cb;
+            {
+                std::lock_guard<std::mutex> lock(m_callbackMutex);
+                cb = m_onError;
+            }
+            if (cb) {
+                cb(event.code, event.extra, event.message.c_str());
+            }
+            break;
+        }
+        case core::BusEventType::Notify: {
+            OnNotifyCallback cb;
+            {
+                std::lock_guard<std::mutex> lock(m_callbackMutex);
+                cb = m_onNotify;
+            }
+            if (cb) {
+                cb(static_cast<NotifyMsgType>(event.code), event.message, event.data);
+            }
+            break;
+        }
+        case core::BusEventType::Prepared: {
+            OnPreparedCallback cb;
+            {
+                std::lock_guard<std::mutex> lock(m_callbackMutex);
+                cb = m_onPrepared;
+            }
+            if (cb) {
+                cb(this);
+            }
+            break;
+        }
+        case core::BusEventType::Started: {
+            OnStartCallback cb;
+            {
+                std::lock_guard<std::mutex> lock(m_callbackMutex);
+                cb = m_onStart;
+            }
+            if (cb) {
+                cb();
+            }
+            break;
+        }
+        case core::BusEventType::Stopped: {
+            OnStopCallback cb;
+            {
+                std::lock_guard<std::mutex> lock(m_callbackMutex);
+                cb = m_onStop;
+            }
+            if (cb) {
+                cb(event.code);
+            }
+            break;
+        }
     }
 }
 

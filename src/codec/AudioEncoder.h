@@ -12,6 +12,7 @@
 #include "core/Bus.h"
 #include "core/Clock.h"
 #include "core/Frame.h"
+#include "core/Health.h"
 #include "core/MediaTypes.h"
 #include "core/Queue.h"
 #include "core/Thread.h"
@@ -23,8 +24,6 @@ extern "C"
 
 namespace TGCapture
 {
-class Muxer;
-
 namespace codec
 {
 
@@ -37,13 +36,16 @@ public:
     int Open(const AudioEncoderParams& params, const core::AudioMediaType& srcType);
     void Close();
 
-    void SetMuxer(Muxer* muxer) noexcept { m_muxer = muxer; }
     void SetSyncClock(std::shared_ptr<core::AVSync> sync) { m_sync = std::move(sync); }
 
+    // BusNode：编码后的包经 Forward 交给链上的下一个节点（muxer）
     bool Submit(core::FramePtr frame) override;
-    size_t Pending() const override;
+    [[nodiscard]] size_t Pending() const override;
+    bool OnCommand(const core::BusCommand& command) override;   // 支持 Flush
 
     [[nodiscard]] AVCodecContext* CodecContext() const noexcept { return m_ctx; }
+    // 最后一次底层失败的 AVERROR（0 = 无）：Open 失败后由 TGCapturer 填进事件 extra
+    [[nodiscard]] int32_t LastAvError() const noexcept { return m_lastAvError.load(); }
     [[nodiscard]] bool IsOpened() const noexcept { return m_ctx != nullptr; }
     [[nodiscard]] uint64_t EncodedFrames() const noexcept { return m_encoded.load(); }
     [[nodiscard]] const std::string& CodecName() const noexcept { return m_codecName; }
@@ -57,6 +59,8 @@ protected:
 
 private:
     int EncodeOne(const core::FramePtr& frame);
+    // 编码结果归集：连续失败超过 1s 上报一次 TGErr_AudioEncodeFailed（extra = AVERROR）
+    void OnEncodeResult(bool ok, int ret);
     int Drain();
     void DeliverPacket(core::AVPacketPtr packet);
 
@@ -73,8 +77,10 @@ private:
     std::unique_ptr<core::BoundedQueue<core::FramePtr>> m_queue;
     std::shared_ptr<core::AVSync> m_sync;
 
-    Muxer* m_muxer = nullptr;
     std::atomic<uint64_t> m_encoded{0};
+    // 运行期失败判定（core/Health.h）：连续失败超过 1s 上报一次 TGErr_AudioEncodeFailed
+    core::FailureTracker m_encodeFail;
+    std::atomic<int32_t> m_lastAvError{0};
     std::atomic<int64_t> m_encodeLatencyUs{0};   // capture → encode out EMA（μs）
     std::atomic_bool m_opened{false};
 };

@@ -1,8 +1,9 @@
 #include "codec/AudioEncoder.h"
 
+#include <cstdio>
+
 #include "core/AvError.h"
 #include "core/Logger.h"
-#include "mux/Muxer.h"
 
 extern "C"
 {
@@ -33,6 +34,9 @@ int AudioEncoder::Open(const AudioEncoderParams& params, const core::AudioMediaT
     // 重开：队列在 Close() 时被永久关闭，必须显式重开
     m_queue->Reopen();
     m_encoded.store(0);
+    m_encodeFail.Reset();
+    m_encodeFail.Configure(1000000, 200000);
+    m_lastAvError.store(0);
     // 上一轮没凑满一帧的残留 PCM 不能带进新一轮，否则开头会多出一段错位音频
     m_pcmBuffer.clear();
     m_nextPts = 0;
@@ -47,11 +51,14 @@ int AudioEncoder::Open(const AudioEncoderParams& params, const core::AudioMediaT
     }
     if (!codec) {
         TG_LOGE("AudioEncoder: 找不到 AAC 编码器");
+        m_lastAvError.store(AVERROR_ENCODER_NOT_FOUND);
         return -1;
     }
 
     m_ctx = avcodec_alloc_context3(codec);
     if (!m_ctx) {
+        TG_LOGE("AudioEncoder: 分配编码器上下文失败 codec=%s", m_codecName.c_str());
+        m_lastAvError.store(AVERROR(ENOMEM));
         return -2;
     }
 
@@ -70,6 +77,7 @@ int AudioEncoder::Open(const AudioEncoderParams& params, const core::AudioMediaT
     if (openRet < 0) {
         TG_LOGE("AudioEncoder: avcodec_open2 失败 %d (%s) codec=%s", openRet, core::AvErr(openRet),
                 m_codecName.c_str());
+        m_lastAvError.store(openRet);
         avcodec_free_context(&m_ctx);
         return -3;
     }
@@ -86,6 +94,10 @@ void AudioEncoder::Close()
     if (m_ctx) {
         avcodec_free_context(&m_ctx);
     }
+    // 残留 PCM 必须在这里放掉：只在 Open() 里 clear 的话，
+    // "编码失败 → Stop → 不再重开"这条路径上这块内存会一直挂到对象析构
+    m_pcmBuffer.clear();
+    m_pcmBuffer.shrink_to_fit();
     m_queue->Close();
     m_opened.store(false);
 }
@@ -110,9 +122,7 @@ void AudioEncoder::Loop(std::stop_token token)
         if (!item.has_value()) {
             continue;
         }
-        if (EncodeOne(*item) < 0) {
-            TG_LOGW("AudioEncoder: 编码一帧失败 codec=%s", m_codecName.c_str());
-        }
+        EncodeOne(*item);   // 失败的归集与上报在 EncodeOne 内部（OnEncodeResult）
     }
     Drain();
 }
@@ -141,6 +151,16 @@ int AudioEncoder::EncodeOne(const core::FramePtr& frame)
     m_pcmBuffer.insert(m_pcmBuffer.end(), src, src + samples);
 
     const size_t need = static_cast<size_t>(frameSize) * static_cast<size_t>(channels);
+    // 背压上限：编码持续失败时本函数会提前返回，剩余样本留在缓冲里等下一批。
+    // 没有上限的话，缓冲会以采集速率单向增长（44.1kHz 立体声约 176 KB/s）且 Close() 也不清，
+    // 最终是一条在故障状态下慢慢吃光内存的路径。超限丢最旧的，保留最新音频。
+    const size_t kMaxPending = need * 16;
+    if (m_pcmBuffer.size() > kMaxPending) {
+        const size_t drop = m_pcmBuffer.size() - kMaxPending;
+        TG_LOGW_THROTTLED(1000000, "AudioEncoder: PCM 积压超限，丢弃最旧 %zu 个样本（编码持续失败？）",
+                          drop);
+        m_pcmBuffer.erase(m_pcmBuffer.begin(), m_pcmBuffer.begin() + static_cast<long>(drop));
+    }
     if (m_pcmBuffer.size() < need) {
         return 0;  // 数据不足，等待下一批
     }
@@ -165,7 +185,13 @@ int AudioEncoder::EncodeOne(const core::FramePtr& frame)
         avFrame->sample_rate = m_ctx->sample_rate;
         avFrame->nb_samples = frameSize;   // 先确定样本数，再分配缓冲
 
-        if (av_frame_get_buffer(avFrame.get(), 0) < 0) {
+        // 取不到缓冲 = 内存不足，按编码失败计入（原先静默 return，宿主完全无感）
+        if (int bufRet = av_frame_get_buffer(avFrame.get(), 0); bufRet < 0) {
+            TG_LOGE_THROTTLED(1000000, "AudioEncoder: av_frame_get_buffer 失败 %d (%s)", bufRet,
+                              core::AvErr(bufRet));
+            OnEncodeResult(false, bufRet);
+            // 这一块编码不出去了，直接丢掉：留在缓冲里下次还是同样的结果，只是把内存耗尽
+            m_pcmBuffer.erase(m_pcmBuffer.begin(), m_pcmBuffer.begin() + static_cast<long>(need));
             return -2;
         }
 
@@ -181,6 +207,10 @@ int AudioEncoder::EncodeOne(const core::FramePtr& frame)
         } else {
             memcpy(avFrame->data[0], chunk, static_cast<size_t>(frameSize) * channels * sizeof(int16_t));
         }
+        // 数据已经拷进 AVFrame，这里就消费掉（注意 chunk 随之失效，后面不再用它）。
+        // 原先放在循环末尾，send_frame / receive_packet 失败时会跳过它，
+        // 于是编码每失败一次缓冲就多留一块，故障期间单向增长。
+        m_pcmBuffer.erase(m_pcmBuffer.begin(), m_pcmBuffer.begin() + static_cast<long>(need));
 
         avFrame->pts = basePts + frameDurUs * chunkIndex;
         ++chunkIndex;
@@ -188,6 +218,7 @@ int AudioEncoder::EncodeOne(const core::FramePtr& frame)
         ret = avcodec_send_frame(m_ctx, avFrame.get());
         if (ret < 0) {
             TG_LOGE_THROTTLED(1000000, "AudioEncoder: send_frame 失败 %d (%s)", ret, core::AvErr(ret));
+            OnEncodeResult(false, ret);
             return -4;
         }
         while (ret >= 0) {
@@ -198,14 +229,15 @@ int AudioEncoder::EncodeOne(const core::FramePtr& frame)
             }
             if (ret < 0) {
                 TG_LOGE_THROTTLED(1000000, "AudioEncoder: receive_packet 失败 %d (%s)", ret, core::AvErr(ret));
+                OnEncodeResult(false, ret);
                 return -5;
             }
             // 音频主时钟由 TGCapturer 的混流器推进（见 TGCapturer::MixLoop），这里不再重复更新
             DeliverPacket(std::move(packet));
         }
 
-        m_pcmBuffer.erase(m_pcmBuffer.begin(), m_pcmBuffer.begin() + static_cast<long>(need));
         m_encoded.fetch_add(1);
+        OnEncodeResult(true, 0);
     }
     // 兜底时钟按"实际送出的样本数"推进，供下一批没带 ptsUs 的帧使用
     m_nextPts = basePts + frameDurUs * chunkIndex;
@@ -219,6 +251,26 @@ int AudioEncoder::EncodeOne(const core::FramePtr& frame)
         }
     }
     return 0;
+}
+
+// 与视频编码器同一套判定：连续失败 1s 才上报，期间恢复则只打日志
+void AudioEncoder::OnEncodeResult(bool ok, int ret)
+{
+    const int64_t nowUs = core::MonotonicClock::NowUs();
+    if (ok) {
+        if (m_encodeFail.OnSuccess(nowUs)) {
+            TG_LOGI("AudioEncoder: 编码已恢复 codec=%s", m_codecName.c_str());
+        }
+        return;
+    }
+    m_lastAvError.store(ret);
+    if (m_encodeFail.OnFailure(nowUs)) {
+        char message[160];
+        std::snprintf(message, sizeof(message), "audio encode failing for %lldms (%s)",
+                      static_cast<long long>(m_encodeFail.FailingUs(nowUs) / 1000),
+                      core::AvErr(ret));
+        ReportError(TGErr_AudioEncodeFailed, message, ret);
+    }
 }
 
 int AudioEncoder::Drain()
@@ -238,11 +290,28 @@ int AudioEncoder::Drain()
     return 0;
 }
 
+bool AudioEncoder::OnCommand(const core::BusCommand& command)
+{
+    if (command.type == core::BusCommandType::Flush) {
+        if (m_queue) {
+            m_queue->Clear();
+        }
+        return true;
+    }
+    return false;
+}
+
 void AudioEncoder::DeliverPacket(core::AVPacketPtr packet)
 {
-    if (m_muxer && packet) {
-        m_muxer->SubmitAudioPacket(std::move(packet));
+    if (!packet) {
+        return;
     }
+    auto out = std::make_shared<core::Frame>();
+    out->kind = core::MediaKind::Packet;
+    out->streamKind = core::MediaKind::Audio;
+    out->keyFrame = true;   // 音频包都可独立解码
+    out->packet = std::move(packet);
+    Forward(std::move(out));
 }
 
 }  // namespace TGCapture::codec

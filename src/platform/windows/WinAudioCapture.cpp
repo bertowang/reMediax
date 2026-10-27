@@ -163,8 +163,18 @@ int WinAudioCapture::Open(int sampleRate, int channels)
 
 bool WinAudioCapture::InitWASAPI()
 {
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    m_comInited = SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
+    // 只有"本次调用真的完成了初始化"才记账，将来才配一次 CoUninitialize。
+    // RPC_E_CHANGED_MODE 表示本线程已以另一种模式初始化过 COM —— 它**失败且不增加引用计数**，
+    // 当成功记账会让 ReleaseWASAPI 多调一次 CoUninitialize，把宿主线程的 apartment 计数打负，
+    // 表现为宿主其它 COM 调用随机失败。多次 Open 同理：只认第一次。
+    if (!m_comInited) {
+        const HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        m_comInited = SUCCEEDED(comHr);
+        if (comHr == RPC_E_CHANGED_MODE) {
+            TG_LOGW("WinAudioCapture: COM 已由宿主以其它模式初始化，本对象不接管其生命周期");
+        }
+    }
+    HRESULT hr = S_OK;
 
     // 枚举器保留为成员：既用于首次打开，也用于后续默认设备变更的 RetryOpen 以及反注册回调。
     if (!m_enumerator) {
@@ -175,29 +185,45 @@ bool WinAudioCapture::InitWASAPI()
         }
     }
 
+    // 下面每个失败分支都走 ReleaseEndpoint()：原先是直接 return，
+    // 于是"设备拿到了但 Activate 失败""client 建好了但 Initialize 失败"这些中途态
+    // 会把 COM 对象一路留着，重试时再被新指针覆盖 —— 每失败一轮泄漏一个 IMMDevice
+    // 加一个已 Initialize 的 IAudioClient（后者还占着音频端点不放）。
     const EDataFlow flow = m_loopback ? eRender : eCapture;
+    if (m_device) {
+        // 重入保护：失败重试路径可能带着上一轮的 device 进来，覆写前先放掉
+        m_device->Release();
+        m_device = nullptr;
+    }
     if (!m_deviceId.empty()) {
         // 指定端点（ListAudioDevices 取到的 id）
         hr = m_enumerator->GetDevice(m_deviceId.c_str(), &m_device);
         if (FAILED(hr) || !m_device) {
             TG_LOGW("WinAudioCapture: 指定设备不可用，回落默认设备");
+            if (m_device) {
+                m_device->Release();
+                m_device = nullptr;
+            }
             hr = m_enumerator->GetDefaultAudioEndpoint(flow, eConsole, &m_device);
         }
     } else {
         hr = m_enumerator->GetDefaultAudioEndpoint(flow, eConsole, &m_device);
     }
     if (FAILED(hr) || !m_device) {
+        ReleaseEndpoint();
         return false;
     }
 
     hr = m_device->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&m_audioClient));
     if (FAILED(hr) || !m_audioClient) {
+        ReleaseEndpoint();
         return false;
     }
 
     WAVEFORMATEX* waveFormat = nullptr;
     hr = m_audioClient->GetMixFormat(&waveFormat);
     if (FAILED(hr) || !waveFormat) {
+        ReleaseEndpoint();
         return false;
     }
 
@@ -212,6 +238,7 @@ bool WinAudioCapture::InitWASAPI()
     hr = m_audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, duration, 0, waveFormat, nullptr);
     if (FAILED(hr)) {
         CoTaskMemFree(waveFormat);
+        ReleaseEndpoint();
         return false;
     }
 
@@ -219,6 +246,7 @@ bool WinAudioCapture::InitWASAPI()
     hr = m_audioClient->GetService(IID_IAudioCaptureClient, reinterpret_cast<void**>(&m_captureClient));
     CoTaskMemFree(waveFormat);
     if (FAILED(hr) || !m_captureClient) {
+        ReleaseEndpoint();   // 此时 audioClient 已 Initialize，不放就一直占着端点
         return false;
     }
 
@@ -236,9 +264,7 @@ bool WinAudioCapture::InitWASAPI()
     av_channel_layout_uninit(&inLayout);
     if (swrRet < 0 || !m_swr || swr_init(m_swr) < 0) {
         TG_LOGW("WinAudioCapture: swr 初始化失败");
-        if (m_swr) {
-            swr_free(&m_swr);
-        }
+        ReleaseEndpoint();   // 原先只放了 swr，device / audioClient / captureClient 全留着
         return false;
     }
 
@@ -273,42 +299,8 @@ void WinAudioCapture::UnregisterDeviceNotify()
     m_notifyClient = nullptr;
 }
 
-void WinAudioCapture::ReleaseWASAPI()
+void WinAudioCapture::ReleaseEndpoint()
 {
-    // 回调要先摘，不然 COM 线程可能在采集对象释放后还回来置标志
-    UnregisterDeviceNotify();
-    if (m_audioClient) {
-        m_audioClient->Stop();
-        m_audioClient->Release();
-        m_audioClient = nullptr;
-    }
-    if (m_captureClient) {
-        m_captureClient->Release();
-        m_captureClient = nullptr;
-    }
-    if (m_device) {
-        m_device->Release();
-        m_device = nullptr;
-    }
-    if (m_enumerator) {
-        m_enumerator->Release();
-        m_enumerator = nullptr;
-    }
-    if (m_swr) {
-        swr_free(&m_swr);
-    }
-    if (m_comInited) {
-        CoUninitialize();
-        m_comInited = false;
-    }
-}
-
-// 工作线程安全时机重开 AudioClient：对齐 MediaX::WinMMCapturer::RetryOpen。
-// 释放 AudioClient / CaptureClient / Device（保留 enumerator、COM 已 Init、notifyClient），
-// 重新 GetDefaultAudioEndpoint + Activate + Initialize + Start。
-int WinAudioCapture::RetryOpen()
-{
-    TG_LOGI("WinAudioCapture: RetryOpen 开始 loopback=%d", m_loopback ? 1 : 0);
     if (m_audioClient) {
         m_audioClient->Stop();
         m_audioClient->Release();
@@ -326,17 +318,49 @@ int WinAudioCapture::RetryOpen()
         swr_free(&m_swr);
         m_swr = nullptr;
     }
+    m_bufferFrames = 0;
+}
+
+void WinAudioCapture::Close()
+{
+    ReleaseWASAPI();
+}
+
+void WinAudioCapture::ReleaseWASAPI()
+{
+    // 回调要先摘，不然 COM 线程可能在采集对象释放后还回来置标志
+    UnregisterDeviceNotify();
+    ReleaseEndpoint();
+    if (m_enumerator) {
+        m_enumerator->Release();
+        m_enumerator = nullptr;
+    }
+    if (m_comInited) {
+        CoUninitialize();
+        m_comInited = false;
+    }
+}
+
+// 工作线程安全时机重开 AudioClient：对齐 MediaX::WinMMCapturer::RetryOpen。
+// 释放 AudioClient / CaptureClient / Device（保留 enumerator、COM 已 Init、notifyClient），
+// 重新 GetDefaultAudioEndpoint + Activate + Initialize + Start。
+int WinAudioCapture::RetryOpen()
+{
+    TG_LOGI("WinAudioCapture: RetryOpen 开始 loopback=%d", m_loopback ? 1 : 0);
+    ReleaseEndpoint();
 
     const EDataFlow flow = m_loopback ? eRender : eCapture;
     HRESULT hr = m_enumerator ? m_enumerator->GetDefaultAudioEndpoint(flow, eConsole, &m_device) : E_FAIL;
     if (FAILED(hr) || !m_device) {
         TG_LOGW("WinAudioCapture: RetryOpen GetDefaultAudioEndpoint 失败 hr=0x%08X",
                 static_cast<unsigned>(hr));
+        ReleaseEndpoint();
         return -1;
     }
     hr = m_device->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&m_audioClient));
     if (FAILED(hr) || !m_audioClient) {
         TG_LOGW("WinAudioCapture: RetryOpen Activate 失败 hr=0x%08X", static_cast<unsigned>(hr));
+        ReleaseEndpoint();
         return -1;
     }
 
@@ -344,6 +368,7 @@ int WinAudioCapture::RetryOpen()
     hr = m_audioClient->GetMixFormat(&waveFormat);
     if (FAILED(hr) || !waveFormat) {
         TG_LOGW("WinAudioCapture: RetryOpen GetMixFormat 失败");
+        ReleaseEndpoint();
         return -1;
     }
     m_deviceChannels = waveFormat->nChannels;
@@ -358,6 +383,7 @@ int WinAudioCapture::RetryOpen()
     if (FAILED(hr)) {
         CoTaskMemFree(waveFormat);
         TG_LOGW("WinAudioCapture: RetryOpen Initialize 失败 hr=0x%08X", static_cast<unsigned>(hr));
+        ReleaseEndpoint();
         return -1;
     }
     m_audioClient->GetBufferSize(&m_bufferFrames);
@@ -374,7 +400,7 @@ int WinAudioCapture::RetryOpen()
     CoTaskMemFree(waveFormat);
     if (FAILED(hr) || !m_captureClient || swrRet < 0 || !m_swr || swr_init(m_swr) < 0) {
         TG_LOGW("WinAudioCapture: RetryOpen 后端重建失败");
-        if (m_swr) swr_free(&m_swr);
+        ReleaseEndpoint();   // 不只放 swr：失败时 client / device 也必须还回去
         return -1;
     }
     m_audioClient->Start();

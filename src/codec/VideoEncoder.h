@@ -12,6 +12,7 @@
 #include "core/Bus.h"
 #include "core/Clock.h"
 #include "core/Frame.h"
+#include "core/Health.h"
 #include "core/MediaTypes.h"
 #include "core/Queue.h"
 #include "core/Thread.h"
@@ -32,8 +33,6 @@ struct ID3D11Texture2D;
 
 namespace TGCapture
 {
-class Muxer;
-
 namespace codec
 {
 
@@ -47,7 +46,6 @@ public:
     int Open(const VideoEncoderParams& params, const core::VideoMediaType& srcType);
     void Close();
 
-    void SetMuxer(Muxer* muxer) noexcept { m_muxer = muxer; }
     void SetSyncClock(std::shared_ptr<core::AVSync> sync) { m_sync = std::move(sync); }
     void SetMaxLagUs(int64_t us) noexcept { m_maxLagUs = us; }
 
@@ -64,18 +62,20 @@ public:
     // GPU 模式下，需要变换或分辨率不一致时是否允许回读到内存处理
     void SetGpuReadbackFallback(bool allow) noexcept { m_gpuReadbackFallback = allow; }
 
-    // BusNode
+    // BusNode：编码后的包经 Forward 交给链上的下一个节点（muxer）；
+    // 下游积压用基类的 DownstreamPending() 查询，用于背压
     bool Submit(core::FramePtr frame) override;
-    size_t Pending() const override;
-
-    // 背压：下游（muxer）积压过多时上游可减速
-    size_t DownstreamPending() const;
+    [[nodiscard]] size_t Pending() const override;
+    // Flush：丢弃编码队列积压；RequestKeyFrame：下一帧强制输出 IDR
+    bool OnCommand(const core::BusCommand& command) override;
 
     [[nodiscard]] AVCodecContext* CodecContext() const noexcept { return m_ctx; }
     [[nodiscard]] bool IsOpened() const noexcept { return m_ctx != nullptr; }
     [[nodiscard]] uint64_t EncodedFrames() const noexcept { return m_encoded.load(); }
     [[nodiscard]] uint64_t DroppedFrames() const noexcept { return m_dropped.load(); }
     [[nodiscard]] const std::string& CodecName() const noexcept { return m_codecName; }
+    // 最后一次底层失败的 AVERROR（0 = 无）：Open 失败后由 TGCapturer 填进事件 extra
+    [[nodiscard]] int32_t LastAvError() const noexcept { return m_lastAvError.load(); }
 
     // 端到端编码延迟 EMA（微秒）：capture → encode out 的滑动平均，供 GetStatsInfo 输出
     [[nodiscard]] int64_t EncodeLatencyUs() const noexcept { return m_encodeLatencyUs.load(); }
@@ -86,6 +86,8 @@ protected:
 
 private:
     int EncodeOne(const core::FramePtr& frame);
+    // 编码结果归集：连续失败超过 1s 上报一次 TGErr_VideoEncodeFailed（extra = AVERROR）
+    void OnEncodeResult(bool ok, int ret);
     int DrainLocked();
     void DeliverPacket(core::AVPacketPtr packet);
 
@@ -140,12 +142,15 @@ private:
     std::shared_ptr<core::AVSync> m_sync;
     int64_t m_maxLagUs = 120000;  // 视频落后音频超过 120ms 则丢帧
 
-    Muxer* m_muxer = nullptr;  // 非拥有
+    std::atomic_bool m_forceKeyFrame{false};   // RequestKeyFrame 置位，EncodeOne 消费
 
     std::atomic<uint64_t> m_encoded{0};
     std::atomic<uint64_t> m_dropped{0};
     // 端到端编码延迟 EMA（微秒），EncodeOne 结束时按 α=1/8 更新（对齐 MediaX 常用 EMA 系数）
     std::atomic<int64_t> m_encodeLatencyUs{0};
+    // 运行期失败判定（core/Health.h）：连续失败超过 1s 上报一次 TGErr_VideoEncodeFailed
+    core::FailureTracker m_encodeFail;
+    std::atomic<int32_t> m_lastAvError{0};
     int64_t m_lastPtsUs = -1;   // 上一帧 PTS，用于 PTS 回退保护
     std::atomic_bool m_opened{false};
 };

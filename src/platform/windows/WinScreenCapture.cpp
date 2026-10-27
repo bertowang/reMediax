@@ -127,11 +127,28 @@ WinScreenCapture::WinScreenCapture(HWND hwnd, VideoCapMode mode, VideoScaleStrat
 WinScreenCapture::~WinScreenCapture()
 {
     Stop();
+    Close();
+}
+
+void WinScreenCapture::Close()
+{
     ReleaseDXGI();
+    ReleaseGdi();
+}
+
+void WinScreenCapture::ReleaseGdi()
+{
     if (m_bitmap) {
+        // 先把原位图选回 DC：位图处于选中状态时 DeleteObject 会失败（GDI 规定），
+        // 原先直接删，4K 下每个采集对象泄漏一张 ~33MB 的 DIB
+        if (m_memDC && m_oldBitmap) {
+            SelectObject(m_memDC, m_oldBitmap);
+        }
         DeleteObject(m_bitmap);
         m_bitmap = nullptr;
     }
+    m_oldBitmap = nullptr;
+    m_bmpBits = nullptr;   // 随 DIB 一起失效，不置空的话补建前会被当成"已就绪"
     if (m_memDC) {
         DeleteDC(m_memDC);
         m_memDC = nullptr;
@@ -282,7 +299,11 @@ bool WinScreenCapture::InitGdi(int width, int height)
             TG_LOGE("WinScreenCapture: CreateDIBSection 失败");
             return false;
         }
-        SelectObject(m_memDC, m_bitmap);
+        // 记下被换出的原位图：ReleaseGdi 要先把它选回去才能删掉 m_bitmap
+        const HGDIOBJ prev = SelectObject(m_memDC, m_bitmap);
+        if (!m_oldBitmap) {
+            m_oldBitmap = prev;
+        }
     }
     return true;
 }

@@ -53,6 +53,64 @@ enum NotifyMsgType
     EsCap_Notify_AudioMetaInfo_Changed = 10,
     EsCap_Notify_SystemFreeze = 20,
     EsCap_Notify_LocalFile_EOF = 21,
+    // 断流恢复：与 TGErr_VideoCaptureStalled / TGErr_AudioCaptureStalled 配对，
+    // 收到它表示该路又有数据了（data = 本次断流持续的毫秒数）
+    EsCap_Notify_VideoCapture_Recovered = 30,
+    EsCap_Notify_AudioCapture_Recovered = 31,
+};
+
+// ------------------------------------------------------------------ 错误码
+// 全工程唯一的错误码空间：**接口返回值与 OnErrorCallback 的 what 取同一套码**，
+// 同一个数值在任何位置都只有一个含义（这是本枚举存在的首要目的）。
+//
+// 约定
+//   1. 0 = 成功，负数 = 失败；返回值为负时一定能在本枚举里查到。
+//   2. extra = **底层原始错误码**（FFmpeg 的 AVERROR、平台 API 的返回码、子模块码），
+//      仅用于排障，不要用它做分支判断；没有底层码时为 0。
+//      唯一的例外在各项注释里显式写明。
+//   3. 分三段，便于宿主按段粗分类：
+//        -1  ~ -19   调用级：状态 / 配置缺失 / 打开失败（Prepare、Start 的返回值）
+//        -20 ~ -99   调用级：参数与能力（配置类接口、外部注入接口的返回值）
+//        -100 以下   运行期：Start 之后由内核主动上报，只经 OnErrorCallback，无返回值对应
+//   4. 回调线程：Prepare / Start 的失败在调用方线程上同步触发；运行期错误在内核的
+//      事件分发线程上触发。两者都不持有内部锁，回调里允许调用 Stop() / 销毁对象。
+enum TGCaptureError : int32_t
+{
+    TGErr_OK = 0,
+
+    // ---- 调用级：状态与打开失败（Prepare / Start 的返回值，同时经 OnError 上报）----
+    TGErr_InvalidState = -1,       // 当前状态不允许该操作：重复 Prepare、未 Prepare 就 Start、
+                                   // 未 Start 就 PushExternal*Frame。extra = 当前内部状态值
+    TGErr_NotConfigured = -2,      // SetupVideoEncoder / SetupAudioEncoder / SetupMuxer 没有全部成功调用过
+    TGErr_OpenVideoEncoder = -3,   // 视频编码器打开失败。extra = AVERROR 或子模块码
+    TGErr_OpenAudioEncoder = -4,   // 音频编码器打开失败。extra = AVERROR 或子模块码
+    TGErr_OpenMuxer = -5,          // 封装器 / 推流地址打开失败（含连接超时）。extra = AVERROR
+    TGErr_OpenVideoSource = -6,    // 已配置的**原生**视频采集源打不开（设备被占用 / 权限未授予 / 无桌面复制通道）。
+                                   // 外部注入源（TypeOfGameEngine4Slave）打开失败不算错误，由上层推帧
+    TGErr_StartFailed = -7,        // 内部线程启动失败（上一轮未停止干净）。extra = 失败的环节：
+                                   // 1=muxer 2=video encoder 3=audio encoder
+
+    // ---- 调用级：参数与能力 ----
+    TGErr_InvalidArgument = -20,   // 入参非法：空指针、尺寸 ≤ 0、stride < width、采样率 / 声道数 ≤ 0、
+                                   // 推流地址为空、源对象类型不匹配
+    TGErr_NotSupported = -21,      // 当前平台 / 当前模式不支持：Linux 原生采集、非 Win/iOS 的外部硬件帧
+    TGErr_NotImplemented = -22,    // 接口占位，尚未实现（本地文件采集）
+    TGErr_Internal = -23,          // 内部资源创建失败（混流通道、静帧加载、水印纹理等）
+
+    // ---- 运行期（Start 之后，只经 OnErrorCallback）----
+    TGErr_MuxWriteFailed = -101,       // 写包持续失败超过 MuxerParams::writeFailReportMs：
+                                       // 推流断开 / 网络阻塞 / 磁盘写满。extra = 最后一次的 AVERROR。
+                                       // **内核不会自动重连**：FFmpeg 的 I/O 错误是粘性的，出错后同一个
+                                       // 连接不会再写成功。宿主应 Stop() 后重新 Prepare/Start（Stop 不会被卡住）
+    TGErr_VideoEncodeFailed = -102,    // 视频编码持续失败超过 1s（编码器内部错误 / 硬编设备丢失）。extra = AVERROR
+    TGErr_AudioEncodeFailed = -103,    // 音频编码持续失败超过 1s。extra = AVERROR
+    TGErr_VideoCaptureStalled = -104,  // 视频超过 SetAVTimeout 的 videoTimeoutMs 没有新帧：
+                                       // 采集设备丢失 / 权限被撤销 / 屏幕采集重建失败 / 上层停止推帧。
+                                       // extra = 已断流毫秒数。恢复时发 EsCap_Notify_VideoCapture_Recovered
+    TGErr_AudioCaptureStalled = -105,  // 音频超过 audioTimeoutMs 没有新数据（含"采集源打开失败后静音兜底"）。
+                                       // extra = 已断流毫秒数。恢复时发 EsCap_Notify_AudioCapture_Recovered
+    TGErr_MuxTrailerFailed = -106,     // 收尾写文件尾 / 关闭连接失败：产出文件可能缺索引、时长不对。
+                                       // extra = AVERROR。出现在 Stop 过程中，紧随其后的 OnStop 会带同一个码
 };
 
 enum VideoCapMode
@@ -241,6 +299,12 @@ struct MuxerParams
     std::string muxerOutput;          // rtmp:// srt:// 或文件路径
     // 音视频交织阈值：领先的一方暂停写入，等落后的一方追上（0 = 关闭）
     int interleaveMs = 350;
+    // 连接 / 握手阶段（Prepare 里打开输出）的最长等待。超时 Prepare 返回 -5，不会一直卡住。0 = 用默认 10000
+    int connectTimeoutMs = 10000;
+    // 运行期单次写包的最长阻塞。网络卡死时超时打断，Stop 不会被卡住。0 = 用默认 5000
+    int ioTimeoutMs = 5000;
+    // 写包持续失败多久后上报 TGErr_MuxWriteFailed。0 = 用默认 3000
+    int writeFailReportMs = 3000;
 };
 
 struct PauseParams

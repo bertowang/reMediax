@@ -31,6 +31,7 @@ set(TG_PLATFORM "windows" CACHE STRING "目标平台: windows|linux|android|ios"
 set(TG_ABI "x64" CACHE STRING "ABI: x64 | arm64-v8a | armeabi-v7a | x86_64 | fat")
 set(TG_3RD_ROOT "" CACHE PATH "TGCapture3rd 根目录（FfmpegCompileShell 的产出目录）")
 option(TG_BUILD_DEMO "编译测试 demo" ON)
+option(TG_BUILD_TESTS "编译单元测试 tg_tests" ON)
 
 # 依赖目录解析优先级（默认值只在这里定义一处，build.py / CI 都不再重复猜，避免多处漂移）：
 #   1) 命令行 -DTG_3RD_ROOT=<dir>（scripts/build.py 的 --3rd 即透传此值）
@@ -118,6 +119,9 @@ endif()
 
 add_library(tgcapture STATIC ${TG_CORE_SOURCES} ${TG_PLATFORM_SOURCES})
 
+# 版本号只在 project(VERSION) 写一处，GetVersion() 通过宏取用
+target_compile_definitions(tgcapture PRIVATE TGCAPTURE_VERSION_STRING="${PROJECT_VERSION}")
+
 target_include_directories(tgcapture PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>   # 内部以 core/ codec/ 等相对路径引用
@@ -180,6 +184,28 @@ endif()
 if(TG_BUILD_DEMO AND TG_PLATFORM STREQUAL "linux")
     add_executable(tg_capture_demo demo/linux/main.cpp)
     target_link_libraries(tg_capture_demo PRIVATE tgcapture)
+endif()
+
+# ---------------------------------------------------------------- 单元测试
+# 零依赖的迷你框架（tests/tg_test.h）；只测内核（Bus / Queue / 同步时钟 / 混音 / 脱敏），不依赖采集设备。
+# 运行：ctest --test-dir <build> 或直接执行 tg_tests [名称过滤]
+if(TG_BUILD_TESTS AND (TG_PLATFORM STREQUAL "linux" OR TG_PLATFORM STREQUAL "windows"))
+    enable_testing()
+    add_executable(tg_tests
+        tests/test_main.cpp
+        tests/test_url_redact.cpp
+        tests/test_queue.cpp
+        tests/test_bus.cpp
+        tests/test_health.cpp
+        tests/test_error_codes.cpp
+        tests/test_video_pts.cpp
+        tests/test_audio_mixer.cpp)
+    target_include_directories(tg_tests PRIVATE tests)
+    target_link_libraries(tg_tests PRIVATE tgcapture)
+    if(MSVC)
+        target_compile_options(tg_tests PRIVATE /utf-8 /EHsc)
+    endif()
+    add_test(NAME tg_tests COMMAND tg_tests)
 endif()
 
 # ---------------------------------------------------------------- 安装
