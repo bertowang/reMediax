@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <limits>
 
+#include <cstdio>
+
 #include "core/AvError.h"
 #include "core/Logger.h"
 
@@ -103,17 +105,25 @@ int VideoEncoder::Open(const VideoEncoderParams& params, const core::VideoMediaT
     m_queue->Reopen();
     m_encoded.store(0);
     m_dropped.store(0);
+    // 运行期失败判定：连续失败 1s 上报，恢复观察期 200ms（编码是无缓冲的同步调用，
+    // 不像 AVIO 那样需要等缓冲刷过几轮）
+    m_encodeFail.Reset();
+    m_encodeFail.Configure(1000000, 200000);
+    m_lastAvError.store(0);
     m_srcType = srcType;
     m_codecName = params.vCodec.empty() ? "libopenh264" : params.vCodec;
 
     const AVCodec* codec = avcodec_find_encoder_by_name(m_codecName.c_str());
     if (!codec) {
         TG_LOGE("VideoEncoder: 找不到编码器 %s", m_codecName.c_str());
+        m_lastAvError.store(AVERROR_ENCODER_NOT_FOUND);
         return -1;
     }
 
     m_ctx = avcodec_alloc_context3(codec);
     if (!m_ctx) {
+        TG_LOGE("VideoEncoder: 分配编码器上下文失败 codec=%s", m_codecName.c_str());
+        m_lastAvError.store(AVERROR(ENOMEM));
         return -2;
     }
 
@@ -183,7 +193,11 @@ int VideoEncoder::Open(const VideoEncoderParams& params, const core::VideoMediaT
     if (ret < 0) {
         TG_LOGE("VideoEncoder: avcodec_open2 失败 %d (%s) codec=%s", ret, core::AvErr(ret),
                 m_codecName.c_str());
-        avcodec_free_context(&m_ctx);
+        m_lastAvError.store(ret);
+        // 走 Close() 而不是只 free ctx：此前 InitHardwareContext / InitHardwareFrames 已经建起
+        // m_hwDeviceCtx / m_hwFramesCtx（Windows 上还有 staging 纹理），只放 ctx 的话它们会残留，
+        // 下一轮 Open 直接覆盖指针 —— 每失败一次泄漏一整套硬件帧池。
+        Close();
         return -3;
     }
 
@@ -466,9 +480,7 @@ void VideoEncoder::Loop(std::stop_token token)
         if (!item.has_value()) {
             continue;
         }
-        if (EncodeOne(*item) < 0) {
-            TG_LOGW("VideoEncoder: 编码一帧失败 codec=%s", m_codecName.c_str());
-        }
+        EncodeOne(*item);   // 失败的归集与上报在 EncodeOne 内部（OnEncodeResult）
     }
     DrainLocked();
 }
@@ -538,6 +550,7 @@ int VideoEncoder::EncodeOne(const core::FramePtr& frame)
     int ret = avcodec_send_frame(m_ctx, avFrame.get());
     if (ret < 0) {
         TG_LOGE_THROTTLED(1000000, "VideoEncoder: send_frame 失败 %d (%s)", ret, core::AvErr(ret));
+        OnEncodeResult(false, ret);
         return -3;
     }
     if (trace) {
@@ -552,6 +565,7 @@ int VideoEncoder::EncodeOne(const core::FramePtr& frame)
         }
         if (ret < 0) {
             TG_LOGE_THROTTLED(1000000, "VideoEncoder: receive_packet 失败 %d (%s)", ret, core::AvErr(ret));
+            OnEncodeResult(false, ret);
             return -4;
         }
         packet->flags |= (packet->flags & AV_PKT_FLAG_KEY) ? AV_PKT_FLAG_KEY : 0;
@@ -559,6 +573,7 @@ int VideoEncoder::EncodeOne(const core::FramePtr& frame)
     }
 
     m_encoded.fetch_add(1);
+    OnEncodeResult(true, 0);
     // 端到端编码延迟 EMA（μs）：capture → encode out；captureUs 无效时跳过。
     // α=1/8：抗抖动但也能快速跟新；首次采样直接写入
     if (frame->captureUs != AV_NOPTS_VALUE) {
@@ -570,6 +585,27 @@ int VideoEncoder::EncodeOne(const core::FramePtr& frame)
         }
     }
     return 0;
+}
+
+// 编码失败对宿主是"画面停了"，和写包失败同等严重，必须上报；
+// 但偶发一两帧失败不该惊动宿主，所以沿用统一的失败判定（连续 1s）。
+void VideoEncoder::OnEncodeResult(bool ok, int ret)
+{
+    const int64_t nowUs = core::MonotonicClock::NowUs();
+    if (ok) {
+        if (m_encodeFail.OnSuccess(nowUs)) {
+            TG_LOGI("VideoEncoder: 编码已恢复 codec=%s", m_codecName.c_str());
+        }
+        return;
+    }
+    m_lastAvError.store(ret);
+    if (m_encodeFail.OnFailure(nowUs)) {
+        char message[160];
+        std::snprintf(message, sizeof(message), "video encode failing for %lldms (%s)",
+                      static_cast<long long>(m_encodeFail.FailingUs(nowUs) / 1000),
+                      core::AvErr(ret));
+        ReportError(TGErr_VideoEncodeFailed, message, ret);
+    }
 }
 
 int VideoEncoder::DrainLocked()
@@ -657,8 +693,14 @@ core::AVFramePtr VideoEncoder::BuildAVFrame(const core::FramePtr& frame)
         if (m_ctx->pix_fmt == AV_PIX_FMT_D3D11 && m_hwFramesCtx &&
             frame->hwKind == core::HwKind::D3D11Texture) {
             if (av_hwframe_get_buffer(m_hwFramesCtx, avFrame.get(), 0) < 0) {
-                TG_LOGW("VideoEncoder: 硬件帧分配失败，本帧走系统内存");
-            } else if (!CopyFromD3D11Texture(frame, avFrame.get())) {
+                // 必须在这里结束本帧。原先只打一条"本帧走系统内存"就往下落穿，
+                // 可 CPU 侧根本没有像素：控制流会走到下面的泛型硬件分支，
+                // 把 D3D11 纹理写进 data[3]（D3D11 的约定是 data[0]=纹理、data[1]=子资源下标），
+                // 等于把一个格式错误的硬件帧交给编码器。丢帧比喂坏数据安全。
+                TG_LOGW_THROTTLED(3000000, "VideoEncoder: 硬件帧池取帧失败，丢弃本帧");
+                return nullptr;
+            }
+            if (!CopyFromD3D11Texture(frame, avFrame.get())) {
                 // 尺寸不匹配等原因导致显存拷贝失败：允许回读就转 CPU 归一化，否则放弃
                 core::FramePtr cpuFrame;
                 core::FramePtr normalized;

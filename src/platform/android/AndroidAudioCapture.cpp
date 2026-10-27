@@ -72,6 +72,11 @@ bool AndroidAudioCapture::StartJava()
     return true;
 }
 
+void AndroidAudioCapture::Close()
+{
+    StopJava();
+}
+
 void AndroidAudioCapture::StopJava()
 {
     if (!m_started) {

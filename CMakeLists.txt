@@ -196,6 +196,8 @@ if(TG_BUILD_TESTS AND (TG_PLATFORM STREQUAL "linux" OR TG_PLATFORM STREQUAL "win
         tests/test_url_redact.cpp
         tests/test_queue.cpp
         tests/test_bus.cpp
+        tests/test_health.cpp
+        tests/test_error_codes.cpp
         tests/test_video_pts.cpp
         tests/test_audio_mixer.cpp)
     target_include_directories(tg_tests PRIVATE tests)

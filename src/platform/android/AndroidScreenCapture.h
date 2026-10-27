@@ -32,6 +32,11 @@ public:
     // 零拷贝：把帧直接投进编码器 Surface（MediaCodec 的输入 Surface）
     void SetEncoderSurface(jobject surface) noexcept;
 
+    // 停掉 Java 侧采集。幂等；Close 之后再 Open 会重新 StartJava。
+    // 关键：Java 线程才是真正的产帧方，Worker::Stop 只停了本地保活线程 ——
+    // 不在这里切断，Stop 之后 Java 侧仍会继续回调进来。
+    void Close() override;
+
     // 由 Java 侧回调（TGCaptureSystemCapture.nativeOnVideoFrame）
     void OnFrame(const uint8_t* y, int yStride,
                  const uint8_t* u, int uStride,

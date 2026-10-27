@@ -89,20 +89,48 @@ IOSAudioCapture::IOSAudioCapture(AudioCapSourceType type) : capture::AudioSource
 IOSAudioCapture::~IOSAudioCapture()
 {
     Stop();
+    Close();
+}
+
+void IOSAudioCapture::Close()
+{
     if (m_observer) {
         TGIOSAudioObserver* observer = (__bridge_transfer TGIOSAudioObserver*)m_observer;
         [observer detach];
         m_observer = nullptr;
     }
+    ReleaseEngine();
+}
+
+void IOSAudioCapture::ReleaseEngine()
+{
     if (m_engine) {
         AVAudioEngine* engine = (__bridge_transfer AVAudioEngine*)m_engine;
+        // 必须先摘 tap 再 stop：tap block 捕获了裸 this，
+        // 不摘的话在飞的回调可能在对象销毁后仍被调用
+        [engine.inputNode removeTapOnBus:0];
         [engine stop];
         m_engine = nullptr;
+    }
+    m_started = false;
+    // session 要显式 deactivate：只 stop engine 的话 session 仍是 active，
+    // 系统会一直认为 App 在录音（状态栏提示不消失、其它 App 拿不到麦克风）
+    NSError* error = nil;
+    AVAudioSession* session = [AVAudioSession sharedInstance];
+    if (![session setActive:NO
+                withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
+                      error:&error]) {
+        TG_LOGW("IOSAudioCapture: session deactivate 失败: %s",
+                [[error localizedDescription] UTF8String]);
     }
 }
 
 int IOSAudioCapture::Open(int sampleRate, int channels)
 {
+    // 重复 Open 必须先拆上一轮：否则第 205 行的 __bridge_retained 会直接覆盖旧指针，
+    // 旧 AVAudioEngine 既泄漏又仍在运行，两个 engine 的 tap 同时往 OnPcm 推 PCM
+    ReleaseEngine();
+
     m_sampleRate = sampleRate > 0 ? sampleRate : 44100;
     m_channels = channels > 0 ? channels : 2;
 
@@ -134,6 +162,7 @@ int IOSAudioCapture::Open(int sampleRate, int channels)
     AVAudioFormat* format = [input outputFormatForBus:0];
     if (!format) {
         TG_LOGE("IOSAudioCapture: 拿不到输入格式");
+        ReleaseEngine();   // session 已 active，不回滚的话系统一直认为在录音
         return -3;
     }
 
@@ -151,10 +180,15 @@ int IOSAudioCapture::Open(int sampleRate, int channels)
         [[AVAudioConverter alloc] initFromFormat:format toFormat:dstFormat];
     if (!converter || !dstFormat) {
         TG_LOGE("IOSAudioCapture: AVAudioConverter 初始化失败");
+        ReleaseEngine();
         return -5;
     }
 
-    __weak auto weakSelf = this;
+    // 注意：这里不能用 __weak —— 它只对 ObjC 对象指针有意义，对 C++ 裸指针没有弱引用语义
+    // （写了 __weak 也永远非空，是一种误导）。生命周期的真实保证是：
+    // ReleaseEngine 会先 removeTapOnBus 再 stop，之后不会再有回调进来；
+    // 且 OnPcm 最终走基类 Emit()，那里有 EmitGate 栅栏兜底。
+    auto* self = this;
     [input installTapOnBus:0
                 bufferSize:4096
                     format:format
@@ -189,16 +223,17 @@ int IOSAudioCapture::Open(int sampleRate, int channels)
                        const int64_t ptsUs = when && when.hostTime > 0
                                                  ? static_cast<int64_t>(when.hostTime / 1000)
                                                  : core::MonotonicClock::NowUs();
-                       if (auto* self = weakSelf) {
-                           self->OnPcm(reinterpret_cast<const int16_t*>(outBuffer.int16ChannelData[0]),
-                                      static_cast<int>(outBuffer.frameLength), ptsUs);
-                       }
+                       self->OnPcm(reinterpret_cast<const int16_t*>(outBuffer.int16ChannelData[0]),
+                                   static_cast<int>(outBuffer.frameLength), ptsUs);
                      }];
 
     NSError* startError = nil;
     if (![engine startAndReturnError:&startError]) {
         TG_LOGE("IOSAudioCapture: AVAudioEngine 启动失败: %s",
                 [[startError localizedDescription] UTF8String]);
+        // tap 已经装上了，必须摘掉再退；engine 此时还没交给 m_engine，就地清理
+        [input removeTapOnBus:0];
+        ReleaseEngine();
         return -4;
     }
 

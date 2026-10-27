@@ -22,6 +22,9 @@ public:
     ~IOSAudioCapture() override;
 
     int Open(int sampleRate, int channels) override;
+    // 摘 tap、停 engine、deactivate session。幂等；Close 之后再 Open 会完整重建。
+    // 没有它的话 audio session 一直处于 active，宿主停播后系统仍显示"正在录音"。
+    void Close() override;
 
     // 由 ObjC++ 实现侧回调（交错 S16）
     void OnPcm(const int16_t* data, int frames, int64_t ptsUs);
@@ -38,6 +41,8 @@ protected:
 
 private:
     bool RestartEngine();   // 中断结束或路由恢复后尝试重启
+    // 释放 engine / tap / session。Open 的失败分支与 Close 共用，避免两处各漏一点。
+    void ReleaseEngine();
 
 private:
     void* m_engine = nullptr;      // AVAudioEngine*（ARC 由实现文件管理）

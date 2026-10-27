@@ -19,11 +19,33 @@ namespace TGCapture::platform
 IOSScreenCapture::~IOSScreenCapture()
 {
     Stop();
-    if (m_recorder) {
-        RPScreenRecorder* recorder = (__bridge_transfer RPScreenRecorder*)m_recorder;
-        (void)recorder;
-        m_recorder = nullptr;
+    Close();
+}
+
+void IOSScreenCapture::Close()
+{
+    if (!m_recorder) {
+        m_started = false;
+        return;
     }
+    RPScreenRecorder* recorder = (__bridge_transfer RPScreenRecorder*)m_recorder;
+    m_recorder = nullptr;
+    if (@available(iOS 11.0, *)) {
+        // stopCaptureWithHandler 是**异步**的：只发一个停止请求就返回，
+        // 在飞的采样回调仍可能在之后到达。这里等它确认停止，避免回调落在已销毁的对象上。
+        // 带超时是因为 completionHandler 走主队列，若本函数就在主线程被调用会互等 ——
+        // 超时退出后仍有基类 EmitGate 兜底（回调会被丢弃，不会进下游）。
+        dispatch_semaphore_t done = dispatch_semaphore_create(0);
+        [recorder stopCaptureWithHandler:^(NSError* error) {
+            if (error) {
+                TG_LOGW("IOSScreenCapture: stopCapture 返回错误: %s",
+                        [[error localizedDescription] UTF8String]);
+            }
+            dispatch_semaphore_signal(done);
+        }];
+        dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 3LL * NSEC_PER_SEC));
+    }
+    m_started = false;
 }
 
 int IOSScreenCapture::Open(int width, int height, float fps)
@@ -37,10 +59,15 @@ int IOSScreenCapture::Open(int width, int height, float fps)
         return -1;
     }
 
+    // 重复 Open 先拆上一轮：否则下面的 __bridge_retained 覆盖旧指针，每次漏一个 retain
+    Close();
+
     RPScreenRecorder* recorder = [RPScreenRecorder sharedRecorder];
     m_recorder = (__bridge_retained void*)recorder;
 
-    __weak auto weakSelf = this;
+    // 不用 __weak：它对 C++ 裸指针没有弱引用语义（写了也永远非空）。
+    // 生命周期保证来自 Close() 的同步停止 + 基类 Emit 的 EmitGate 栅栏。
+    auto* self = this;
     if (@available(iOS 11.0, *)) {
         [recorder startCaptureWithHandler:^(CMSampleBufferRef sampleBuffer,
                                             RPSampleBufferType bufferType, NSError* error) {
@@ -55,9 +82,7 @@ int IOSScreenCapture::Open(int width, int height, float fps)
             const int64_t ptsUs = (pts.timescale > 0)
                                       ? (pts.value * 1000000LL / pts.timescale)
                                       : core::MonotonicClock::NowUs();
-            if (auto* self = weakSelf) {
-                self->OnSampleBuffer(pixelBuffer, ptsUs);
-            }
+            self->OnSampleBuffer(pixelBuffer, ptsUs);
         }
             completionHandler:^(NSError* error) {
               if (error) {
@@ -72,6 +97,7 @@ int IOSScreenCapture::Open(int width, int height, float fps)
     }
 
     TG_LOGE("IOSScreenCapture: 需要 iOS 11+ 的 startCaptureWithHandler");
+    Close();   // 上面已经 retain 了 recorder，这条失败路径原先直接漏掉
     return -2;
 }
 

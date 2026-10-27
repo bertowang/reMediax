@@ -214,8 +214,12 @@ AudioMixer::~AudioMixer()
 
 void AudioMixer::SetOutputFormat(int sampleRate, int channels)
 {
-    m_outSampleRate = sampleRate;
-    m_outChannels = channels;
+    // 持锁：Mix 会用 (m_outSampleRate, m_outChannels) 这一对去算缓冲区大小，
+    // 不加锁的话混流线程可能拿到"新采样率 + 旧声道数"的组合，
+    // 算出的字节数与声明的 nbSamples/channels 不一致，下游 swr/编码器就会越界读。
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_outSampleRate.store(sampleRate);
+    m_outChannels.store(channels);
 }
 
 int AudioMixer::AddChannel(int id, int sampleRate, int channels, int64_t nowUs)
@@ -233,8 +237,8 @@ int AudioMixer::AddChannel(int id, int sampleRate, int channels, int64_t nowUs)
 
     Channel ch;
     ch.id = id;
-    ch.sampleRate = sampleRate > 0 ? sampleRate : m_outSampleRate;
-    ch.channels = channels > 0 ? channels : m_outChannels;
+    ch.sampleRate = sampleRate > 0 ? sampleRate : m_outSampleRate.load();
+    ch.channels = channels > 0 ? channels : m_outChannels.load();
     ch.active = true;
     ch.clock.Init(ch.sampleRate, ch.channels, nowUs);
 
@@ -262,7 +266,7 @@ int AudioMixer::AddChannel(int id, int sampleRate, int channels, int64_t nowUs)
     av_channel_layout_uninit(&outLayout);
 
     TG_LOGI("AudioMixer: 通道 +1 id=%d %dHz %dch（输出 %dHz %dch）",
-            id, ch.sampleRate, ch.channels, m_outSampleRate, m_outChannels);
+            id, ch.sampleRate, ch.channels, m_outSampleRate.load(), m_outChannels.load());
     m_channels.push_back(std::move(ch));
     return 0;
 }

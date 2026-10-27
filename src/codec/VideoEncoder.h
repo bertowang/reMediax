@@ -12,6 +12,7 @@
 #include "core/Bus.h"
 #include "core/Clock.h"
 #include "core/Frame.h"
+#include "core/Health.h"
 #include "core/MediaTypes.h"
 #include "core/Queue.h"
 #include "core/Thread.h"
@@ -73,6 +74,8 @@ public:
     [[nodiscard]] uint64_t EncodedFrames() const noexcept { return m_encoded.load(); }
     [[nodiscard]] uint64_t DroppedFrames() const noexcept { return m_dropped.load(); }
     [[nodiscard]] const std::string& CodecName() const noexcept { return m_codecName; }
+    // 最后一次底层失败的 AVERROR（0 = 无）：Open 失败后由 TGCapturer 填进事件 extra
+    [[nodiscard]] int32_t LastAvError() const noexcept { return m_lastAvError.load(); }
 
     // 端到端编码延迟 EMA（微秒）：capture → encode out 的滑动平均，供 GetStatsInfo 输出
     [[nodiscard]] int64_t EncodeLatencyUs() const noexcept { return m_encodeLatencyUs.load(); }
@@ -83,6 +86,8 @@ protected:
 
 private:
     int EncodeOne(const core::FramePtr& frame);
+    // 编码结果归集：连续失败超过 1s 上报一次 TGErr_VideoEncodeFailed（extra = AVERROR）
+    void OnEncodeResult(bool ok, int ret);
     int DrainLocked();
     void DeliverPacket(core::AVPacketPtr packet);
 
@@ -143,6 +148,9 @@ private:
     std::atomic<uint64_t> m_dropped{0};
     // 端到端编码延迟 EMA（微秒），EncodeOne 结束时按 α=1/8 更新（对齐 MediaX 常用 EMA 系数）
     std::atomic<int64_t> m_encodeLatencyUs{0};
+    // 运行期失败判定（core/Health.h）：连续失败超过 1s 上报一次 TGErr_VideoEncodeFailed
+    core::FailureTracker m_encodeFail;
+    std::atomic<int32_t> m_lastAvError{0};
     int64_t m_lastPtsUs = -1;   // 上一帧 PTS，用于 PTS 回退保护
     std::atomic_bool m_opened{false};
 };

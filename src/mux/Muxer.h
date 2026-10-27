@@ -3,7 +3,8 @@
 // 总线节点（名字 "muxer"）：
 //   数据面  Submit(Frame{kind=Packet, streamKind=Video|Audio})；编码器链尾就是它
 //   命令面  Flush = 丢弃积压；Abort = 立即打断正在进行的 I/O（拆除路径，不等超时）
-//   事件面  写包持续失败超过阈值 → TGErr_MuxWriteFailed（Error）。不自动重连（I/O 错误在 FFmpeg 里是粘性的）
+//   事件面  写包持续失败超过阈值 → TGErr_MuxWriteFailed；写文件尾失败 → TGErr_MuxTrailerFailed。
+//           两者的 extra 都是底层 AVERROR。不自动重连（I/O 错误在 FFmpeg 里是粘性的）
 //
 // 阻塞保护：所有可能阻塞的 I/O（打开 / 写头 / 写包 / 写尾）都挂在 AVIOInterruptCB 上，
 // 超过各自的超时就被打断 —— 网络卡死时 Stop() 最坏也只等一个 ioTimeout，而不是永久挂起。
@@ -17,6 +18,7 @@
 #include "TGCapture/TGCapturerInterface.h"
 #include "core/Bus.h"
 #include "core/Frame.h"
+#include "core/Health.h"
 #include "core/Queue.h"
 #include "core/Thread.h"
 
@@ -51,7 +53,9 @@ public:
     [[nodiscard]] size_t AudioPending() const;
     [[nodiscard]] bool IsOpened() const noexcept { return m_opened.load(); }
     // 写包正处于连续失败中（用于拆除时决定要不要直接 Abort，不等超时）
-    [[nodiscard]] bool IsFailing() const noexcept { return m_failSinceUs.load() != 0; }
+    [[nodiscard]] bool IsFailing() const noexcept { return m_writeFail.Failing(); }
+    // 最后一次底层失败的 AVERROR（0 = 无）。Open 失败后由 TGCapturer 取来填进事件的 extra
+    [[nodiscard]] int32_t LastAvError() const noexcept { return m_lastAvError.load(); }
 
     // 音视频交织阈值（微秒）：领先的一方暂停写入，等落后的一方追上，0 = 关闭
     void SetInterleaveUs(int64_t us) noexcept { m_interleaveUs.store(us > 0 ? us : 0); }
@@ -60,7 +64,7 @@ public:
     [[nodiscard]] float TrafficBps() const;
     [[nodiscard]] uint64_t WrittenBytes() const noexcept { return m_bytes.load(); }
     [[nodiscard]] uint64_t WrittenPackets() const noexcept { return m_packets.load(); }
-    [[nodiscard]] uint64_t FailedPackets() const noexcept { return m_failedPackets.load(); }
+    [[nodiscard]] uint64_t FailedPackets() const noexcept { return m_writeFail.Failures(); }
     [[nodiscard]] std::string Stats() const;
 
 protected:
@@ -69,7 +73,7 @@ protected:
 private:
     int WriteOne(core::AVPacketPtr packet, bool isVideo);
     void UpdateBitrate(size_t bytes);
-    void OnWriteResult(bool ok, int64_t startUs, int64_t endUs);
+    void OnWriteResult(bool ok, int ret, int64_t startUs, int64_t endUs);
 
     // I/O 中断：返回 1 让 ffmpeg 立即放弃当前阻塞操作
     static int InterruptCb(void* opaque);
@@ -110,13 +114,9 @@ private:
     int64_t m_connectTimeoutUs = 10000000;
     int64_t m_ioTimeoutUs = 5000000;
 
-    // ---- 写包失败追踪（仅 Muxer 线程写，其余线程只读 m_failSinceUs）----
-    int64_t m_writeFailReportUs = 3000000;
-    std::atomic<int64_t> m_failSinceUs{0};   // 本轮连续失败的起点，0 = 当前正常
-    std::atomic<uint64_t> m_failedPackets{0};
-    uint64_t m_failDroppedThisRound = 0;
-    bool m_failReported = false;
-    int64_t m_okSinceUs = 0;   // 失败后第一次写成功的时刻；持续成功够久才算恢复（缓冲写入的成功不算）
+    // ---- 失败追踪（判定逻辑见 core/Health.h；只由 Muxer 线程驱动）----
+    core::FailureTracker m_writeFail;
+    std::atomic<int32_t> m_lastAvError{0};
 };
 
 }  // namespace TGCapture

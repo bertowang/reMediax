@@ -27,6 +27,8 @@ public:
     ~IOSScreenCapture() override;
 
     int Open(int width, int height, float fps) override;
+    // 停止 ReplayKit 并释放 recorder。幂等；Close 之后再 Open 会重新 startCapture。
+    void Close() override;
 
     // 由 ObjC++ 实现侧回调
     void OnSampleBuffer(void* pixelBuffer, int64_t ptsUs);

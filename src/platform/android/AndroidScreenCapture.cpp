@@ -84,6 +84,11 @@ bool AndroidScreenCapture::StartJava()
     return true;
 }
 
+void AndroidScreenCapture::Close()
+{
+    StopJava();
+}
+
 void AndroidScreenCapture::StopJava()
 {
     if (!m_started) {

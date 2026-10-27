@@ -3,6 +3,7 @@
 #define TGCAPTURE_TGCAPTURER_H
 
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -18,6 +19,7 @@
 #include "core/AudioMixer.h"
 #include "core/Bus.h"
 #include "core/Clock.h"
+#include "core/Health.h"
 #include "core/PauseFrame.h"
 #include "core/Watermark.h"
 #include "mux/Muxer.h"
@@ -86,16 +88,23 @@ private:
         Stopping,
     };
 
-    // Prepare 的实际工作（持生命周期锁）。失败时通过 err 带出要上报的错误，
-    // 由外层在**解锁之后**同步触发 —— 宿主回调永远不在内部锁里被调用
+    // Prepare / Start 的实际工作（持生命周期锁）。失败时通过 err 带出要上报的错误，
+    // 由外层在**解锁之后**同步触发 —— 宿主回调永远不在内部锁里被调用。
+    // what 既是上报码也是接口返回值（见 TGCaptureError），extra 是底层原始错误码
     struct PrepareError
     {
         int32_t what = 0;
+        int32_t extra = 0;
         std::string message;
     };
     int PrepareLocked(PrepareError& err);
-    void StartLocked();
+    int StartLocked(PrepareError& err);
     void StopLocked();
+    // 按数据流逆序拆除整条链路（停线程 → 关资源）。Stop 与 Prepare 失败回滚共用同一套顺序，
+    // 避免回滚路径另写一份、漏掉某个节点。对未启动/未打开的节点是无副作用的空操作。
+    void TeardownLocked();
+    // 等待在途的 Stop（含锁外收尾）结束。返回 false 表示调用方自己就是停机线程，不应再停。
+    bool WaitStopSettled(std::unique_lock<std::mutex>& lock);
 
     void OnVideoFrame(core::FramePtr frame);
     // 外部注入的音频（PushExternalAudioFrame）也进混流器
@@ -114,16 +123,31 @@ private:
     void MixLoop(std::stop_token token);
     int ChannelIdOf(capture::AudioSourceBase* source) const;
 
+    // 断流看护：采集类故障（设备丢失 / 权限被撤销 / 采集重建失败 / 上层停推）没有失败返回值，
+    // 共同表现就是"不再有数据"。在内核侧统一探测，比指望每个平台各自上报可靠得多
+    void StartWatchdog();
+    void StopWatchdog();
+    void WatchLoop(std::stop_token token);
+
 private:
     GameID m_gameId = GameID::GAME_ID_DEFAULT;
     std::atomic<State> m_state{State::Idle};
     // 生命周期互斥：Prepare / Start / Stop 三个入口串行化，避免快速启停时
     // "Stop 在 Starting 态跑完、Start 随后才启动线程"导致的野线程。
     //
-    // 必须用 recursive_mutex：Prepare() 内部要触发 m_onPrepared 回调，
-    // 而宿主的标准用法正是在回调里调 Start()（demo 就是这么写的），
-    // 普通 mutex 会在同线程重入时自死锁。
-    std::recursive_mutex m_lifecycleMutex;
+    // 用普通 mutex 而非 recursive：所有宿主回调（Prepared / Started / Stopped / Error）
+    // 都已经移到解锁之后触发，本类内部不存在同线程重入路径。
+    // 这里刻意不留 recursive 的余地 —— 它会把"在持锁状态下回调宿主"这种缺陷
+    // 掩盖成"能跑但状态被嵌套修改"，而不是在测试里立刻暴露。
+    std::mutex m_lifecycleMutex;
+    // Stop 的收尾（Drain + 发 Stopped）必须在锁外做（回调不能在锁内触发），
+    // 于是出现一个空窗：此时锁已放开，别的线程调 Stop 会看到 state==Idle 直接返回，
+    // 以为"已经停干净了"转头就 delete，而收尾阶段仍在回调宿主 → 析构与回调并发。
+    // 用下面三个成员把收尾也纳入"停机未完成"：其它线程等它结束，
+    // 发起停机的线程自己（宿主在 OnStop 里再调 Stop）则直接放行，避免自等。
+    bool m_stopping = false;
+    std::thread::id m_stopOwner;
+    std::condition_variable m_stopSettled;
 
     // 参数
     VideoEncoderParams m_videoParams;
@@ -144,7 +168,9 @@ private:
     // 多源混流（core/AudioMixer：按采样点加和 + 每路 PI/BURST 时钟校正）
     std::unique_ptr<core::AudioMixer> m_mixer;
     int m_audioFrameSize = 1024;
-    std::jthread m_mixThread;
+    // m_mixThread 不在这里声明：MixLoop 会访问 m_bus / m_audioIn / m_audioClock / m_videoPtsGen，
+    // 成员按声明逆序析构，线程必须声明在它访问的所有成员之后才能最先被 join。
+    // 见下方与 m_watchThread 相邻的声明。
 
     // 平台采集句柄（Android：MediaProjection jobject 全局引用，由 SetPrivateData 传入）
     void* m_mediaProjection = nullptr;
@@ -157,7 +183,8 @@ private:
     std::shared_ptr<core::VideoPtsGenerator> m_videoPtsGen;
     std::shared_ptr<core::VideoOnlyTimeline> m_videoOnlyTimeline;
     int64_t m_videoIntervalUs = 33333;
-    uint64_t m_syncDropped = 0;
+    // 采集线程 / 外灌线程 ++，宿主线程在 StopLocked 里读 —— 必须原子（同 m_bpDropped）
+    std::atomic<uint64_t> m_syncDropped{0};
     // 编码前背压丢帧（编码器积压 >= kMaxEncoderPending）：之前不计数，E 场景丢 117 帧统计里不可见
     std::atomic<uint64_t> m_bpDropped{0};
     // 音频主时钟首帧等待：音频未就绪时视频不发帧（避免就绪后 PTS 回退被整段丢弃）
@@ -205,9 +232,17 @@ private:
     // 结果不是"混音"而是"交替输出"。
     std::unordered_map<int, int> m_externalAudioChannels;
     std::mutex m_externalAudioMutex;
-    int64_t m_audioTimeoutMs = 3000;
-    int64_t m_videoTimeoutMs = 3000;
-    int64_t m_lastVideoUs = 0;
+    // 断流阈值（SetAVTimeout 可改）与看护状态
+    std::atomic<int64_t> m_audioTimeoutMs{3000};
+    std::atomic<int64_t> m_videoTimeoutMs{3000};
+    core::StallWatch m_videoWatch;
+    core::StallWatch m_audioWatch;
+    // 两个工作线程声明在最后：它们访问 m_bus / 编码器节点 / 同步时钟，
+    // 逆序析构保证先 join 线程、再销毁线程正在用的东西
+    std::jthread m_mixThread;
+    std::jthread m_watchThread;
+    // 本轮运行期最后一次上报的错误码，Stop 时带给 OnStopCallback（0 = 全程无错误）
+    std::atomic<int32_t> m_lastRuntimeError{0};
 };
 
 }  // namespace TGCapture

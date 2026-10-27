@@ -48,6 +48,9 @@ public:
     void* EnsureD3D11Device();
     [[nodiscard]] void* D3D11Device() const noexcept { return m_device; }
 
+    // 释放 DXGI 与 GDI 资源。幂等；Close 之后再 Open 会重新补建。
+    void Close() override;
+
 protected:
     void Loop(std::stop_token token) override;
 
@@ -56,6 +59,7 @@ private:
     // GDI 兜底资源（DC + DIB 位图）。抽成独立方法：DXGI 失效后要临时回退 GDI，
     // 那时必须能补建这些资源，否则 m_bmpBits 为空 → 采集静默永久失效。
     bool InitGdi(int width, int height);
+    void ReleaseGdi();
     bool InitDXGI(int width, int height);
     // CPU 回读用的 staging 纹理按需创建：GPU 模式下 Open 不建它，
     // 若之后编码器降级把 m_gpuMode 关掉，GrabDXGI 仍能正常工作而不是 CopyResource(nullptr)。
@@ -81,6 +85,10 @@ private:
     HDC m_windowDC = nullptr;    // 窗口 DC（整窗）或显示器 DC
     HDC m_memDC = nullptr;
     HBITMAP m_bitmap = nullptr;
+    // CreateCompatibleDC 返回的 DC 自带一张 1x1 单色位图，SelectObject 会把它换出来。
+    // 必须留着：删除 m_bitmap 之前要先把它选回去，否则位图仍处于"选中"状态，
+    // 按 GDI 规定 DeleteObject 会失败 —— 4K 下每个采集对象漏一张 ~33MB 的 DIB。
+    HGDIOBJ m_oldBitmap = nullptr;
     int m_bmpWidth = 0;
     int m_bmpHeight = 0;
     uint8_t* m_bmpBits = nullptr;
