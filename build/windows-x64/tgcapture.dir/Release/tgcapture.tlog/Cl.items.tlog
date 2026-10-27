@@ -1,7 +1,0 @@
-D:\bertonwang\TGCapture\src\ITGCapturer.cpp;D:\bertonwang\TGCapture\build\windows-x64\tgcapture.dir\Release\ITGCapturer.obj
-D:\bertonwang\TGCapture\src\TGCapturer.cpp;D:\bertonwang\TGCapture\build\windows-x64\tgcapture.dir\Release\TGCapturer.obj
-D:\bertonwang\TGCapture\src\codec\VideoEncoder.cpp;D:\bertonwang\TGCapture\build\windows-x64\tgcapture.dir\Release\VideoEncoder.obj
-D:\bertonwang\TGCapture\src\codec\AudioEncoder.cpp;D:\bertonwang\TGCapture\build\windows-x64\tgcapture.dir\Release\AudioEncoder.obj
-D:\bertonwang\TGCapture\src\mux\Muxer.cpp;D:\bertonwang\TGCapture\build\windows-x64\tgcapture.dir\Release\Muxer.obj
-D:\bertonwang\TGCapture\src\platform\windows\WinScreenCapture.cpp;D:\bertonwang\TGCapture\build\windows-x64\tgcapture.dir\Release\WinScreenCapture.obj
-D:\bertonwang\TGCapture\src\platform\windows\WinAudioCapture.cpp;D:\bertonwang\TGCapture\build\windows-x64\tgcapture.dir\Release\WinAudioCapture.obj
