@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <vector>
 
 #include "core/Logger.h"
 
@@ -650,6 +651,8 @@ int TGCapturer::PrepareLocked(PrepareError& err)
     m_syncDropped.store(0);
     m_bpDropped.store(0);
     m_audioWaitStartUs = 0;
+    m_lastVideoPtsUs = -1;
+    m_lastVideoCaptureUs = -1;
     // 首帧标志必须复位，否则第二轮不再触发 EsCap_Notify_Fisrt_Frame_OK
     m_firstFrameSent.store(false);
     m_lastRuntimeError.store(0);
@@ -1104,8 +1107,8 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
 
     // ---- 音画同步：视频 PTS 由音频时钟反推（不用采集 wall clock）----
     // 对齐 MediaX：每帧独立判定，不保留"已降级"状态 ——
-    // 音频恢复后下一帧 m_audioClock->IsFresh() 自然为 true，直接切回主时钟，
-    // VideoOnlyTimeline 也顺手 Reset 让再次掉线能重新从 0 起算。
+    // 音频恢复后下一帧 m_audioClock->IsFresh() 自然为 true，直接切回主时钟；
+    // 两条时间轴切换时都从最后一个已输出帧接续（见 m_lastVideoPtsUs），保证 PTS 不回退。
     //
     // 关键：判活用 IsFresh(audioTimeoutMs) 而不是 Valid()。Valid() 是单向开关
     // （第一次 Advance/Reserve 后永远 true），音频长时间断流时 ReferencePtsUs()
@@ -1121,11 +1124,14 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
     if (m_audioEnabled && m_audioClock && m_audioClock->IsFresh(m_audioTimeoutMs)) {
         useAudioClock = true;
         audioRef = m_audioClock->ReferencePtsUs();
-        // 音频刚从异常恢复：重置等待起点 + 让 videoOnlyTimeline 下次能从 0 重起
+        // 音频刚从异常恢复：重置等待起点；VideoPtsGenerator 接续 fallback 期间已输出的 PTS
+        // （它的内部 PTS 还停在断流前，直接用会产出回退 PTS，被编码器整段丢弃）
         if (m_audioWaitStartUs != 0) {
-            TG_LOGI("TGCapturer: 音频主时钟恢复，切回主时钟（曾等待/断流 %lldms）",
-                    static_cast<long long>((core::MonotonicClock::NowUs() - m_audioWaitStartUs) / 1000));
+            TG_LOGI("TGCapturer: 音频主时钟恢复，切回主时钟（曾等待/断流 %lldms，接续 pts=%lld）",
+                    static_cast<long long>((core::MonotonicClock::NowUs() - m_audioWaitStartUs) / 1000),
+                    static_cast<long long>(m_lastVideoPtsUs));
             m_audioWaitStartUs = 0;
+            m_videoPtsGen->Rebase(m_lastVideoPtsUs);
             m_videoOnlyTimeline->Reset();
         }
     } else if (m_audioEnabled) {
@@ -1134,11 +1140,18 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
             m_audioWaitStartUs = nowUs;
             // 区分"首帧前等待" vs "运行中断流"的日志，便于定位
             if (m_audioClock && m_audioClock->Valid()) {
-                TG_LOGW("TGCapturer: 音频主时钟断流（最后一拍 %lldms 前），进入 wall-clock fallback",
-                        static_cast<long long>(m_audioTimeoutMs));
+                TG_LOGW("TGCapturer: 音频主时钟断流（超过 %lldms 未推进），进入 wall-clock fallback，接续 pts=%lld",
+                        static_cast<long long>(m_audioTimeoutMs), static_cast<long long>(m_lastVideoPtsUs));
             } else {
                 TG_LOGI("TGCapturer: 等待音频主时钟首帧（最多 %lldms）",
                         static_cast<long long>(m_audioTimeoutMs));
+            }
+            // 运行中断流：wall-clock 时间轴从最后一个已输出帧接续（pts + 采集时刻差），
+            // 而不是从 0 重起 —— 从 0 起会比已输出的 PTS 小，整段被编码器按"PTS 回退"丢掉
+            if (m_lastVideoPtsUs >= 0 && m_lastVideoCaptureUs >= 0) {
+                m_videoOnlyTimeline->Rebase(m_lastVideoPtsUs, m_lastVideoCaptureUs);
+            } else {
+                m_videoOnlyTimeline->Reset();
             }
         }
         // 首帧前（Valid()==false）要尊重 audioTimeoutMs 的等待窗口；
@@ -1176,9 +1189,14 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
     const int width = frame->width;
     const int height = frame->height;
     const int64_t pts = frame->ptsUs;
+    const int64_t captureUs = frame->captureUs;
 
     if (!m_videoIn->Submit(std::move(frame))) {
         return;
+    }
+    if (pts >= 0) {
+        m_lastVideoPtsUs = pts;
+        m_lastVideoCaptureUs = captureUs;
     }
 
     if (!m_firstFrameSent.exchange(true)) {
@@ -1451,18 +1469,23 @@ std::string TGCapturer::GetStatsInfo(StatsInfoType type)
         return out;
     };
 
-    char buffer[1024];
+    // Muxer::Stats() 自带花括号，是完整 JSON 对象，直接嵌入，不能再包一层（否则输出 "{{...}}" 非法 JSON）
+    const std::string muxerJson = m_muxer ? m_muxer->Stats() : std::string("{}");
+    // 嵌入的变长段（mixer 每路诊断、muxer url）可能很长：按实际长度留够余量，避免截断成半个 JSON
+    const std::string diag =
+        (type == StatsInfoType::audioInfo || type == StatsInfoType::metaInfo) ? mixerDiagJson() : std::string();
+    std::vector<char> buffer(1024 + muxerJson.size() + diag.size());
     switch (type) {
         case StatsInfoType::bitrateInfo:
             // 对齐 MediaX：bitrate + bytes + packets，统一报告"写出到网络/文件"的字节量
-            snprintf(buffer, sizeof(buffer),
+            snprintf(buffer.data(), buffer.size(),
                      "{\"bitrate_bps\":%.0f,\"bytes\":%llu,\"packets\":%llu}",
                      m_muxer ? m_muxer->TrafficBps() : 0.0f,
                      m_muxer ? static_cast<unsigned long long>(m_muxer->WrittenBytes()) : 0ULL,
                      m_muxer ? static_cast<unsigned long long>(m_muxer->WrittenPackets()) : 0ULL);
             break;
         case StatsInfoType::videoInfo:
-            snprintf(buffer, sizeof(buffer),
+            snprintf(buffer.data(), buffer.size(),
                      "{\"codec\":\"%s\",\"encoded\":%llu,\"dropped\":%llu,"
                      "\"pending\":%zu,\"latency_us\":%lld}",
                      m_videoEncoder ? m_videoEncoder->CodecName().c_str() : "",
@@ -1471,10 +1494,9 @@ std::string TGCapturer::GetStatsInfo(StatsInfoType type)
                      m_videoEncoder ? m_videoEncoder->Pending() : 0,
                      m_videoEncoder ? static_cast<long long>(m_videoEncoder->EncodeLatencyUs()) : 0LL);
             break;
-        case StatsInfoType::audioInfo: {
+        case StatsInfoType::audioInfo:
             // 音频：编码器基本信息 + mixer 每路 PI/BURST/补偿诊断
-            const std::string diag = mixerDiagJson();
-            snprintf(buffer, sizeof(buffer),
+            snprintf(buffer.data(), buffer.size(),
                      "{\"codec\":\"%s\",\"encoded\":%llu,\"pending\":%zu,"
                      "\"latency_us\":%lld,\"mixer_channels\":%s}",
                      m_audioEncoder ? m_audioEncoder->CodecName().c_str() : "",
@@ -1483,19 +1505,16 @@ std::string TGCapturer::GetStatsInfo(StatsInfoType type)
                      m_audioEncoder ? static_cast<long long>(m_audioEncoder->EncodeLatencyUs()) : 0LL,
                      diag.c_str());
             break;
-        }
         case StatsInfoType::pktInfo:
-            snprintf(buffer, sizeof(buffer), "{%s}", m_muxer ? m_muxer->Stats().c_str() : "");
-            break;
+            return muxerJson;
         case StatsInfoType::metaInfo:
-        default: {
+        default:
             // 快照：三端通用的运行时概览
-            const std::string diag = mixerDiagJson();
-            snprintf(buffer, sizeof(buffer),
+            snprintf(buffer.data(), buffer.size(),
                      "{\"bitrate_bps\":%.0f,\"video\":{\"codec\":\"%s\",\"encoded\":%llu,"
                      "\"dropped\":%llu,\"latency_us\":%lld},"
                      "\"audio\":{\"codec\":\"%s\",\"encoded\":%llu,\"latency_us\":%lld},"
-                     "\"muxer\":{%s},\"mixer\":%s}",
+                     "\"muxer\":%s,\"mixer\":%s}",
                      m_muxer ? m_muxer->TrafficBps() : 0.0f,
                      m_videoEncoder ? m_videoEncoder->CodecName().c_str() : "",
                      m_videoEncoder ? static_cast<unsigned long long>(m_videoEncoder->EncodedFrames()) : 0ULL,
@@ -1504,12 +1523,11 @@ std::string TGCapturer::GetStatsInfo(StatsInfoType type)
                      m_audioEncoder ? m_audioEncoder->CodecName().c_str() : "",
                      m_audioEncoder ? static_cast<unsigned long long>(m_audioEncoder->EncodedFrames()) : 0ULL,
                      m_audioEncoder ? static_cast<long long>(m_audioEncoder->EncodeLatencyUs()) : 0LL,
-                     m_muxer ? m_muxer->Stats().c_str() : "",
+                     muxerJson.c_str(),
                      diag.c_str());
             break;
-        }
     }
-    return std::string(buffer);
+    return std::string(buffer.data());
 }
 
 float TGCapturer::GetTrafficStats()
@@ -1538,8 +1556,13 @@ void TGCapturer::OnBusEvent(const core::BusEvent& event)
         case core::BusEventType::Error: {
             TG_LOGE("TGCapturer: error source=%s what=%d extra=%d msg=%s", event.source.c_str(),
                     event.code, event.extra, event.message.c_str());
-            // 记下最后一个错误码，Stop 时带给 OnStopCallback，宿主能据此判断本轮是否正常收尾
-            m_lastRuntimeError.store(event.code);
+            // 记下最后一个运行期错误码，Stop 时带给 OnStopCallback，宿主能据此判断本轮是否正常收尾。
+            // 调用级误用（重复 Prepare、非法入参等）已经同步返回给调用方，且不影响本轮出流，
+            // 不计入 —— 否则一次误调就让一轮完全正常的录制在 OnStop 里报错
+            if (event.code != TGErr_InvalidState && event.code != TGErr_InvalidArgument &&
+                event.code != TGErr_NotConfigured && event.code != TGErr_NotSupported) {
+                m_lastRuntimeError.store(event.code);
+            }
             OnErrorCallback cb;
             {
                 std::lock_guard<std::mutex> lock(m_callbackMutex);

@@ -225,11 +225,19 @@ int64_t VideoPtsGenerator::Next(int64_t audioRefPts, int64_t frameIntervalUs, bo
         }
         const int64_t newPts = m_currentPts + passUs;
         if (newPts - audioRefPts > m_params.maxLeadUs) {
+            const int64_t capPts = audioRefPts + m_params.maxLeadUs;
+            if (capPts <= m_currentPts) {
+                // 已经钉在上限：再出帧只能靠 ClampMonotonic 的最小步长往上爬（每帧 +帧间隔/10），
+                // 音频停得够久就会越过 maxLead（实测 0.8s 爬出 36ms）。真实帧与补帧一律丢弃，
+                // 等音频恢复，或由调用方判定主时钟失效后切到 wall-clock 时间轴
+                m_clamped.fetch_add(1, std::memory_order_relaxed);
+                return skip();
+            }
             if (!isRealFrame && (++m_clampFill) > m_params.maxConsecutiveClampFill) {
                 // 补帧被连续 clamp：停止产出，避免视频 PTS 被拖着缓慢漂移
                 return skip();
             }
-            m_currentPts = ClampMonotonic(audioRefPts + m_params.maxLeadUs, m_currentPts, intervalUs);
+            m_currentPts = capPts;
             m_clamped.fetch_add(1, std::memory_order_relaxed);
         } else {
             m_clampFill = 0;
@@ -293,11 +301,39 @@ int64_t VideoPtsGenerator::Next(int64_t audioRefPts, int64_t frameIntervalUs, bo
     return m_currentPts;
 }
 
+void VideoPtsGenerator::Rebase(int64_t lastOutputPts) noexcept
+{
+    if (lastOutputPts < 0) {
+        return;
+    }
+    if (m_currentPts == kInvalidPtsUs || lastOutputPts > m_currentPts) {
+        m_currentPts = lastOutputPts;
+    }
+    // 接管期间音频时钟没走，上一个 ref 已无参考意义：清掉，避免恢复首帧被当成"音频跳变"
+    m_prevAudioRef = kInvalidPtsUs;
+    m_prevSysUs = 0;
+    m_stallFrames = 0;
+    m_clampFill = 0;
+    m_adapting = false;
+    m_diffEmaUs = 0;
+}
+
 // ------------------------------------------------------------------ VideoOnlyTimeline
 void VideoOnlyTimeline::Reset() noexcept
 {
     m_baseUs = kInvalidPtsUs;
     m_lastPts = 0;
+}
+
+void VideoOnlyTimeline::Rebase(int64_t anchorPts, int64_t anchorCaptureUs) noexcept
+{
+    if (anchorPts < 0 || anchorCaptureUs < 0) {
+        Reset();
+        return;
+    }
+    // 之后 Next(captureUs) = anchorPts + (captureUs - anchorCaptureUs)
+    m_baseUs = anchorCaptureUs - anchorPts;
+    m_lastPts = anchorPts;
 }
 
 int64_t VideoOnlyTimeline::Next(int64_t captureUs) noexcept

@@ -308,6 +308,8 @@ TG_TEST(ErrorCodes, DuplicatePrepareIsReportedNotSilent)
     TG_EXPECT_EQ(c.Prepare(), int{TGErr_InvalidState});
     TG_EXPECT(rec.HasError(TGErr_InvalidState));
     c.Stop();
+    // 调用级误用已同步返回给调用方，不应让 OnStop 报"本轮非干净收尾"
+    TG_EXPECT_EQ(rec.stopCode.load(), int32_t{0});
 }
 
 TG_TEST(ErrorCodes, CleanStopReportsZeroToHost)

@@ -196,6 +196,55 @@ TG_TEST(VideoPts, UnavailableAudioClockReturnsInvalid)
     TG_EXPECT_EQ(gen.Next(-1, kIntervalUs, true, 0), kInvalidPtsUs);
 }
 
+TG_TEST(VideoPts, VideoOnlyTimelineRebaseContinuesOutputPts)
+{
+    // 运行中音频断流：wall-clock 时间轴必须从最后一个已输出帧接续，不能从 0 重起
+    VideoOnlyTimeline tl;
+    tl.Rebase(2540000, 10000000);   // 最后输出 pts=2.54s，采集时刻 10.0s
+    TG_EXPECT_EQ(tl.Next(10033333), int64_t{2573333});
+    TG_EXPECT_EQ(tl.Next(10500000), int64_t{3040000});
+    // 采集时刻回退：仍单调
+    TG_EXPECT(tl.Next(10400000) > 3040000);
+    // 非法锚点等价 Reset：首帧归零
+    tl.Rebase(-1, 10000000);
+    TG_EXPECT_EQ(tl.Next(20000000), int64_t{0});
+}
+
+TG_TEST(VideoPts, RebaseAfterWallClockTakeoverNeverGoesBackward)
+{
+    // 主时钟断流期间 wall-clock 接管把 PTS 推到了 5.0s；音频恢复时参考略落后（4.98s）。
+    // 接回主时钟后第一帧不能比 5.0s 小（否则编码器按"PTS 回退"丢帧）
+    VideoPtsGenerator gen;
+    RunResult r;
+    int64_t t = 50000;
+    Feed(gen, r, 60, 33333.33, t);   // 正常跑到 ~2s
+    const int64_t lastOut = 5000000;
+    gen.Rebase(lastOut);
+    std::vector<int64_t> after;
+    int64_t ref = 4980000;
+    for (int k = 0; k < 30; ++k) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(33));
+        ref += 33333;
+        const int64_t pts = gen.Next(ref, kIntervalUs, true, 5000);
+        if (pts >= 0) {
+            after.push_back(pts);
+        }
+    }
+    TG_ASSERT(after.size() > 20);
+    TG_EXPECT(after.front() > lastOut);
+    for (size_t i = 1; i < after.size(); ++i) {
+        TG_EXPECT(after[i] > after[i - 1]);
+    }
+    // 接回后与音频的偏差应收敛在 2 帧内
+    TG_EXPECT(std::llabs(gen.stats().avDiffUs) < 2 * kIntervalUs);
+
+    // Rebase 不允许把内部 PTS 拉低
+    const int64_t cur = after.back();
+    gen.Rebase(1000);
+    const int64_t next = gen.Next(ref + 33333, kIntervalUs, true, 5000);
+    TG_EXPECT(next < 0 || next > cur);
+}
+
 TG_TEST(VideoPts, LargeLagForceAligns)
 {
     VideoPtsGenerator gen;

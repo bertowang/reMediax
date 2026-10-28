@@ -22,6 +22,8 @@ extern "C"
 #include <libavcodec/avcodec.h>
 }
 
+struct SwrContext;
+
 namespace TGCapture
 {
 namespace codec
@@ -59,6 +61,8 @@ protected:
 
 private:
     int EncodeOne(const core::FramePtr& frame);
+    // 把 m_pcmBuffer 头部 frameSize 个交错 S16 样本写进 avFrame（按编码器 sample_fmt 转换）
+    bool FillFrame(AVFrame* avFrame, const int16_t* chunk, int frameSize, int channels);
     // 编码结果归集：连续失败超过 1s 上报一次 TGErr_AudioEncodeFailed（extra = AVERROR）
     void OnEncodeResult(bool ok, int ret);
     int Drain();
@@ -67,6 +71,9 @@ private:
 private:
     std::string m_codecName;
     AVCodecContext* m_ctx = nullptr;
+    // 输入恒为交错 S16（混流器输出）。编码器 sample_fmt 不是 S16/S16P 时（ffmpeg 内置 aac、
+    // aac_at 均为 FLTP）必须转换，否则 int16 位模式被当 float 解读 → NaN → 编码持续失败
+    SwrContext* m_swr = nullptr;
 
     core::AudioMediaType m_srcType;
     int m_frameSize = 1024;

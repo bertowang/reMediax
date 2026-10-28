@@ -8,6 +8,7 @@
 extern "C"
 {
 #include <libavutil/opt.h>
+#include <libswresample/swresample.h>
 }
 
 namespace TGCapture::codec
@@ -83,14 +84,37 @@ int AudioEncoder::Open(const AudioEncoderParams& params, const core::AudioMediaT
     }
 
     m_frameSize = m_ctx->frame_size > 0 ? m_ctx->frame_size : 1024;
+
+    // 输入恒为交错 S16。编码器要别的采样格式时（回退到 ffmpeg 内置 aac / aac_at 都是 FLTP）
+    // 必须做格式转换：原先直接 memcpy / 按 int16 拷进 FLTP 平面，float 位模式全是垃圾，
+    // 编码器报 "Input contains NaN/+-Inf"，持续失败 1s 后上报 TGErr_AudioEncodeFailed。
+    // 采样率与声道数两端一致，这里只转格式（swr 在同采样率下不引入延迟）。
+    if (m_ctx->sample_fmt != AV_SAMPLE_FMT_S16 && m_ctx->sample_fmt != AV_SAMPLE_FMT_S16P) {
+        const int swrRet = swr_alloc_set_opts2(&m_swr, &m_ctx->ch_layout, m_ctx->sample_fmt,
+                                               m_ctx->sample_rate, &m_ctx->ch_layout,
+                                               AV_SAMPLE_FMT_S16, m_ctx->sample_rate, 0, nullptr);
+        if (swrRet < 0 || !m_swr || swr_init(m_swr) < 0) {
+            TG_LOGE("AudioEncoder: 采样格式转换初始化失败 codec=%s fmt=%s", m_codecName.c_str(),
+                    av_get_sample_fmt_name(m_ctx->sample_fmt));
+            m_lastAvError.store(swrRet < 0 ? swrRet : AVERROR(EINVAL));
+            swr_free(&m_swr);
+            avcodec_free_context(&m_ctx);
+            return -4;
+        }
+    }
+
     m_opened.store(true);
-    TG_LOGI("AudioEncoder: %s %dHz %dch frame=%d", m_codecName.c_str(), m_ctx->sample_rate,
-            m_ctx->ch_layout.nb_channels, m_frameSize);
+    TG_LOGI("AudioEncoder: %s %dHz %dch frame=%d fmt=%s%s", m_codecName.c_str(), m_ctx->sample_rate,
+            m_ctx->ch_layout.nb_channels, m_frameSize, av_get_sample_fmt_name(m_ctx->sample_fmt),
+            m_swr ? "（S16→转换）" : "");
     return 0;
 }
 
 void AudioEncoder::Close()
 {
+    if (m_swr) {
+        swr_free(&m_swr);
+    }
     if (m_ctx) {
         avcodec_free_context(&m_ctx);
     }
@@ -195,22 +219,16 @@ int AudioEncoder::EncodeOne(const core::FramePtr& frame)
             return -2;
         }
 
-        const bool planar = av_sample_fmt_is_planar(m_ctx->sample_fmt) != 0;
         const int16_t* chunk = m_pcmBuffer.data();
-        if (planar) {
-            for (int c = 0; c < channels; ++c) {
-                auto* dst = reinterpret_cast<int16_t*>(avFrame->data[c]);
-                for (int i = 0; i < frameSize; ++i) {
-                    dst[i] = chunk[static_cast<size_t>(i) * channels + c];
-                }
-            }
-        } else {
-            memcpy(avFrame->data[0], chunk, static_cast<size_t>(frameSize) * channels * sizeof(int16_t));
-        }
+        const bool filled = FillFrame(avFrame.get(), chunk, frameSize, channels);
         // 数据已经拷进 AVFrame，这里就消费掉（注意 chunk 随之失效，后面不再用它）。
         // 原先放在循环末尾，send_frame / receive_packet 失败时会跳过它，
         // 于是编码每失败一次缓冲就多留一块，故障期间单向增长。
         m_pcmBuffer.erase(m_pcmBuffer.begin(), m_pcmBuffer.begin() + static_cast<long>(need));
+        if (!filled) {
+            OnEncodeResult(false, AVERROR(EINVAL));
+            return -3;
+        }
 
         avFrame->pts = basePts + frameDurUs * chunkIndex;
         ++chunkIndex;
@@ -251,6 +269,31 @@ int AudioEncoder::EncodeOne(const core::FramePtr& frame)
         }
     }
     return 0;
+}
+
+bool AudioEncoder::FillFrame(AVFrame* avFrame, const int16_t* chunk, int frameSize, int channels)
+{
+    if (m_swr) {
+        const uint8_t* in[1] = {reinterpret_cast<const uint8_t*>(chunk)};
+        const int converted = swr_convert(m_swr, avFrame->data, frameSize, in, frameSize);
+        if (converted != frameSize) {
+            TG_LOGE_THROTTLED(1000000, "AudioEncoder: 采样格式转换失败 ret=%d need=%d", converted,
+                              frameSize);
+            return false;
+        }
+        return true;
+    }
+    if (av_sample_fmt_is_planar(m_ctx->sample_fmt) != 0) {   // S16P
+        for (int c = 0; c < channels; ++c) {
+            auto* dst = reinterpret_cast<int16_t*>(avFrame->data[c]);
+            for (int i = 0; i < frameSize; ++i) {
+                dst[i] = chunk[static_cast<size_t>(i) * channels + c];
+            }
+        }
+    } else {   // S16
+        memcpy(avFrame->data[0], chunk, static_cast<size_t>(frameSize) * channels * sizeof(int16_t));
+    }
+    return true;
 }
 
 // 与视频编码器同一套判定：连续失败 1s 才上报，期间恢复则只打日志

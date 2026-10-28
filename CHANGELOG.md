@@ -17,7 +17,8 @@
 - 新增断流看护线程，覆盖"没有失败返回值、只表现为不再出数据"的采集类故障
   （`TGErr_VideoCaptureStalled` / `TGErr_AudioCaptureStalled`，恢复后发 `*_Recovered` 通知），
   顺带让 `SetAVTimeout` 的 `audioTimeoutMs` 真正生效（此前只存不用）。
-- `OnStopCallback(err)` 带出本轮最后一次错误码（此前恒为 0）。
+- `OnStopCallback(err)` 带出本轮最后一次**运行期**错误码（此前恒为 0）。调用级误用
+  （`InvalidState` / `InvalidArgument` / `NotConfigured` / `NotSupported`，已同步返回给调用方）不计入。
 
 #### 失败后的状态与资源
 - `Prepare` 中途失败现在会完整回滚（统一走 `TeardownLocked`）。此前只改状态就返回，后果是双重的：
@@ -104,13 +105,28 @@
 - 推流地址在日志与统计里统一脱敏（`core::RedactUrl`）。
 - 心跳日志增加 `bus[pend=… evDrop=…]`。
 
+### iOS 回归修复（模拟器 x86_64 实测）
+- `IOSScreenCapture::Loop` 退出时调 `stopCaptureWithHandler:nil`，ReplayKit 回调 nil block 必崩（SIGSEGV）；
+  启停改为只由 `Open` / `Close` 管理。
+- `AudioEncoder`：指定编码器不可用回退到内置 `aac`（FLTP）时仍按 S16 拷贝，编码全部失败（-103、文件写不出）；
+  非 S16/S16P 编码器改经 swresample 转换。
+- 音频运行中断流：wall-clock 时间轴从 0 重起导致 PTS 回退被编码器整段丢弃（视频断档约 2.5s）；
+  现在 fallback 与恢复都从最后一个已输出 PTS 接续（`VideoOnlyTimeline::Rebase` / `VideoPtsGenerator::Rebase`）。
+- `VideoPtsGenerator` Pause 档钉在 `maxLead` 后仍按最小步长爬升、越过上限；改为到达上限后丢帧。
+- `GetStatsInfo`：`metaInfo` / `pktInfo` 的 muxer 段多包一层花括号（非法 JSON）；变长段改为按实际长度分配缓冲，避免截断。
+- iOS 链接补 `Foundation` 框架（`IOSAudioCapture` 使用 `NSNotificationCenter`）。
+
 ### 工程
 - 新增单元测试 `tg_tests`（Bus / Queue / 视频 PTS / 混音 / URL 脱敏）与 `scripts/accept_av.sh`、`scripts/ci.sh`。
 - `build/` 不再纳入版本管理。
 
 ### 已知限制
 - 写失败后不自动重连（FFmpeg I/O 错误为粘性），需宿主 `Stop()` 后重新 `Prepare()`。
-- 以上改动只在 Linux 上构建与回归，Windows 待复测。
+- 以上改动在 Linux 与 iOS（模拟器 x86_64 全链路回归 + 真机 arm64 编译）验证，Windows / Android 待复测。
+- iOS 麦克风采集与 ReplayKit 出帧未在真机实测：模拟器命令行进程中 `AURemoteIO` 初始化会 RPC 超时 abort（系统限制），
+  ReplayKit 无授权不出帧（仅验证了 Prepare / Stop / 重新 Prepare 不崩、断流看护上报 -104）。
+- 音频运行中断流时，视频在 `maxLead`（500ms）到 `audioTimeoutMs` 之间按设计丢帧，产物中会有
+  `audioTimeoutMs - 500ms` 的视频空档；需要更短空档可调小 `SetAVTimeout` 的 `audioTimeoutMs`。
 - 部分平台的音频采集源在 `Open` 失败后仍会注入静音帧，混流照常出帧，断流看护探测不到。
   这种"有声道但全静音"只能靠日志排查，无法自动上报。
 - 本轮的平台层改动（Windows / iOS / Android）未在目标平台编译验证，需复测。

@@ -116,6 +116,10 @@ public:
     // 返回 kInvalidPtsUs 也可能是"建议丢弃本帧"（视频突发超前 / 补帧被连续 clamp），见 stats().skipped
     int64_t Next(int64_t audioRefPts, int64_t frameIntervalUs, bool isRealFrame, int64_t audioIdleUs = -1);
 
+    // 时间轴曾被别人接管（音频断流期间走 wall-clock）后重新交还：
+    // 把内部 PTS 抬到"最后一个已输出 PTS"，并清掉追赶/停滞状态，保证接回后不产出回退 PTS
+    void Rebase(int64_t lastOutputPts) noexcept;
+
     struct Stats
     {
         int64_t avDiffUs = 0;        // 音频 - 视频，>0 表示视频落后
@@ -155,10 +159,13 @@ private:
 
 // ------------------------------------------------------------------ 纯视频时间轴
 // 没有音频时（--no-audio）用采集单调时钟做时间轴：首帧归零，后续按真实采集时刻。
+// 运行中音频断流接管时用 Rebase 接续已输出的时间轴，而不是从 0 重起（否则 PTS 回退被下游整段丢弃）。
 class VideoOnlyTimeline
 {
 public:
     void Reset() noexcept;
+    // 让后续 Next(captureUs) = anchorPts + (captureUs - anchorCaptureUs)；参数非法时等价 Reset
+    void Rebase(int64_t anchorPts, int64_t anchorCaptureUs) noexcept;
     int64_t Next(int64_t captureUs) noexcept;
 
 private:

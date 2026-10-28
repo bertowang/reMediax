@@ -105,7 +105,11 @@ elseif(TG_PLATFORM STREQUAL "ios")
     list(APPEND TG_PLATFORM_SOURCES
         src/platform/ios/IOSScreenCapture.mm
         src/platform/ios/IOSAudioCapture.mm)
+    # Foundation：IOSAudioCapture.mm 用 NSNotificationCenter 订阅 AVAudioSession 中断/路由变更，
+    # 不显式声明的话，纯 C++ 宿主（不自带 Foundation）链接 libtgcapture.a 会报
+    # _OBJC_CLASS_$_NSNotificationCenter 未定义
     list(APPEND TG_PLATFORM_LIBS
+        "-framework Foundation"
         "-framework CoreFoundation" "-framework CoreVideo" "-framework CoreMedia"
         "-framework VideoToolbox" "-framework AudioToolbox" "-framework AVFoundation"
         "-framework ReplayKit" "-framework UIKit")

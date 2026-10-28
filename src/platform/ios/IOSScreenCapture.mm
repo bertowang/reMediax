@@ -103,16 +103,13 @@ int IOSScreenCapture::Open(int width, int height, float fps)
 
 void IOSScreenCapture::Loop(std::stop_token token)
 {
-    // 帧由 ReplayKit 回调驱动，这里只保活
+    // 帧由 ReplayKit 回调驱动，这里只保活。
+    // 不在这里 stopCapture：recorder 的启停只归 Open/Close 管（Close 带完成回调同步等待）。
+    // 原先这里调 stopCaptureWithHandler:nil —— ReplayKit 会无条件调用 handler，
+    // nil block 直接 SIGSEGV（iOS 模拟器实测 KERN_INVALID_ADDRESS 0x10），且与 Close 重复停止。
     while (!token.stop_requested()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    if (@available(iOS 11.0, *)) {
-        if (m_recorder) {
-            [(__bridge RPScreenRecorder*)m_recorder stopCaptureWithHandler:nil];
-        }
-    }
-    m_started = false;
 }
 
 void IOSScreenCapture::OnSampleBuffer(void* pixelBuffer, int64_t ptsUs)

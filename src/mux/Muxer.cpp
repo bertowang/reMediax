@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <mutex>
+#include <vector>
 
 #include "core/AvError.h"
 #include "core/Clock.h"
@@ -480,8 +481,9 @@ float Muxer::TrafficBps() const
 
 std::string Muxer::Stats() const
 {
-    char buffer[512];
-    snprintf(buffer, sizeof(buffer),
+    // url 长度不定（带鉴权参数的推流地址可达数百字节）：按实际长度留余量，截断会产出半个 JSON
+    std::vector<char> buffer(512 + m_format.size() + m_urlSafe.size());
+    snprintf(buffer.data(), buffer.size(),
              "{\"format\":\"%s\",\"url\":\"%s\",\"bitrate_bps\":%.0f,\"packets\":%llu,"
              "\"video_pending\":%zu,\"audio_pending\":%zu,"
              "\"write_failed\":%llu,\"failing\":%d,\"last_averror\":%d,"
@@ -492,7 +494,7 @@ std::string Muxer::Stats() const
              m_lastAvError.load(),
              static_cast<unsigned long long>(m_videoQueue ? m_videoQueue->DroppedCount() : 0),
              static_cast<unsigned long long>(m_audioQueue ? m_audioQueue->DroppedCount() : 0));
-    return std::string(buffer);
+    return std::string(buffer.data());
 }
 
 }  // namespace TGCapture
