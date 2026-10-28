@@ -1396,7 +1396,6 @@ python scripts/build.py --platform windows [--build-type Debug]
 | 窗口采集黑屏 | 部分窗口（如有 DRM 保护的播放器）不允许采集；先换「整个显示器」确认链路正常，再看日志里的 `WinScreenCapture` 行 |
 | 开播一直「正在连接…」 | 推流地址不可达，会等到连接超时（10s）后弹框；先用本地文件验证，再查网络和地址 |
 
-
 ### 10.4 自动化检查（单元测试 / 验收）
 
 ```bash
