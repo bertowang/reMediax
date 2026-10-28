@@ -172,6 +172,9 @@ def main() -> int:
         if not exe.exists():
             exe = build_dir / name
         print(f"demo: {exe if exe.exists() else '(见 build 目录)'}")
+        if args.platform == "windows":
+            gui = build_dir / "demo" / "windows_gui" / args.build_type / "tg_capture_gui.exe"
+            print(f"gui:  {gui if gui.exists() else '(见 build 目录)'}")
     return 0
 
 

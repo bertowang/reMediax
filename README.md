@@ -70,6 +70,7 @@ TGCapture/
 │   └── ITGCapturer.cpp         Create/Destroy/Init/UnInit
 ├── demo/                       测试 demo（第 10 节）
 │   ├── windows/ linux/         命令行 demo tg_capture_demo（原生采集 / 外灌帧）
+│   ├── windows_gui/            UI demo：Win32 图形界面开播测试工具 tg_capture_gui
 │   ├── android/                UI demo：Kotlin 开播测试 App（Gradle :demo）
 │   └── ios/                    UI demo：UIKit 开播测试 App（CMake → Xcode）
 ├── bindings/android/           Android SDK（Gradle :tgcapture → AAR）：Java API + JNI 胶水
@@ -817,7 +818,7 @@ python scripts/build.py --platform ios    --ide [--team <Team ID>]
 
 | 平台 | IDE | 工程 | 说明 |
 | - | - | - | - |
-| Windows | VS2022 | `build/windows-x64/TGCapture.sln` | 只保留 `Debug`/`Release`；`tg_capture_demo` 为启动工程；调试环境变量已带 ffmpeg DLL 目录，**F5 直接跑** |
+| Windows | VS2022 | `build/windows-x64/TGCapture.sln` | 只保留 `Debug`/`Release`；`tg_capture_gui`（图形界面）为启动工程；工程按 `demo` / `sdk` / `tests` 分到解决方案文件夹；调试工作目录与环境变量已指向 exe 目录（ffmpeg DLL 已自动拷入），**F5 直接跑** |
 | Android | Android Studio | `ide/android` | Gradle 宿主工程：`:tgcapture`（`bindings/android`）通过 `externalNativeBuild` 驱动根 `CMakeLists.txt`，`:demo` 是 App |
 | iOS | Xcode | `build/ios-fat-xcode/TGCapture.xcodeproj` | `--ide` 自动切换到 Xcode 生成器；`TGCaptureDemo` 为默认 scheme |
 
@@ -841,7 +842,7 @@ Windows 产物是 `flat` 布局（无 abi 层），`cmake/Deps.cmake` 按 abi �
 | 平台 | 内核 | demo |
 | - | - | - |
 | Linux | `build/linux-x86_64/libtgcapture.a` | 命令行：`build/linux-x86_64/tg_capture_demo`（外灌帧，不依赖采集设备） |
-| Windows | `build/windows-x64/Release/tgcapture.lib` | 命令行：`build/windows-x64/Release/tg_capture_demo.exe`（+ 同目录 ffmpeg DLL） |
+| Windows | `build/windows-x64/Release/tgcapture.lib` | 命令行：`build/windows-x64/Release/tg_capture_demo.exe`；UI：`build/windows-x64/demo/windows_gui/Release/tg_capture_gui.exe`（均 + 同目录 ffmpeg DLL） |
 | Android | `bindings/android/build/outputs/aar/tgcapture-release.aar`（内含 `libtgcapture_jni.so`）；`build.py` 只出 `build/android-arm64-v8a/libtgcapture.a` | UI：`demo/android/build/outputs/apk/debug/demo-debug.apk` |
 | iOS | `build/ios-fat/libtgcapture.a` | UI：`build/ios-fat/demo/ios/TGCaptureDemo.app`（命令行构建，未签名）；装到真机请用 Xcode 工程 |
 
@@ -855,6 +856,7 @@ Windows 产物是 `flat` 布局（无 abi 层），`cmake/Deps.cmake` 按 abi �
 | - | - | - | - | - | - | - | - |
 | **命令行** | Windows | `demo/windows` | 控制台 `tg_capture_demo.exe` | 根 `CMakeLists.txt`（`build.py` / VS2022） | 屏幕 DXGI·GDI、窗口、人造帧 | WASAPI 麦克风 + 扬声器 | 原生采集、GPU 链路、重开 / 并发回归 |
 | **命令行** | Linux | `demo/linux` | 控制台 `tg_capture_demo` | 根 `CMakeLists.txt`（`build.py`） | 外灌：系统 `ffmpeg` 解素材 → NV12 | 外灌：两路素材 → S16 | 编码 / 混流 / 音画同步压测、故障注入、CI 验收 |
+| **UI** | Windows | `demo/windows_gui` | Win32 对话框 `tg_capture_gui.exe` | 根 `CMakeLists.txt`（`build.py` / VS2022） | 显示器（DXGI·GDI）、指定窗口 | WASAPI 麦克风 + 系统声音，可选具体设备 | 桌面端开播联调、参数对比、Logo / 暂停画面等运行期操作 |
 | **UI** | Android | `demo/android` | Kotlin App（APK） | Gradle（`ide/android`，`:demo` 模块） | MediaProjection 录屏、测试图案 | 麦克风、系统内录、测试音 | 移动端开播联调、模拟器自测 |
 | **UI** | iOS | `demo/ios` | UIKit App（.app） | 根 `CMakeLists.txt` → Xcode 工程 | ReplayKit（App 内画面）、测试图案 | 麦克风、测试音 | 移动端开播联调（仅真机） |
 
@@ -876,7 +878,8 @@ Windows 产物是 `flat` 布局（无 abi 层），`cmake/Deps.cmake` 按 abi �
 # 命令行：产物 build\windows-x64\Release\tg_capture_demo.exe（ffmpeg DLL 已自动拷到同目录）
 python scripts/build.py --platform windows --abi x64 [--build-type Debug]
 
-# IDE：生成并打开 build\windows-x64\TGCapture.sln，tg_capture_demo 是启动工程，F5 直接运行
+# IDE：生成并打开 build\windows-x64\TGCapture.sln（默认启动工程是 tg_capture_gui，
+#      调命令行 demo 时右键 tg_capture_demo →「设为启动项目」）
 python scripts/build.py --platform windows --ide
 ```
 
@@ -1299,6 +1302,100 @@ python3 scripts/build.py --platform ios [--build-type Debug]
 **取产物和日志**：Info.plist 已开启文件共享（`UIFileSharingEnabled`），可以在「文件」App → 我的 iPhone → TGCaptureDemo，
 或者 Finder 的设备页 → 文件，取出 `Documents/records`（本地录制文件）和 `Documents/logs`（内核日志）。
 Xcode 运行时，内核日志同时会输出到控制台（`Init(…, printLog=true)`）。
+
+#### 10.3.3 Windows（`demo/windows_gui`）：图形界面开播测试工具
+
+参照 MediaX 的 MFC 测试界面（`capturer-mfc-ui`）重写，使用 Win32 原生对话框，**不依赖 MFC / ATL**，
+VS2022 默认安装（“使用 C++ 的桌面开发”）就能编译。
+
+**工程结构**
+
+| 文件 | 作用 |
+| - | - |
+| `res/tg_capture_gui.rc` / `resource.h` | 对话框模板（VS2022「资源视图」可以直接编辑）、图标、版本信息 |
+| `res/tg_capture_gui.manifest` | Common Controls v6、DPI 感知、UTF-8 活动代码页 |
+| `src/MainDialog.*` | 界面：控件初始化、参数收集与校验、状态切换、设置保存 |
+| `src/LiveSession.*` | 开播会话：所有 SDK 调用都在**一条工作线程**上串行执行，回调通过 `PostMessage` 送回界面线程 |
+| `src/LiveConfig.*` | 一次开播的完整参数（与控件无关），以及输出地址展开、封装推断 |
+| `src/Devices.*` | 枚举显示器、可采集窗口（与 Alt+Tab 列表一致）、WASAPI 音频设备 |
+| `src/LogBuffer.*` | 内核日志 sink → 界面日志区 + VS「输出」窗口 |
+
+> 选择“系统默认设备”时走公开 API `EnableMicrophoneCapture` / `EnableSpeakerCapture`；
+> 选了具体设备时，和命令行 demo 一样直接创建平台层 `platform::WinAudioCapture` 并 `SetDeviceId`，再 `AddAudioSource`
+> （公开 API 目前不能指定设备）。其余调用全部是公开接口，可以当作 Windows 接入示例来看。
+
+**构建与调试（VS2022）**
+
+```powershell
+# 生成解决方案并用 VS2022 打开（只生成不编译）
+python scripts/build.py --platform windows --ide
+#   或者手工：cmake -S . -B build/windows-x64 -G "Visual Studio 17 2022" -A x64
+#   然后打开 build\windows-x64\TGCapture.sln
+```
+
+1. 解决方案里 `demo` 文件夹下的 `tg_capture_gui` 已设为启动项目，配置选 `Debug` 或 `Release`，按 **F5** 即可。
+2. 调试工作目录就是 exe 所在目录，ffmpeg DLL 构建后会自动拷过去，不需要改 PATH。
+3. 内核日志会同时输出到 VS「输出」窗口（`OutputDebugString`），断点调试时不用切回界面看日志。
+4. 改界面布局：在「资源视图」中打开 `IDD_MAIN`；新增控件后，要在 `resource.h` 里加 ID，并在 `MainDialog.cpp` 中处理。
+
+命令行构建：
+
+```powershell
+python scripts/build.py --platform windows [--build-type Debug]
+# 或 cmake --build build/windows-x64 --config Release --target tg_capture_gui
+# 产物：build\windows-x64\demo\windows_gui\<Debug|Release>\tg_capture_gui.exe
+```
+
+**界面说明**
+
+| 区域 | 选项 | 说明 |
+| - | - | - |
+| ① 视频源 | 采集对象 | 整个显示器，或指定窗口（窗口列表与 Alt+Tab 一致，点「刷新」重新枚举） |
+| | 采集方式 | 显示器：DXGI 桌面复制（推荐）/ GDI（兼容兜底）；窗口：整窗（含标题栏）/ 仅客户区 |
+| | 性能模式 | CPU（兼容性最好）/ GPU（显存直送硬编，见第 7 节） |
+| ② 音频源 | 麦克风 / 系统声音 | 可以同时开，由内核混音；每一路都能选具体设备，也能单独静音（**直播中也可以切换**） |
+| ③ 编码与输出 | 输出地址 | 下拉框里有预设：`records\tg_{time}.flv`、`.ts`、`rtmp://…`、`srt://…`；也可以点「浏览…」选文件 |
+| | 封装格式 | 「自动」：`.ts` / `srt://` / `udp://` → `mpegts`，其余 → `flv` |
+| | 分辨率 / 帧率 / 码率 / GOP | 1080P / 720P / 540P；15–60fps |
+| | 视频编码 | `libopenh264` / `h264_nvenc` / `h264_amf` / `h264_mf`。启动时会在后台探测一次，本机不可用的选项后面会标「✗本机不可用」（仍可选，内核会自动回落） |
+| | 音频编码 / 码率 | `libfdk_aac` / `aac`；64–192kbps |
+| | 画面旋转 / 翻转 | 0/90/180/270°；水平、垂直镜像（见 4.8） |
+| | 断流告警 | 即 `SetAVTimeout`：超过该时长没有新数据时，日志里会出现 `*CaptureStalled` |
+| ④ 画面控制 | 暂停图片 | 「暂停画面」期间显示的图片；留空则冻结最后一帧。开播前设置后随开播生效，直播中改了要点「应用」 |
+| | Logo | 选择图片、序号（0–5，可同时叠多个）和位置（四角 / 上下居中 / 自定义 X·Y），直播中点「添加 / 更新 / 删除」 |
+| 运行状态 | — | 未开播 / 连接中 / 直播中 / 正在停止；直播中每秒刷新：**实时**码率（载荷 / 封装后）与**平均**码率、**累计**字节（载荷 / 封装后）与包数、音视频各自的码率和字节、编码帧数 / 丢帧 / 积压 / 编码耗时（字段含义见 11 节 `GetStatsInfo`） |
+| 日志 | 级别 / 清空 / 日志目录 | 显示内核日志和 SDK 回调（`[回调] OnPrepared / OnStart / OnError / OnStop`、`[通知] …`）；级别可以随时切换；日志文件写在 exe 目录的 `logs\` 下 |
+| 底部 | 开始直播 / 暂停画面 / 打开输出目录 | 「开始直播」在连接中会变成「正在连接…」，开播成功后变为「停止直播」 |
+
+**操作流程**
+
+1. 启动后，日志里会先出现 `本机可用编码器 视频：… 音频：…`。
+2. 选好视频源、音频源和输出地址，点「开始直播」。按钮先显示「正在连接…」（推流时最长等待连接超时）；收到 `OnStart` 后，状态变为绿色的「直播中」。
+3. 直播中可以：切换麦克风 / 系统声音的静音、暂停 / 恢复画面、添加或修改 Logo、修改暂停图片。
+   ①②③ 区的其他参数在直播期间会置灰，要停播后修改，下次开播时生效。
+4. 点「停止直播」：内核会排空编码器并写入文件尾，所以录制文件是完整的。直接关闭窗口时，会先询问，再同步停播后退出。
+5. 遇到致命错误（`MuxWriteFailed` / `VideoEncodeFailed` / `AudioEncodeFailed`，例如推流断开）时，工具会自动停播并弹框说明原因。
+
+界面上的所有设置都保存在 exe 同目录的 `tg_capture_gui.ini` 里，下次启动时自动恢复（不想要旧设置时删掉这个文件即可）。
+输出地址里的 `{time}` 会在开播时替换成 `年月日_时分秒`，避免多次录制互相覆盖；本地文件的相对路径以 exe 目录为基准。
+
+| 场景 | 推荐设置 |
+| - | - |
+| 本机快速自检 | 默认设置（显示器 + DXGI + 默认麦克风 + `records\tg_{time}.flv`），开播几秒后「打开输出目录」查看录制文件 |
+| 推流联调 | 输出地址填 `rtmp://…` 或 `srt://…`，封装格式选「自动」 |
+| 硬编对比 | 视频编码选 `h264_nvenc` 等，性能模式选 GPU，对比运行状态里的编码耗时 |
+| 只录某个程序 | 采集对象选「指定窗口」，再选「仅客户区」就能去掉标题栏 |
+
+**实测结果**（Win11，2160x3840 竖屏显示器，默认设置）：Release / Debug 都能正常开播和停播；
+录出的 `flv` 用 `ffprobe` 检查为 `h264 1280x720` + `aac 44100Hz`，时长与开播时长一致；关闭窗口后进程正常退出（退出码 0）。
+
+| 常见问题 | 处理 |
+| - | - |
+| 双击 exe 提示缺少 `avcodec-60.dll` 等 | DLL 没有拷到 exe 目录：确认 configure 日志里有 `ffmpeg=<路径>`，然后重新构建（构建后步骤会拷贝） |
+| 选 `h264_amf` 时日志出现 `amfrt64.dll failed to open` | 本机没有 AMD 驱动，属于正常现象，编码器会回落到 `libopenh264` |
+| 窗口采集黑屏 | 部分窗口（如有 DRM 保护的播放器）不允许采集；先换「整个显示器」确认链路正常，再看日志里的 `WinScreenCapture` 行 |
+| 开播一直「正在连接…」 | 推流地址不可达，会等到连接超时（10s）后弹框；先用本地文件验证，再查网络和地址 |
+
 
 ### 10.4 自动化检查（单元测试 / 验收）
 

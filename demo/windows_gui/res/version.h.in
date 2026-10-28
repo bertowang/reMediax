@@ -1,0 +1,10 @@
+// 由 CMake configure_file 生成到构建目录，请勿手改（版本号来源：根 CMakeLists.txt 的 project(VERSION)）
+#ifndef TGUI_VERSION_H
+#define TGUI_VERSION_H
+
+#define TGUI_VER_MAJOR @PROJECT_VERSION_MAJOR@
+#define TGUI_VER_MINOR @PROJECT_VERSION_MINOR@
+#define TGUI_VER_PATCH @PROJECT_VERSION_PATCH@
+#define TGUI_VER_STR   "@PROJECT_VERSION@"
+
+#endif  // TGUI_VERSION_H
