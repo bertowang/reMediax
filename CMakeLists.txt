@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.21)   # 3.21：$<TARGET_RUNTIME_DLLS>（Windows 拷 ffmpeg DLL）
 project(TGCapture VERSION 1.0.0 LANGUAGES CXX)
 
 # ---------------------------------------------------------------- 基本设置
@@ -134,8 +134,9 @@ target_include_directories(tgcapture PUBLIC
     $<INSTALL_INTERFACE:include>)
 
 # ---------------------------------------------------------------- 依赖
+# find_package(TGCapture3rd) → TGCapture3rd::* 导入目标，见 cmake/Deps.cmake
 include(cmake/Deps.cmake)
-tg_link_thirdparty(tgcapture ${TG_PLATFORM} ${TG_ABI} "${TG_3RD_ROOT}")
+tg_link_thirdparty(tgcapture)
 
 target_link_libraries(tgcapture PUBLIC ${TG_PLATFORM_LIBS})
 
@@ -157,21 +158,24 @@ else()
 endif()
 
 # ---------------------------------------------------------------- demo
+# Windows 下 ffmpeg 是 DLL（TGCapture3rd::av* 为 SHARED IMPORTED 目标）：构建后把该 exe
+# 实际依赖的 DLL（$<TARGET_RUNTIME_DLLS>）拷到 exe 同目录，VS 里 F5、ctest、直接双击 exe 都能跑
+function(tg_copy_runtime_dlls target)
+    if(TGCapture3rd_RUNTIME_DLLS)    # 依赖都是静态库时列表为空，copy 命令不能空跑
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    $<TARGET_RUNTIME_DLLS:${target}> "$<TARGET_FILE_DIR:${target}>"
+            COMMAND_EXPAND_LISTS
+            COMMENT "拷贝 ${target} 依赖的 DLL 到输出目录")
+    endif()
+endfunction()
+
 # Windows 可执行程序（命令行 demo / 图形界面测试工具）共用的运行时配置：
-#   - ffmpeg 是 DLL：把 <3rd>/ffmpeg/windows/bin/*.dll 拷到 exe 同目录，
-#     这样 VS 里 F5、以及直接双击 exe 都能跑，不必手工改 PATH；
+#   - 拷贝依赖的 DLL（见 tg_copy_runtime_dlls）；
 #   - VS2022 调试工作目录/环境变量指向 exe 所在目录；
 #   - 在 VS 解决方案里归到 demo 文件夹。
 function(tg_setup_windows_app target)
-    if(TG_FFMPEG_BIN_DIR)
-        file(GLOB _tg_ffmpeg_dlls "${TG_FFMPEG_BIN_DIR}/*.dll")
-        foreach(dll IN LISTS _tg_ffmpeg_dlls)
-            add_custom_command(TARGET ${target} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        "${dll}" "$<TARGET_FILE_DIR:${target}>"
-                COMMENT "拷贝 ${dll} 到 ${target} 输出目录")
-        endforeach()
-    endif()
+    tg_copy_runtime_dlls(${target})
     if(MSVC)
         target_compile_options(${target} PRIVATE /utf-8 /EHsc)
         set_target_properties(${target} PROPERTIES
@@ -193,7 +197,7 @@ if(TG_BUILD_DEMO AND TG_PLATFORM STREQUAL "windows")
     add_subdirectory(demo/windows_gui)
 
     # VS2022 打开解决方案后 F5 直接启动图形界面工具
-    if(MSVC AND CMAKE_VERSION VERSION_GREATER_EQUAL "3.21")
+    if(MSVC)
         set_property(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                      PROPERTY VS_STARTUP_PROJECT tg_capture_gui)
     endif()
@@ -236,6 +240,7 @@ if(TG_BUILD_TESTS AND (TG_PLATFORM STREQUAL "linux" OR TG_PLATFORM STREQUAL "win
         # 平台层实测：直接驱动真实 WASAPI / GDI / DXGI 源，验证失败与重开路径不泄漏
         target_sources(tg_tests PRIVATE tests/test_win_platform.cpp)
         target_link_libraries(tg_tests PRIVATE psapi ole32)
+        tg_copy_runtime_dlls(tg_tests)
     endif()
     if(MSVC)
         target_compile_options(tg_tests PRIVATE /utf-8 /EHsc)

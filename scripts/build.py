@@ -12,6 +12,8 @@
     python scripts/build.py --platform ios --ide [--team <Team ID>]   # 含 demo/ios 开播测试 App
 
 依赖目录（3rd）不给时由 CMake 解析：环境变量 TG_3RD_ROOT > 工程同级 TGCapture3rd。
+依赖以标准 CMake 包引入（find_package(TGCapture3rd)，见 cmake/Deps.cmake）；
+直接调用 cmake 时也可以用 -DCMAKE_PREFIX_PATH=<依赖目录> 代替 TG_3RD_ROOT。
 """
 
 from __future__ import annotations
@@ -32,6 +34,9 @@ PLATFORM_ABI = {
     "android": "arm64-v8a",
     "ios": "fat",
 }
+
+# Windows ABI -> Visual Studio 生成器的 -A 平台名（须与 TGCapture3rd 里该 ABI 的产物一致）
+VS_PLATFORM = {"x64": "x64", "x86": "Win32", "arm64": "ARM64"}
 
 # 依赖根目录不在本脚本里猜：默认值统一由 CMakeLists.txt 解析（--3rd > $TG_3RD_ROOT > 同级探测），
 # 避免出现"脚本和 CMake 两套默认值"的漂移。本脚本只在显式给出 --3rd 时透传。
@@ -91,6 +96,8 @@ def main() -> int:
     args = parser.parse_args()
 
     abi = args.abi or PLATFORM_ABI[args.platform]
+    if args.platform == "windows" and abi not in VS_PLATFORM:
+        parser.error(f"windows 的 --abi 只支持 {'/'.join(VS_PLATFORM)}，收到 {abi}")
     build_dir = DEFAULT_BUILD_DIR / f"{args.platform}-{abi}"
     if args.platform == "ios" and (args.ide or args.generator == "Xcode"):
         # Xcode 工程与命令行构建（Makefiles）分目录：同一目录换生成器 CMake 会直接报错
@@ -129,7 +136,7 @@ def main() -> int:
     if generator:
         configure += ["-G", generator]
         if generator.startswith("Visual Studio"):
-            configure += ["-A", "x64"]
+            configure += ["-A", VS_PLATFORM.get(abi, "x64")]
 
     if args.platform == "android":
         if not args.ndk:

@@ -23,12 +23,13 @@ android {
         minSdk = 23
         consumerProguardFiles("consumer-rules.pro")
         ndk {
-            // 换 / 加 ABI 只改这里：CMake 侧按 ANDROID_ABI 自动选 TGCapture3rd/<lib>/android/<abi>
+            // 换 / 加 ABI 只改这里：CMake 侧 find_package(TGCapture3rd) 按 ANDROID_ABI 选 TGCapture3rd/<lib>/android/<abi>
             abiFilters += listOf("arm64-v8a")
         }
         externalNativeBuild {
             cmake {
                 arguments += listOf("-DANDROID_STL=c++_shared")
+                // 依赖根目录即 CMake 包前缀（含 TGCapture3rdConfig.cmake），由 cmake/Deps.cmake 作为 find_package 的 HINTS
                 thirdRoot?.let { arguments += "-DTG_3RD_ROOT=$it" }
             }
         }

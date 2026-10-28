@@ -1,80 +1,50 @@
-# 依赖 FfmpegCompileShell 的产出目录（默认 TGCapture3rd）：<root>/<库>/<平台>[/<abi>]/{include,lib}
+# 第三方依赖 TGCapture3rd（FfmpegCompileShell 的产出目录），按标准 CMake 包引入：
 #
-# 布局不写死，按 FfmpegCompileShell 的 PLATFORM_LAYOUT 依次探测：
-#   abi     : <库>/<平台>/<abi>/{include,lib}          —— android / ohos，或 Windows 同时编多 ABI 时回落
-#   lib     : <库>/<平台>/include + <库>/<平台>/lib/<abi> —— spdlog
-#   flat    : <库>/<平台>/{include,lib}                —— Windows 开播用到的库（ffmpeg/libyuv/openssl/srt/fdk-aac/openh264）
-# iOS 为 lipo 合并的 fat 库，天然无 abi 层，flat 直接命中。
-function(_tg_dep_dir out root lib platform abi)
-    set(${out} "" PARENT_SCOPE)
-    foreach(candidate
-            "${root}/${lib}/${platform}/${abi}"
-            "${root}/${lib}/${platform}/lib/${abi}"
-            "${root}/${lib}/${platform}")
-        if(EXISTS "${candidate}/include" OR EXISTS "${candidate}/lib")
-            set(${out} "${candidate}" PARENT_SCOPE)
-            return()
-        endif()
-    endforeach()
-endfunction()
+#   find_package(TGCapture3rd CONFIG COMPONENTS ffmpeg libyuv)
+#   → TGCapture3rd::avformat / avcodec / swscale / swresample / avutil / libyuv 等导入目标
+#
+# 包配置 TGCapture3rdConfig.cmake 由 FfmpegCompileShell 在每次 build 结束时写到产物根目录；
+# 旧产物没有的话补一份：python build.py export -o <产物根目录>。
+# 导入目标自带头文件目录、库文件完整路径、传递依赖（静态 ffmpeg 的 openssl / srt / fdk-aac /
+# openh264 / zlib 与系统库，取自 ffmpeg 自己的 .pc）以及 Windows 下 DLL 的位置，
+# 所以这里不再手写 include / link 目录，也不用操心 GNU ld 单遍解析的链接顺序。
+#
+# 包的查找顺序（CMake 标准规则）：
+#   -DTGCapture3rd_DIR=<根> / -DTGCapture3rd_ROOT=<根> / -DCMAKE_PREFIX_PATH=<根>
+#   > TG_3RD_ROOT（作为 HINTS；由根 CMakeLists.txt 解析：--3rd > 环境变量 > 同级目录）
 
-function(tg_link_thirdparty target platform abi root)
-    if(NOT EXISTS "${root}")
-        message(FATAL_ERROR
-            "依赖目录未找到: ${root}\n"
-            "  用 --3rd <目录> 或 -DTG_3RD_ROOT=<目录> 指向 FfmpegCompileShell 的输出目录（如 ../TGCapture3rd）")
-    endif()
+# 平台 / ABI 明确交给包配置，与本工程的 TG_PLATFORM / TG_ABI 保持一致；
+# Windows 上包配置还会核对编译器的目标架构（-A），不一致时在配置阶段就报错，而不是等到 LNK1112
+if(NOT DEFINED TGCapture3rd_PLATFORM)
+    set(TGCapture3rd_PLATFORM "${TG_PLATFORM}")
+endif()
+if(NOT DEFINED TGCapture3rd_ABI AND NOT TG_PLATFORM STREQUAL "ios")   # iOS 是 fat 库，没有 abi 层
+    set(TGCapture3rd_ABI "${TG_ABI}")
+endif()
 
-    _tg_dep_dir(ffmpeg_dir "${root}" "ffmpeg" "${platform}" "${abi}")
-    if(NOT ffmpeg_dir)
-        message(FATAL_ERROR
-            "在 ${root}/ffmpeg/${platform} 下找不到 {include,lib}（当前 abi=${abi}）；"
-            "请先执行 FfmpegCompileShell 编译，或用 --3rd 指向正确的输出目录")
-    endif()
+# 产物目录在、但还是旧版本（没有包配置）：直接给出补救命令，比 find_package 的通用报错好懂
+if(EXISTS "${TG_3RD_ROOT}" AND NOT EXISTS "${TG_3RD_ROOT}/TGCapture3rdConfig.cmake"
+   AND NOT TGCapture3rd_DIR AND NOT TGCapture3rd_ROOT AND NOT CMAKE_PREFIX_PATH)
+    message(FATAL_ERROR
+        "${TG_3RD_ROOT} 里没有 TGCapture3rdConfig.cmake（产物由旧版 FfmpegCompileShell 生成）。\n"
+        "  在 FfmpegCompileShell 下执行一次：python build.py export -o \"${TG_3RD_ROOT}\"")
+endif()
 
-    target_include_directories(${target} PUBLIC "${ffmpeg_dir}/include")
-    target_link_directories(${target} PUBLIC "${ffmpeg_dir}/lib")
+# NO_CMAKE_FIND_ROOT_PATH：Android / OHOS 工具链把包查找限定在 sysroot 里（CMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY），
+# 而 TGCapture3rd 在宿主机上
+find_package(TGCapture3rd 1 CONFIG REQUIRED
+    COMPONENTS ffmpeg libyuv
+    HINTS "${TG_3RD_ROOT}"
+    NO_CMAKE_FIND_ROOT_PATH)
 
-    # ffmpeg 组件（Windows 为 import lib，其它平台为 .a）
-    #
-    # 顺序不能随便排：静态库用 GNU ld 是**单遍解析**，依赖方必须在被依赖方之前。
-    # avformat 会引用 avcodec 的内部符号（av_parser_init/parse2/close、ff_toupper4、
-    # avpriv_pix_fmt_find、ff_ac3_channel_layout_tab、ff_mpa_freq_tab…），
-    # 写成 avcodec 在前的话，这些符号轮到 avcodec 时还没出现，直接 undefined reference。
-    # 这与 ffmpeg 自己的 pkg-config 顺序（avformat → avcodec → swresample → avutil）一致。
-    target_link_libraries(${target} PUBLIC avformat avcodec swscale swresample avutil)
-
-    # 其余开播依赖（静态库）
-    # zlib：ffmpeg 的 png / gzip 路径依赖它，静态链接时必须显式带上
-    # （Windows 下 ffmpeg 是 DLL，z 已并入；重复链一个不需要的静态库不会有副作用）
-    foreach(lib openh264 fdk-aac srt libyuv openssl zlib)
-        _tg_dep_dir(dir "${root}" "${lib}" "${platform}" "${abi}")
-        if(NOT dir)
-            # libyuv 是应用直接链接的独立库，缺了必然链接失败；
-            # 其余库已静态并入 ffmpeg，缺失只影响单独使用的场景
-            if(lib STREQUAL "libyuv")
-                message(FATAL_ERROR "libyuv 未找到: ${root}/libyuv/${platform}（abi=${abi}）")
-            endif()
-            message(WARNING "依赖缺失，跳过: ${root}/${lib}/${platform}（abi=${abi}）")
-            continue()
-        endif()
-        if(EXISTS "${dir}/include")
-            target_include_directories(${target} PUBLIC "${dir}/include")
-        endif()
-        if(EXISTS "${dir}/lib")
-            target_link_directories(${target} PUBLIC "${dir}/lib")
-        endif()
-    endforeach()
-
-    # 静态链接这些库（libyuv 由应用直接链接；其余已静态并入 ffmpeg，重复链无符号需求时不会引入目标文件）
-    target_link_libraries(${target} PUBLIC openh264 fdk-aac srt yuv ssl crypto z)
-
-    # 导出给上层：Windows 下 ffmpeg 的 DLL 在 <ffmpeg>/bin，用于 demo 的调试环境与产物拷贝
-    if(EXISTS "${ffmpeg_dir}/bin")
-        set(TG_FFMPEG_BIN_DIR "${ffmpeg_dir}/bin" PARENT_SCOPE)
-    else()
-        set(TG_FFMPEG_BIN_DIR "" PARENT_SCOPE)
-    endif()
-
-    message(STATUS "TGCapture: ffmpeg=${ffmpeg_dir}")
+# 内核直接用到的只有 ffmpeg 与 libyuv（采集帧的格式转换 / 缩放）；
+# openssl / srt / fdk-aac / openh264 / zlib 由 ffmpeg 的导入目标按需传递（Windows 下已并入 ffmpeg DLL）
+function(tg_link_thirdparty target)
+    target_link_libraries(${target} PUBLIC
+        TGCapture3rd::avformat
+        TGCapture3rd::avcodec
+        TGCapture3rd::swscale
+        TGCapture3rd::swresample
+        TGCapture3rd::avutil
+        TGCapture3rd::libyuv)
 endfunction()

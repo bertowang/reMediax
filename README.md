@@ -75,7 +75,7 @@ TGCapture/
 │   └── ios/                    UI demo：UIKit 开播测试 App（CMake → Xcode）
 ├── bindings/android/           Android SDK（Gradle :tgcapture → AAR）：Java API + JNI 胶水
 ├── tests/                      单元测试 tg_tests（零依赖迷你框架，第 10.4 节）
-├── cmake/Deps.cmake            TGCapture3rd 依赖定位
+├── cmake/Deps.cmake            TGCapture3rd 依赖：find_package(TGCapture3rd) + 导入目标（9.3）
 ├── ide/android/                Android Studio 宿主工程（只做模块聚合：:tgcapture + :demo）
 ├── CMakeLists.txt
 ├── CHANGELOG.md
@@ -835,7 +835,29 @@ python scripts/build.py --platform ios    --ide [--team <Team ID>]
 
 默认值只在 `CMakeLists.txt` 定义一处；configure 会打印 `3rd=<路径> (来源: …)`；
 缓存里的失效路径会自动回退探测并告警。
-Windows 产物是 `flat` 布局（无 abi 层），`cmake/Deps.cmake` 按 abi → lib/abi → flat 依次探测。
+
+**链接方式：标准 CMake 包。** 依赖目录就是一个 CMake 包前缀，根目录下的 `TGCapture3rdConfig.cmake`
+由 FfmpegCompileShell 在每次 `build` 结束时生成（旧产物补一份：`python build.py export -o <依赖目录>`）。
+`cmake/Deps.cmake` 只做两件事：
+
+```cmake
+find_package(TGCapture3rd 1 CONFIG REQUIRED COMPONENTS ffmpeg libyuv
+             HINTS "${TG_3RD_ROOT}" NO_CMAKE_FIND_ROOT_PATH)
+target_link_libraries(tgcapture PUBLIC
+    TGCapture3rd::avformat TGCapture3rd::avcodec TGCapture3rd::swscale
+    TGCapture3rd::swresample TGCapture3rd::avutil TGCapture3rd::libyuv)
+```
+
+* 导入目标自带头文件目录、库文件完整路径和传递依赖：静态 ffmpeg（Android / iOS / Linux / OHOS）
+  需要的 openssl / srt / fdk-aac / openh264 / zlib 与系统库取自 ffmpeg 自己的 `.pc`，
+  链接顺序由 CMake 按依赖图生成；Windows 下 ffmpeg 是 `SHARED IMPORTED`（`.lib` + DLL）。
+* Windows 的 exe 用 `$<TARGET_RUNTIME_DLLS>` 把实际依赖的 DLL 拷到输出目录（`tg_copy_runtime_dlls`），
+  `tg_tests` 也一样，所以 `ctest` 不用改 PATH。
+* 平台 / ABI 取 `TG_PLATFORM` / `TG_ABI`。Windows 上包配置会核对编译器的目标架构（`-A`）和产物的版本标记：
+  比如 `-A Win32` 却链 x64 的产物，会在 configure 阶段报错，而不是等到链接时报 `LNK1112`。
+  `scripts/build.py --abi x86|arm64` 会自动传对应的 `-A Win32|ARM64`。
+* 不经过 `build.py`、直接调 cmake 时，也可以用 CMake 的标准变量 `-DCMAKE_PREFIX_PATH=<依赖目录>`（或
+  `-DTGCapture3rd_DIR=<依赖目录>`）指定依赖，优先级高于 `TG_3RD_ROOT`。
 
 ### 9.4 产物
 
