@@ -40,6 +40,13 @@ public:
     int Open(const AudioEncoderParams& params, const core::AudioMediaType& srcType);
     void Close();
 
+    // ---- 总线生命周期（output 组；纯视频模式下未打开 → 不激活，分组启动时跳过）----
+    [[nodiscard]] core::NodeGroup Group() const override { return core::NodeGroup::Output; }
+    [[nodiscard]] bool IsActive() const override { return IsOpened(); }
+    bool NodeStart() override { return Start(); }
+    void NodeStop() override { Stop(); }
+    void NodeClose() override { Close(); }
+
     void SetSyncClock(std::shared_ptr<core::AVSync> sync) { m_sync = std::move(sync); }
 
     // BusNode：编码后的包经 Forward 交给链上的下一个节点（muxer）

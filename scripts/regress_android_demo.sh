@@ -129,7 +129,7 @@ newfile="$(comm -13 <(echo "$before") <(echo "$after") | grep "\.$ext$" | tail -
 [[ -n "$newfile" ]] || die "$records 下没有新录像"
 out_dir="$root/build/regress"
 mkdir -p "$out_dir"
-adb pull "$records/$newfile" "$out_dir/$newfile" >/dev/null || die "adb pull 失败"
+adb pull "$records/$newfile" "$out_dir/$newfile" >/dev/null 2>&1 || die "adb pull 失败"
 local_file="$out_dir/$newfile"
 
 probe() { ffprobe -v error -select_streams "$1" -show_entries "$2" -of default=nw=1:nk=1 "$local_file" | head -1; }

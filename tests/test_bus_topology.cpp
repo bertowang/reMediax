@@ -507,3 +507,211 @@ TG_TEST(BusFrame, ControlFrameHelpers)
     TG_EXPECT(f->streamKind == MediaKind::Audio);
     TG_EXPECT(!Data()->IsControl());
 }
+
+// ------------------------------------------------------------------ 生命周期 / 分组启停
+namespace
+{
+
+struct Journal
+{
+    std::mutex mutex;
+    std::vector<std::string> lines;
+    void Add(std::string s)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        lines.push_back(std::move(s));
+    }
+    std::string Joined()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::string out;
+        for (const auto& l : lines) {
+            out += l + ",";
+        }
+        return out;
+    }
+};
+
+class LifeNode : public BusNode
+{
+public:
+    LifeNode(std::string name, NodeGroup group, Journal& j) : BusNode(std::move(name)), m_group(group), m_j(j) {}
+
+    NodeGroup Group() const override { return m_group; }
+    bool IsActive() const override { return active; }
+    bool GatedOutput() const override { return gated; }
+    int NodeConfigure() override
+    {
+        m_j.Add("cfg:" + Name());
+        return configureRet;
+    }
+    bool NodeStart() override
+    {
+        m_j.Add("start:" + Name());
+        return startOk;
+    }
+    void NodeStop() override { m_j.Add("stop:" + Name()); }
+    void NodeClose() override { m_j.Add("close:" + Name()); }
+
+    bool Submit(FramePtr frame) override { return Forward(std::move(frame)); }
+    size_t Pending() const override { return 0; }
+    bool Out(FramePtr f) { return Emit(0, std::move(f)); }
+
+    bool active = true;
+    bool gated = false;
+    bool startOk = true;
+    int configureRet = 0;
+
+private:
+    NodeGroup m_group;
+    Journal& m_j;
+};
+
+// src(capture) -> enc(output) -> mux(output)，另一路 aenc(output) -> mux
+struct LifeGraph
+{
+    Journal j;
+    Bus bus;
+    std::shared_ptr<LifeNode> src = std::make_shared<LifeNode>("src", NodeGroup::Capture, j);
+    std::shared_ptr<LifeNode> venc = std::make_shared<LifeNode>("venc", NodeGroup::Output, j);
+    std::shared_ptr<LifeNode> aenc = std::make_shared<LifeNode>("aenc", NodeGroup::Output, j);
+    std::shared_ptr<LifeNode> mux = std::make_shared<LifeNode>("mux", NodeGroup::Output, j);
+    std::shared_ptr<PortNode> sink = std::make_shared<PortNode>("sink", 1, 1);
+
+    LifeGraph()
+    {
+        bus.Begin()
+            .Register("src", src)
+            .Register("venc", venc)
+            .Register("aenc", aenc)
+            .Register("mux", mux)
+            .Register("sink", sink)
+            .Link("src", "venc")
+            .Link("venc", "mux")
+            .Link("aenc", "mux")
+            .Link("mux", "sink")
+            .Commit();
+    }
+};
+
+}  // namespace
+
+TG_TEST(BusLifecycle, GroupOrderFollowsTopology)
+{
+    LifeGraph g;
+    TG_EXPECT(g.bus.ConfigureGroup(NodeGroup::Output).ok);
+    TG_EXPECT(g.bus.StartGroup(NodeGroup::Output).ok);
+    g.bus.StopGroup(NodeGroup::Output);
+    g.bus.CloseGroup(NodeGroup::Output);
+    TG_EXPECT_EQ(g.j.Joined(),
+                 std::string("cfg:aenc,cfg:venc,cfg:mux,"        // 上游先于下游
+                             "start:mux,start:venc,start:aenc,"  // 下游先于上游
+                             "stop:aenc,stop:venc,stop:mux,"     // 上游先于下游
+                             "close:mux,close:venc,close:aenc,"));   // 下游先于上游
+    TG_EXPECT(g.src->Lifecycle() == NodeLifecycle::Created);   // capture 组不受影响
+    TG_EXPECT(g.mux->Lifecycle() == NodeLifecycle::Closed);
+}
+
+TG_TEST(BusLifecycle, GroupsStartAndStopIndependently)
+{
+    LifeGraph g;
+    TG_EXPECT(g.bus.StartGroup(NodeGroup::Capture).ok);
+    TG_EXPECT(g.src->Lifecycle() == NodeLifecycle::Running);
+    TG_EXPECT(g.mux->Lifecycle() == NodeLifecycle::Created);
+    TG_EXPECT(g.bus.StartGroup(NodeGroup::Output).ok);
+    g.bus.StopGroup(NodeGroup::Output);
+    TG_EXPECT(g.src->Lifecycle() == NodeLifecycle::Running);   // 停播不停采集（预览继续）
+    TG_EXPECT(g.mux->Lifecycle() == NodeLifecycle::Stopped);
+    const auto dump = g.bus.DumpGraph();
+    TG_EXPECT(dump.find("node src in=1 out=1 pending=0 group=capture state=running") != std::string::npos);
+    TG_EXPECT(dump.find("node mux in=1 out=1 pending=0 group=output state=stopped") != std::string::npos);
+}
+
+TG_TEST(BusLifecycle, InactiveNodesAreSkippedOnStart)
+{
+    LifeGraph g;
+    g.aenc->active = false;   // 纯视频模式
+    TG_EXPECT(g.bus.StartGroup(NodeGroup::Output).ok);
+    TG_EXPECT(g.j.Joined().find("start:aenc") == std::string::npos);
+    TG_EXPECT(g.aenc->Lifecycle() == NodeLifecycle::Created);
+}
+
+TG_TEST(BusLifecycle, StartFailureRollsBackStartedNodes)
+{
+    LifeGraph g;
+    g.venc->startOk = false;
+    const auto r = g.bus.StartGroup(NodeGroup::Output);
+    TG_EXPECT(!r.ok);
+    TG_EXPECT(r.failedNode == "venc");
+    TG_EXPECT_EQ(g.j.Joined(), std::string("start:mux,start:venc,stop:mux,"));
+    TG_EXPECT(g.mux->Lifecycle() == NodeLifecycle::Stopped);
+}
+
+TG_TEST(BusLifecycle, ConfigureStopsAtFirstFailure)
+{
+    LifeGraph g;
+    g.venc->configureRet = -5;
+    const auto r = g.bus.ConfigureGroup(NodeGroup::Output);
+    TG_EXPECT(!r.ok);
+    TG_EXPECT(r.failedNode == "venc");
+    TG_EXPECT_EQ(r.code, -5);
+    TG_EXPECT(g.j.Joined().find("cfg:mux") == std::string::npos);
+}
+
+TG_TEST(BusLifecycle, GatedOutputBlocksEmitAfterStop)
+{
+    LifeGraph g;
+    g.src->gated = true;
+    g.venc->gated = false;
+    TG_EXPECT(g.bus.StartGroup(NodeGroup::Capture).ok);
+    TG_EXPECT(g.src->Out(Data()));
+    TG_EXPECT_EQ(g.sink->received.load(), 1);
+    g.bus.StopGroup(NodeGroup::Capture);
+    TG_EXPECT(!g.src->Out(Data()));   // 关闸后丢弃
+    TG_EXPECT_EQ(g.sink->received.load(), 1);
+    TG_EXPECT(g.venc->Out(Data()));   // 非受控节点不受影响（编码器停止时要 drain）
+    TG_EXPECT(g.bus.StartGroup(NodeGroup::Capture).ok);
+    TG_EXPECT(g.src->Out(Data()));    // 重新启动后开闸
+}
+
+TG_TEST(BusLifecycle, StressGatedStopWhileEmitting)
+{
+    LifeGraph g;
+    g.src->gated = true;
+    for (int round = 0; round < 50; ++round) {
+        TG_ASSERT(g.bus.StartGroup(NodeGroup::Capture).ok);
+        std::atomic<bool> stop{false};
+        std::atomic<int> afterStop{0};
+        std::atomic<bool> stopped{false};
+        std::thread producer([&] {
+            while (!stop.load()) {
+                const bool wasStopped = stopped.load();   // 先读：读到 true 时 StopGroup 已返回
+                const bool ok = g.src->Out(Data());
+                if (ok && wasStopped) {
+                    ++afterStop;   // StopGroup 返回之后仍放行 = 违反保证
+                }
+            }
+        });
+        std::this_thread::sleep_for(100us);
+        g.bus.StopGroup(NodeGroup::Capture);
+        stopped = true;
+        std::this_thread::sleep_for(100us);
+        stop = true;
+        producer.join();
+        TG_EXPECT_EQ(afterStop.load(), 0);
+    }
+}
+
+TG_TEST(EmitGateScope, PairsEnterAndLeave)
+{
+    EmitGate gate;
+    {
+        EmitGate::Scope s(gate);
+        TG_EXPECT(static_cast<bool>(s));
+    }
+    gate.Close();
+    gate.WaitDrained();   // 计数已归零，不会卡住
+    EmitGate::Scope s2(gate);
+    TG_EXPECT(!static_cast<bool>(s2));
+    TG_EXPECT(!gate.IsOpen());
+}

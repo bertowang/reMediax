@@ -825,31 +825,20 @@ int TGCapturer::Start()
 // 原先只打一条 Warn 然后照常返回 0，宿主会以为开播成功
 int TGCapturer::StartLocked(PrepareError& err)
 {
-    auto fail = [&](int32_t stage, const char* what) {
-        TG_LOGE("TGCapturer: %s 线程启动失败（上一轮可能未停止干净）", what);
-        err = {TGErr_StartFailed, stage, std::string("start failed: ") + what};
-        // 逆序停掉本轮已经起来的线程：只退状态不停线程的话，muxer / 视频编码线程会继续空转，
-        // 宿主若不 Stop 直接析构，它们就会在正在销毁的成员上继续发包
-        if (m_audioEncoder) {
-            m_audioEncoder->Stop();
-        }
-        if (m_videoEncoder) {
-            m_videoEncoder->Stop();
-        }
-        if (m_muxer) {
-            m_muxer->Stop();
-        }
+    // output 组（封装器 / 编码器）由总线按拓扑顺序启动：下游先于上游（muxer → 编码器）；
+    // 任一失败时总线已把本次起来的线程逆序停掉 —— 只退状态不停线程的话，muxer / 视频编码线程会继续空转，
+    // 宿主若不 Stop 直接析构，它们就会在正在销毁的成员上继续发包。
+    // 纯视频模式下音频编码器未打开（IsActive=false），不会被启动。
+    const auto started = m_bus.StartGroup(core::NodeGroup::Output);
+    if (!started.ok) {
+        const int32_t stage = started.failedNode == "muxer"           ? 1
+                              : started.failedNode == "video_encoder" ? 2
+                              : started.failedNode == "audio_encoder" ? 3
+                                                                      : 0;
+        TG_LOGE("TGCapturer: %s 线程启动失败（上一轮可能未停止干净）", started.failedNode.c_str());
+        err = {TGErr_StartFailed, stage, "start failed: " + started.failedNode};
         m_state.store(State::Prepared);   // 退回可重试的状态，宿主可以 Stop 后重开
         return static_cast<int>(TGErr_StartFailed);
-    };
-    if (!m_muxer->Start()) {
-        return fail(1, "muxer");
-    }
-    if (!m_videoEncoder->Start()) {
-        return fail(2, "video encoder");
-    }
-    if (m_audioEnabled && !m_audioEncoder->Start()) {
-        return fail(3, "audio encoder");
     }
     if (m_videoSource) {
         m_videoSource->StartCapture();
@@ -936,22 +925,10 @@ void TGCapturer::TeardownLocked()
         }
     }
     StopAudioMixer();
-    if (m_videoEncoder) {
-        m_videoEncoder->Stop();
-    }
-    if (m_audioEncoder) {
-        m_audioEncoder->Stop();
-    }
-    if (m_muxer) {
-        m_muxer->Stop();
-        m_muxer->Close();
-    }
-    if (m_videoEncoder) {
-        m_videoEncoder->Close();
-    }
-    if (m_audioEncoder) {
-        m_audioEncoder->Close();
-    }
+    // output 组由总线按拓扑顺序收尾：Stop 上游先于下游（编码器 drain 完积压再停封装器），
+    // Close 下游先于上游（封装器先写尾，再关编码器）。对未启动 / 未打开的节点是空操作
+    m_bus.StopGroup(core::NodeGroup::Output);
+    m_bus.CloseGroup(core::NodeGroup::Output);
     // 采集源的设备资源（摄像头/麦克风句柄、COM 对象、D3D 纹理、GDI 位图）最后放。
     // 此时采集线程已 join、在飞回调已退出，Close 不会与产帧并发。
     // 这一步以前完全缺失：设备只在采集源析构时才释放，而采集源是宿主持有的，

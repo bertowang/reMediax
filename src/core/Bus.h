@@ -54,6 +54,7 @@
 #include <utility>
 #include <vector>
 
+#include "EmitGate.h"
 #include "Frame.h"
 #include "Logger.h"
 
@@ -539,6 +540,47 @@ struct BusRoute
 };
 using BusRouteTable = std::vector<std::vector<BusRoute>>;   // [输出端口] -> 出边列表
 
+// ------------------------------------------------------------------ 节点生命周期
+// 分组启停：capture 组（采集 / 混音 / 合成 / 预览）与 output 组（同步 / 编码 / 封装）可以独立启停，
+// 开播前预览 = 只起 capture 组；开播 = 再起 output 组；停播 = 只停 output 组。
+enum class NodeGroup : uint8_t
+{
+    None,      // 不参与分组启停（由持有者自行管理）
+    Capture,
+    Output,
+};
+
+enum class NodeLifecycle : uint8_t
+{
+    Created,
+    Configured,
+    Running,
+    Stopped,
+    Closed,
+};
+
+inline const char* NodeGroupName(NodeGroup g) noexcept
+{
+    switch (g) {
+        case NodeGroup::None: return "none";
+        case NodeGroup::Capture: return "capture";
+        case NodeGroup::Output: return "output";
+    }
+    return "?";
+}
+
+inline const char* NodeLifecycleName(NodeLifecycle s) noexcept
+{
+    switch (s) {
+        case NodeLifecycle::Created: return "created";
+        case NodeLifecycle::Configured: return "configured";
+        case NodeLifecycle::Running: return "running";
+        case NodeLifecycle::Stopped: return "stopped";
+        case NodeLifecycle::Closed: return "closed";
+    }
+    return "?";
+}
+
 // ------------------------------------------------------------------ 数据面节点
 class BusNode
 {
@@ -580,6 +622,64 @@ public:
     // Dump 时附加的节点状态（一行，可空）
     [[nodiscard]] virtual std::string DumpState() const { return {}; }
 
+    // ---- 生命周期（由 Bus 的分组启停按拓扑顺序调用；不分组的节点由持有者自行调用）----
+    // Configure：上游先于下游（编码器先于封装器）；Start：下游先于上游（先有人收再开始产）；
+    // Stop：上游先于下游（先断源，下游 drain 完积压）；Close：下游先于上游。
+    [[nodiscard]] virtual NodeGroup Group() const { return NodeGroup::None; }
+    // 未激活的节点在分组启动时被跳过（如纯视频模式下没有打开的音频编码器）
+    [[nodiscard]] virtual bool IsActive() const { return true; }
+    // 受控输出：Stop 时先关输出闸、Stop 后等在飞的 Emit 退出（采集类节点用，回调线程不归自己管）。
+    // 编码器 / 封装器不能开：它们在 Stop 里要把积压 drain 给下游
+    [[nodiscard]] virtual bool GatedOutput() const { return false; }
+
+    virtual int NodeConfigure() { return 0; }
+    virtual bool NodeStart() { return true; }
+    virtual void NodeStop() {}
+    virtual void NodeClose() {}
+
+    [[nodiscard]] NodeLifecycle Lifecycle() const noexcept { return m_lifecycle.load(); }
+
+    // 单节点的完整动作（含输出闸与状态），Bus 的分组启停逐个调用它们；也可单独调用
+    int Configure()
+    {
+        const int ret = NodeConfigure();
+        if (ret >= 0) {
+            m_lifecycle.store(NodeLifecycle::Configured);
+        }
+        return ret;
+    }
+
+    bool StartNode()
+    {
+        m_outGate.Open();
+        if (!NodeStart()) {
+            return false;
+        }
+        m_lifecycle.store(NodeLifecycle::Running);
+        return true;
+    }
+
+    void StopNode()
+    {
+        const bool gated = GatedOutput();
+        if (gated) {
+            m_outGate.Close();
+        }
+        NodeStop();
+        if (gated) {
+            m_outGate.WaitDrained();
+        }
+        if (m_lifecycle.load() == NodeLifecycle::Running) {
+            m_lifecycle.store(NodeLifecycle::Stopped);
+        }
+    }
+
+    void CloseNode()
+    {
+        NodeClose();
+        m_lifecycle.store(NodeLifecycle::Closed);
+    }
+
     // 独立使用（不经 Bus）时把输出端口 0 直连到 next。挂到 Bus 上后拓扑由 Bus 管理
     void LinkNext(std::shared_ptr<BusNode> next)
     {
@@ -614,6 +714,10 @@ protected:
     {
         if (!frame) {
             return false;
+        }
+        EmitGate::Scope gate(m_outGate);
+        if (!gate) {
+            return false;   // 受控输出已关闸（节点停止中）
         }
         EmitGuard guard(*this);
         auto table = Routes();
@@ -745,6 +849,8 @@ private:
     mutable std::mutex m_routeMutex;
     std::shared_ptr<const BusRouteTable> m_routes;
     std::atomic<int> m_emitting{0};
+    EmitGate m_outGate;
+    std::atomic<NodeLifecycle> m_lifecycle{NodeLifecycle::Created};
     std::shared_ptr<EventHub> m_events;
     std::shared_ptr<BusContext> m_context;
 };
@@ -901,6 +1007,75 @@ public:
         return Begin().Unlink(from, to).Commit();
     }
 
+    // ---- 分组生命周期 ----
+    // 顺序由当前拓扑决定（拓扑排序，同层按名字），不需要调用方手写先后
+    struct GroupResult
+    {
+        bool ok = true;
+        std::string failedNode;   // 失败的节点名
+        int code = 0;             // Configure 的返回值（<0）
+    };
+
+    // 上游先于下游。遇到第一个失败即停止（已配置的不回滚，由调用方 CloseGroup）
+    GroupResult ConfigureGroup(NodeGroup group)
+    {
+        GroupResult result;
+        for (const auto& node : GroupNodes(group, /*upstreamFirst=*/true)) {
+            const int ret = node->Configure();
+            if (ret < 0) {
+                result = {false, node->Name(), ret};
+                break;
+            }
+        }
+        return result;
+    }
+
+    // 下游先于上游，跳过未激活节点。任一节点启动失败：把本次已启动的按停止顺序停掉，返回失败节点
+    GroupResult StartGroup(NodeGroup group)
+    {
+        std::vector<BusNodePtr> started;
+        for (const auto& node : GroupNodes(group, /*upstreamFirst=*/false)) {
+            if (!node->IsActive()) {
+                continue;
+            }
+            if (!node->StartNode()) {
+                TG_LOGE("Bus: %s 组启动失败于节点 %s", NodeGroupName(group), node->Name().c_str());
+                for (auto it = started.rbegin(); it != started.rend(); ++it) {
+                    (*it)->StopNode();
+                }
+                return {false, node->Name(), 0};
+            }
+            started.push_back(node);
+        }
+        return {};
+    }
+
+    // 上游先于下游。对未启动的节点也调用（NodeStop 必须幂等）
+    void StopGroup(NodeGroup group)
+    {
+        for (const auto& node : GroupNodes(group, /*upstreamFirst=*/true)) {
+            node->StopNode();
+        }
+    }
+
+    // 下游先于上游（封装器先写尾，再关编码器）
+    void CloseGroup(NodeGroup group)
+    {
+        for (const auto& node : GroupNodes(group, /*upstreamFirst=*/false)) {
+            node->CloseNode();
+        }
+    }
+
+    // 组内节点按拓扑顺序排列的名字（调试 / 测试用）
+    [[nodiscard]] std::vector<std::string> GroupOrder(NodeGroup group, bool upstreamFirst = true) const
+    {
+        std::vector<std::string> names;
+        for (const auto& node : GroupNodes(group, upstreamFirst)) {
+            names.push_back(node->Name());
+        }
+        return names;
+    }
+
     BusNodePtr Get(const std::string& name) const
     {
         auto topo = Snapshot();
@@ -972,6 +1147,10 @@ public:
             std::string line = "node " + name + " in=" + (in == kDynamicPorts ? "*" : std::to_string(in)) +
                                " out=" + std::to_string(node->OutputPorts()) +
                                " pending=" + std::to_string(node->Pending());
+            if (node->Group() != NodeGroup::None) {
+                line += std::string(" group=") + NodeGroupName(node->Group()) +
+                        " state=" + NodeLifecycleName(node->Lifecycle());
+            }
             const std::string state = node->DumpState();
             if (!state.empty()) {
                 line += " " + state;
@@ -1078,6 +1257,46 @@ private:
     {
         std::shared_lock<std::shared_mutex> lock(m_mutex);
         return m_topo;
+    }
+
+    // 全图拓扑排序（Kahn，同层按名字），再筛出指定组。注意节点在拓扑里的名字可能与 Name() 不同，
+    // 排序按注册名
+    [[nodiscard]] std::vector<BusNodePtr> GroupNodes(NodeGroup group, bool upstreamFirst) const
+    {
+        auto topo = Snapshot();
+        std::map<std::string, int> indegree;
+        std::map<std::string, std::vector<std::string>> adj;
+        for (const auto& [name, _] : topo->nodes) {
+            indegree[name] = 0;
+        }
+        for (const auto& l : topo->links) {
+            adj[l.from].push_back(l.to);
+            indegree[l.to]++;
+        }
+        std::set<std::string> ready;
+        for (const auto& [name, deg] : indegree) {
+            if (deg == 0) {
+                ready.insert(name);
+            }
+        }
+        std::vector<BusNodePtr> order;
+        while (!ready.empty()) {
+            const std::string name = *ready.begin();
+            ready.erase(ready.begin());
+            const auto& node = topo->nodes.at(name);
+            if (node->Group() == group) {
+                order.push_back(node);
+            }
+            for (const auto& next : adj[name]) {
+                if (--indegree[next] == 0) {
+                    ready.insert(next);
+                }
+            }
+        }
+        if (!upstreamFirst) {
+            std::reverse(order.begin(), order.end());
+        }
+        return order;
     }
 
     static bool HasCycle(const Topology& topo)

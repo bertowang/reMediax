@@ -7,6 +7,7 @@
 #include <memory>
 
 #include "TGCapture/TGCapturerInterface.h"
+#include "core/EmitGate.h"
 #include "core/Frame.h"
 #include "core/Logger.h"
 #include "core/Thread.h"
@@ -14,56 +15,9 @@
 namespace TGCapture::capture
 {
 
-// 采集回调栅栏。
-//
-// 要解决的问题：各平台产帧的线程并不都是我们自己起的 —— Android 的 PCM/图像由 Java 线程回调、
-// iOS ReplayKit 由系统队列回调、外灌源由宿主线程直接推。这些路径上 Worker::Stop() 的 join
-// 只停了"保活线程"，并不构成回调栅栏。而 TGCapturer::StopLocked 默认"StopCapture 返回即无回调"，
-// 随后就去 Close 编码器 / Reset 混流器 —— 在飞的回调会踩到正在拆除的对象。
-//
+// 采集回调栅栏：实现已通用化到 core/EmitGate.h（总线节点的受控输出也用它），原理见该文件。
 // 所有平台的帧最终都经过基类 Emit()，所以在这里统一设闸，不需要改任何平台实现。
-//
-// 关闸与计数的双向检查（Dekker 式，依赖 seq_cst）：
-//   关闭侧：Close() 置 false  →  读 m_inFlight
-//   通过侧：m_inFlight +1     →  再读一次 m_open
-// 若通过侧第二次读到 true，说明它的 +1 排在 Close() 之前，关闭侧读计数时必然看到 ≥1 而等待；
-// 若读到 false，则回调被丢弃。两种情况都不会出现"关闭侧已返回、回调仍在跑"。
-class EmitGate
-{
-public:
-    void Open() noexcept { m_open.store(true); }
-    void Close() noexcept { m_open.store(false); }
-
-    // 返回 true 表示允许触发回调，调用方必须配对调用 Leave()
-    bool Enter() noexcept
-    {
-        if (!m_open.load()) {
-            return false;
-        }
-        m_inFlight.fetch_add(1);
-        if (!m_open.load()) {
-            m_inFlight.fetch_sub(1);
-            return false;
-        }
-        return true;
-    }
-
-    void Leave() noexcept { m_inFlight.fetch_sub(1); }
-
-    // 等待在飞回调退出。自旋而不是条件变量：这里等的是"回调函数体执行完"，
-    // 正常情况下是微秒级，且停机路径本就不在热路径上。
-    void WaitDrained() const noexcept
-    {
-        while (m_inFlight.load() > 0) {
-            std::this_thread::yield();
-        }
-    }
-
-private:
-    // 默认开闸：没有显式调用 StartCapture 的路径（如仅 Open 后由宿主直接推帧）保持原有行为
-    std::atomic_bool m_open{true};
-    std::atomic<int> m_inFlight{0};
-};
+using EmitGate = core::EmitGate;
 
 // 视频采集源：平台实现周期性调用 Emit(frame)
 class VideoSourceBase : public IVideoSource, public core::Worker

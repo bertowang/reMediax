@@ -48,6 +48,13 @@ public:
     int Open(const VideoEncoderParams& params, const core::VideoMediaType& srcType);
     void Close();
 
+    // ---- 总线生命周期（output 组；Open 带参数，由持有者在 Prepare 里调用）----
+    [[nodiscard]] core::NodeGroup Group() const override { return core::NodeGroup::Output; }
+    [[nodiscard]] bool IsActive() const override { return IsOpened(); }
+    bool NodeStart() override { return Start(); }
+    void NodeStop() override { Stop(); }
+    void NodeClose() override { Close(); }
+
     void SetSyncClock(std::shared_ptr<core::AVSync> sync) { m_sync = std::move(sync); }
     void SetMaxLagUs(int64_t us) noexcept { m_maxLagUs = us; }
 

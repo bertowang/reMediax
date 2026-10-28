@@ -41,6 +41,13 @@ public:
     int Open(const MuxerParams& params, AVCodecContext* videoCtx, AVCodecContext* audioCtx);
     void Close();
 
+    // ---- 总线生命周期（output 组，位于编码器下游：先于编码器启动、晚于编码器停止、先于编码器关闭）----
+    [[nodiscard]] core::NodeGroup Group() const override { return core::NodeGroup::Output; }
+    [[nodiscard]] bool IsActive() const override { return IsOpened(); }
+    bool NodeStart() override { return Start(); }
+    void NodeStop() override { Stop(); }
+    void NodeClose() override { Close(); }
+
     // ---- BusNode ----
     bool Submit(core::FramePtr frame) override;
     [[nodiscard]] size_t Pending() const override { return VideoPending() + AudioPending(); }
