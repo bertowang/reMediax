@@ -48,27 +48,37 @@ TGCapturer::TGCapturer(GameID gameId) : m_gameId(gameId)
     m_audioClock = std::make_shared<core::AudioClock>();
     m_videoPtsGen = std::make_shared<core::VideoPtsGenerator>();
     m_videoOnlyTimeline = std::make_shared<core::VideoOnlyTimeline>();
-    m_mixer = std::make_unique<core::AudioMixer>();
     m_videoEncoder = std::make_shared<codec::VideoEncoder>();
     m_audioEncoder = std::make_shared<codec::AudioEncoder>();
     m_muxer = std::make_shared<Muxer>();
+    m_audioMixer = std::make_shared<nodes::AudioMixerNode>();
     m_pauseFrame = std::make_shared<core::PauseFrame>();
     m_watermark = std::make_shared<core::Watermark>();
 
     m_videoEncoder->SetSyncClock(m_sync);
     m_audioEncoder->SetSyncClock(m_sync);
 
-    // 总线拓扑：采集 → video_encoder / audio_encoder → muxer
-    // 数据、命令、事件都走这一条总线（见 core/Bus.h）；拓扑只在这里建立，运行期只读
-    m_bus.Register("video_encoder", m_videoEncoder);
-    m_bus.Register("audio_encoder", m_audioEncoder);
-    m_bus.Register("muxer", m_muxer);
-    const bool linked = m_bus.Link("video_encoder", "muxer") && m_bus.Link("audio_encoder", "muxer");
+    // 共享服务经总线上下文注入（不是节点）：混音节点按输出推进音频主时钟
+    m_bus.Context().Provide(m_audioClock);
+    m_bus.Context().Provide(m_sync);
+
+    // 总线拓扑：asrc.* → audio_mixer → audio_encoder → muxer；采集 → video_encoder → muxer
+    // 数据、命令、事件都走这一条总线（见 core/Bus.h）。音频源节点在 AddAudioSource / 首次外灌时接入
+    const bool linked = m_bus.Begin()
+                            .Register("video_encoder", m_videoEncoder)
+                            .Register("audio_encoder", m_audioEncoder)
+                            .Register("muxer", m_muxer)
+                            .Register("audio_mixer", m_audioMixer)
+                            .Link("video_encoder", "muxer")
+                            .Link("audio_encoder", "muxer")
+                            .Link("audio_mixer", "audio_encoder")
+                            .Commit();
     if (!linked) {
-        TG_LOGE("TGCapturer: 总线拓扑建立失败（video/audio_encoder → muxer）");
+        TG_LOGE("TGCapturer: 总线拓扑建立失败");
     }
     m_videoIn = m_bus.Get("video_encoder");
-    m_audioIn = m_bus.Get("audio_encoder");
+    m_audioMixer->SetOutputObserver([this](int64_t nowUs) { m_audioWatch.OnActivity(nowUs); });
+    m_audioMixer->SetHeartbeat([this] { LogHeartbeat(); });
 
     // 事件：错误 / 通知 / 生命周期统一从总线分发，OnBusEvent 里做联动并转给宿主回调
     m_bus.Subscribe([this](const core::BusEvent& event) { OnBusEvent(event); });
@@ -221,188 +231,101 @@ int TGCapturer::AddAudioSource(IAudioSource* source)
     if (std::find(m_audioSources.begin(), m_audioSources.end(), base) != m_audioSources.end()) {
         return 0;   // 已添加
     }
+    // 每路源一个 asrc.* 节点，接到混音器的空闲端口（端口号 = 混流通道号，由总线分配）
+    const AudioCapSourceType type = base->GetAudioCapSourceType();
+    const std::string name = UniqueAudioNodeName(type == TypeOfSelfMicphone ? "asrc.mic"
+                                                 : type == TypeOfSpeaker    ? "asrc.speaker"
+                                                                            : "asrc.src");
+    auto node = std::make_shared<nodes::AudioSourceNode>(name, base);
+    if (!m_bus.Begin().Register(name, node).Link(name, 0, "audio_mixer", core::kAnyPort).Commit()) {
+        node->Detach();
+        TG_LOGE("TGCapturer: 音频源 %s 接入总线失败", name.c_str());
+        return TGErr_Internal;
+    }
     m_audioSources.push_back(base);
+    m_audioSourceNodes.push_back(std::move(node));
     if (!m_audioSource) {
         m_audioSource = base;
     }
-    base->SetEmitCallback([this, base](core::FramePtr frame) { OnAudioFrameFrom(base, std::move(frame)); });
-    TG_LOGI("TGCapturer: 音频源 +1（当前 %zu 路）", m_audioSources.size());
+    TG_LOGI("TGCapturer: 音频源 +1 %s（当前 %zu 路）", name.c_str(), m_audioSources.size());
     return 0;
 }
 
-int TGCapturer::ChannelIdOf(capture::AudioSourceBase* source) const
+std::string TGCapturer::UniqueAudioNodeName(const std::string& base) const
 {
-    for (size_t i = 0; i < m_audioSources.size(); ++i) {
-        if (m_audioSources[i] == source) {
-            return static_cast<int>(i);
+    if (!m_bus.Get(base)) {
+        return base;
+    }
+    for (int i = 2;; ++i) {
+        std::string name = base + "." + std::to_string(i);
+        if (!m_bus.Get(name)) {
+            return name;
         }
-    }
-    return -1;
-}
-
-void TGCapturer::OnAudioFrameFrom(capture::AudioSourceBase* source, core::FramePtr frame)
-{
-    if (!frame || !m_audioEnabled || !m_mixer || m_state.load() != State::Running) {
-        return;
-    }
-    if (!frame->audioData || frame->audioBytes == 0 || frame->channels <= 0) {
-        return;
-    }
-    // 统一进混流器：单路也同样走（这样单路也能吃到 PI/BURST 时钟校正）
-    const int id = ChannelIdOf(source);
-    if (id < 0) {
-        return;
-    }
-    const int frames = static_cast<int>(frame->audioBytes / (sizeof(int16_t) * static_cast<size_t>(frame->channels)));
-    m_mixer->Push(id, reinterpret_cast<const int16_t*>(frame->audioData.get()), frames,
-                  frame->captureUs);
-}
-
-void TGCapturer::StartAudioMixer()
-{
-    if (!m_audioEnabled || m_mixThread.joinable()) {
-        return;
-    }
-    TG_LOGI("TGCapturer: 启用音频混流（%zu 路，输出 %dHz %dch）",
-            m_audioSources.size(), m_mixer->OutputSampleRate(), m_mixer->OutputChannels());
-    m_mixThread = std::jthread([this](std::stop_token st) { MixLoop(st); });
-}
-
-void TGCapturer::StopAudioMixer()
-{
-    if (m_mixThread.joinable()) {
-        m_mixThread.request_stop();
-        m_mixThread.join();
-    }
-    // 混流器与音频主时钟必须一起复位：AudioClock::AdvanceTo 是单向的（只在前进方向生效），
-    // 若只把 mixer 的输出时间轴归零、而 m_audioClock 还停在上一轮的末值，
-    // 新一轮的 AdvanceTo 会被判成"回退"全部忽略，视频 PTS 就会从上一轮时长起算。
-    if (m_audioClock) {
-        m_audioClock->Reset();
-        m_audioClock->SetCompensationUs(m_videoParams.audioCompensationUs);
-    }
-    if (m_mixer) {
-        const auto ms = m_mixer->Stats();
-        TG_LOGI("TGCapturer: 混流汇总 out=%llu wait=%llu reanchor=%llu/%lldms",
-                static_cast<unsigned long long>(ms.outputFrames),
-                static_cast<unsigned long long>(ms.waitTimeouts),
-                static_cast<unsigned long long>(ms.reanchors),
-                static_cast<long long>(ms.reanchorUs / 1000));
-        auto diags = m_mixer->AllDiagnostics();
-        for (size_t i = 0; i < diags.size(); ++i) {
-            const auto& d = diags[i];
-            TG_LOGI("TGCapturer: 混流通道 %zu under=%llu comp=%lldms drop=%lldms ovf=%lldms "
-                    "drift=%lldus/5s tsBad=%llu fallback=%d jump=%llu",
-                    i, static_cast<unsigned long long>(d.underrun),
-                    static_cast<long long>(d.compensationUs / 1000),
-                    static_cast<long long>(d.productionDropUs / 1000),
-                    static_cast<long long>(d.overflowDropUs / 1000),
-                    static_cast<long long>(d.residualDriftUs),
-                    static_cast<unsigned long long>(d.tsAnomalies), d.tsFallback ? 1 : 0,
-                    static_cast<unsigned long long>(d.clock.jumpCount));
-        }
-        m_mixer->Reset();
     }
 }
 
-void TGCapturer::MixLoop(std::stop_token token)
+void TGCapturer::RemoveExternalAudioNodes()
 {
-    // 心跳：每 10 秒打一条累计状态，长压测时能在时间轴上看到 drift / avDiff 的分布，
-    // 而不是只在 Stop 时才有一次最终聚合
-    const int64_t kHeartbeatUs = 10 * 1000000LL;
-    int64_t lastBeatUs = core::MonotonicClock::NowUs();
-    int64_t lastOutputUs = lastBeatUs;
-    while (!token.stop_requested()) {
-        std::shared_ptr<uint8_t> data;
-        int64_t ptsUs = 0;
-        if (!m_mixer->Mix(m_audioFrameSize, data, ptsUs)) {
-            // 混流按输出时钟出帧，轮询时取不到数据是常态；只有持续 500ms 没有任何输出才提示
-            // （全部通道断流 / 未推数据，音频时间轴停住）
-            if (core::MonotonicClock::NowUs() - lastOutputUs > 500000) {
-                TG_LOGW_THROTTLED(3000000, "TGCapturer: 混流超过 500ms 无输出（当前通道数 %zu，全部断流或未推数据）",
-                                  m_mixer->ChannelCount());
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            continue;
-        }
-        lastOutputUs = core::MonotonicClock::NowUs();
-        m_audioWatch.OnActivity(lastOutputUs);
-
-        // ---- 心跳：10s/次 I 级累计状态 ----
-        const int64_t nowUs = core::MonotonicClock::NowUs();
-        if (nowUs - lastBeatUs >= kHeartbeatUs) {
-            lastBeatUs = nowUs;
-            // 1) 视频 PTS 生成器累计
-            core::VideoPtsGenerator::Stats vs{};
-            if (m_videoPtsGen) { vs = m_videoPtsGen->stats(); }
-            // 2) 每路音频的 drift / PI / BURST / ForceAlign / 积压
-            auto diags = m_mixer->AllDiagnostics();
-            std::string per;
-            per.reserve(128);
-            for (size_t i = 0; i < diags.size(); ++i) {
-                const auto& d = diags[i];
-                char buf[256];
-                std::snprintf(buf, sizeof(buf),
-                              " ch%zu[drift=%lldus/5s jump=%llu under=%llu comp=%lldms drop=%lldms "
-                              "ovf=%lldms tsBad=%llu%s buf=%zu]",
-                              i,
-                              static_cast<long long>(d.residualDriftUs),
-                              static_cast<unsigned long long>(d.clock.jumpCount),
-                              static_cast<unsigned long long>(d.underrun),
-                              static_cast<long long>(d.compensationUs / 1000),
-                              static_cast<long long>(d.productionDropUs / 1000),
-                              static_cast<long long>(d.overflowDropUs / 1000),
-                              static_cast<unsigned long long>(d.tsAnomalies),
-                              d.tsFallback ? "(wall)" : "",
-                              m_mixer->BufferedFrames(static_cast<int>(i)));
-                per += buf;
-            }
-            const auto ms = m_mixer->Stats();
-            TG_LOGI("TGCapturer: 心跳 avDiff=%lldms force=%llu adapt=%llu clamp=%llu "
-                    "stall=%llu skip=%llu jump=%llu staleReset=%llu bpDrop=%llu "
-                    "bus[pend=%zu evDrop=%llu] mix[out=%llu wait=%llu reanchor=%llu/%lldms]|%s",
-                    static_cast<long long>(vs.avDiffUs / 1000),
-                    static_cast<unsigned long long>(vs.forceSynced),
-                    static_cast<unsigned long long>(vs.adapted),
-                    static_cast<unsigned long long>(vs.clamped),
-                    static_cast<unsigned long long>(vs.stalled),
-                    static_cast<unsigned long long>(vs.skipped),
-                    static_cast<unsigned long long>(vs.jumpWarns),
-                    static_cast<unsigned long long>(vs.staleResets),
-                    static_cast<unsigned long long>(m_bpDropped.load()),
-                    m_bus.TotalPending(),
-                    static_cast<unsigned long long>(m_bus.Events().Dropped()),
-                    static_cast<unsigned long long>(ms.outputFrames),
-                    static_cast<unsigned long long>(ms.waitTimeouts),
-                    static_cast<unsigned long long>(ms.reanchors),
-                    static_cast<long long>(ms.reanchorUs / 1000),
-                    per.c_str());
-        }
-
-        const int channels = m_mixer->OutputChannels();
-        const int sampleRate = m_mixer->OutputSampleRate();
-        const size_t bytes = static_cast<size_t>(m_audioFrameSize) * static_cast<size_t>(channels) *
-                             sizeof(int16_t);
-
-        auto frame = std::make_shared<core::Frame>();
-        frame->kind = core::MediaKind::Audio;
-        frame->sampleRate = sampleRate;
-        frame->channels = channels;
-        frame->sampleFmt = AV_SAMPLE_FMT_S16;
-        frame->planar = false;
-        frame->nbSamples = m_audioFrameSize;
-        frame->audioData = data;
-        frame->audioBytes = bytes;
-        frame->ptsUs = ptsUs;
-        frame->captureUs = core::MonotonicClock::NowUs();
-
-        // 音频主时钟跟着混流输出走（视频 PTS 由它反推）
-        if (sampleRate > 0) {
-            m_audioClock->AdvanceTo(ptsUs + static_cast<int64_t>(m_audioFrameSize) * 1000000LL /
-                                                sampleRate);
-        }
-        m_audioIn->Submit(std::move(frame));
+    std::unordered_map<int, std::shared_ptr<nodes::AudioSourceNode>> nodes;
+    {
+        std::lock_guard<std::mutex> lock(m_externalAudioMutex);
+        nodes.swap(m_externalAudioNodes);
     }
+    for (const auto& [_, node] : nodes) {
+        m_bus.Unregister(node->Name());
+    }
+}
+
+void TGCapturer::LogHeartbeat()
+{
+    // 1) 视频 PTS 生成器累计
+    core::VideoPtsGenerator::Stats vs{};
+    if (m_videoPtsGen) {
+        vs = m_videoPtsGen->stats();
+    }
+    // 2) 每路音频的 drift / PI / BURST / ForceAlign / 积压
+    const auto& mixer = m_audioMixer->Mixer();
+    auto diags = mixer.AllDiagnostics();
+    std::string per;
+    per.reserve(128);
+    for (size_t i = 0; i < diags.size(); ++i) {
+        const auto& d = diags[i];
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      " ch%zu[drift=%lldus/5s jump=%llu under=%llu comp=%lldms drop=%lldms "
+                      "ovf=%lldms tsBad=%llu%s buf=%zu]",
+                      i,
+                      static_cast<long long>(d.residualDriftUs),
+                      static_cast<unsigned long long>(d.clock.jumpCount),
+                      static_cast<unsigned long long>(d.underrun),
+                      static_cast<long long>(d.compensationUs / 1000),
+                      static_cast<long long>(d.productionDropUs / 1000),
+                      static_cast<long long>(d.overflowDropUs / 1000),
+                      static_cast<unsigned long long>(d.tsAnomalies),
+                      d.tsFallback ? "(wall)" : "",
+                      mixer.BufferedFrames(static_cast<int>(i)));
+        per += buf;
+    }
+    const auto ms = mixer.Stats();
+    TG_LOGI("TGCapturer: 心跳 avDiff=%lldms force=%llu adapt=%llu clamp=%llu "
+            "stall=%llu skip=%llu jump=%llu staleReset=%llu bpDrop=%llu "
+            "bus[pend=%zu evDrop=%llu] mix[out=%llu wait=%llu reanchor=%llu/%lldms]|%s",
+            static_cast<long long>(vs.avDiffUs / 1000),
+            static_cast<unsigned long long>(vs.forceSynced),
+            static_cast<unsigned long long>(vs.adapted),
+            static_cast<unsigned long long>(vs.clamped),
+            static_cast<unsigned long long>(vs.stalled),
+            static_cast<unsigned long long>(vs.skipped),
+            static_cast<unsigned long long>(vs.jumpWarns),
+            static_cast<unsigned long long>(vs.staleResets),
+            static_cast<unsigned long long>(m_bpDropped.load()),
+            m_bus.TotalPending(),
+            static_cast<unsigned long long>(m_bus.Events().Dropped()),
+            static_cast<unsigned long long>(ms.outputFrames),
+            static_cast<unsigned long long>(ms.waitTimeouts),
+            static_cast<unsigned long long>(ms.reanchors),
+            static_cast<long long>(ms.reanchorUs / 1000),
+            per.c_str());
 }
 
 int TGCapturer::AddVideoSource(IVideoSource* source)
@@ -585,10 +508,8 @@ int TGCapturer::PrepareLocked(PrepareError& err)
         videoType.SetHeight(evenH);
     }
     m_useExternalVideoPts = m_videoParams.videoUseExternalPts;
-    {
-        std::lock_guard<std::mutex> lock(m_externalAudioMutex);
-        m_externalAudioChannels.clear();
-    }
+    // 上一轮外灌音频的 asrc.ext.* 节点（及其混流通道）作废，本轮按首帧格式重新接入
+    RemoveExternalAudioNodes();
 
     // 纯视频模式：不建音频编码器、封装器也不建音频流
     m_audioEnabled = m_audioParams.enabled && m_audioParams.sampleRate > 0 && m_audioParams.channels > 0;
@@ -764,29 +685,24 @@ int TGCapturer::PrepareLocked(PrepareError& err)
         return fail(TGErr_OpenMuxer, m_muxer->LastAvError(), "open muxer failed");
     }
 
-    if (m_audioEnabled) {
-        for (auto* source : m_audioSources) {
-            if (source && source->Open(m_audioParams.sampleRate, m_audioParams.channels) < 0) {
-                // 音频按"降级而非失败"处理（少一路声音仍可开播），但不能就这么算了：
-                // 开播后若混流器整体没有音频"输出"，断流看护会上报 TGErr_AudioCaptureStalled。
-                // 注意：部分平台的采集源在打开失败后仍会注入静音帧，此时混流照常出帧，
-                // 看护探测不到——这种"有声道但全静音"的情况只能靠日志排查，无法自动上报。
-                TG_LOGW("TGCapturer: 音频源 type=%d 打开失败，该路按静音处理",
-                        static_cast<int>(source->GetAudioCapSourceType()));
-            }
-        }
+    // 音频链路：各路源节点先打开（失败按静音降级，见 AudioSourceNode::NodeConfigure），
+    // 再配置混音节点 —— 输出格式取编码器配置，已接入的每路源预建一条通道（单路也同样建，以便做时钟校正）
+    for (const auto& node : m_audioSourceNodes) {
+        node->SetEnabled(m_audioEnabled);
+        node->SetOpenFormat(m_audioParams.sampleRate, m_audioParams.channels);
     }
-
-    // 混流通道：每一路音频源一条，输出格式取编码器配置（单路也同样建，以便做时钟校正）
+    m_audioMixer->SetEnabled(m_audioEnabled);
     if (m_audioEnabled) {
-        m_mixer->Reset();
-        m_mixer->SetOutputFormat(m_audioParams.sampleRate, m_audioParams.channels);
-        const int64_t nowUs = core::MonotonicClock::NowUs();
-        for (size_t i = 0; i < m_audioSources.size(); ++i) {
-            m_mixer->AddChannel(static_cast<int>(i), m_audioParams.sampleRate,
-                                m_audioParams.channels, nowUs);
+        for (const auto& node : m_audioSourceNodes) {
+            node->Configure();
         }
-        m_audioFrameSize = audioType.FrameSize() > 0 ? audioType.FrameSize() : 1024;
+        nodes::AudioMixerNode::Config mixCfg;
+        mixCfg.sampleRate = m_audioParams.sampleRate;
+        mixCfg.channels = m_audioParams.channels;
+        mixCfg.frameSize = audioType.FrameSize() > 0 ? audioType.FrameSize() : 1024;
+        mixCfg.clockCompensationUs = m_videoParams.audioCompensationUs;
+        m_audioMixer->SetConfig(mixCfg);
+        m_audioMixer->Configure();
     }
 
     m_state.store(State::Prepared);
@@ -843,14 +759,9 @@ int TGCapturer::StartLocked(PrepareError& err)
     if (m_videoSource) {
         m_videoSource->StartCapture();
     }
-    if (m_audioEnabled) {
-        for (auto* source : m_audioSources) {
-            if (source) {
-                source->StartCapture();
-            }
-        }
-        StartAudioMixer();   // 多于一路时合并（麦克风 + 扬声器）
-    }
+    // capture 组（音频源 + 混音器）：下游先于上游，混音时钟线程先起、源再开始产帧。
+    // 纯视频模式下这些节点未激活，被跳过
+    m_bus.StartGroup(core::NodeGroup::Capture);
 
     m_state.store(State::Running);
     StartWatchdog();
@@ -917,14 +828,10 @@ void TGCapturer::TeardownLocked()
     if (m_videoSource) {
         m_videoSource->StopCapture();
     }
-    // 不按 m_audioEnabled 过滤：Prepare 中途失败时它可能还是上一轮的值，
+    // capture 组（音频源 → 混音器）：上游先于下游。源节点是受控输出（关闸 + 停源 + 等在飞回调），
+    // 混音器停线程并复位音频主时钟。不按 m_audioEnabled 过滤：Prepare 中途失败时它可能还是上一轮的值，
     // 而已经 Open 过的音频源无论如何都得停。对没启动的源是无副作用的空操作。
-    for (auto* source : m_audioSources) {
-        if (source) {
-            source->StopCapture();
-        }
-    }
-    StopAudioMixer();
+    m_bus.StopGroup(core::NodeGroup::Capture);
     // output 组由总线按拓扑顺序收尾：Stop 上游先于下游（编码器 drain 完积压再停封装器），
     // Close 下游先于上游（封装器先写尾，再关编码器）。对未启动 / 未打开的节点是空操作
     m_bus.StopGroup(core::NodeGroup::Output);
@@ -936,11 +843,8 @@ void TGCapturer::TeardownLocked()
     if (m_videoSource) {
         m_videoSource->Close();
     }
-    for (auto* source : m_audioSources) {
-        if (source) {
-            source->Close();
-        }
-    }
+    m_bus.CloseGroup(core::NodeGroup::Capture);
+    RemoveExternalAudioNodes();
     m_sync->Reset();
 }
 
@@ -1041,6 +945,13 @@ void TGCapturer::ReleaseAll()
     // 析构路径：必须等任何在途的 Stop 收尾完，否则这里开始销毁成员时
     // 那个线程还在 PublishSync 里回调宿主
     WaitStopSettled(lock);
+    // 先把音频源节点从总线上摘下并解除与源的回调绑定，再释放源（源可能比节点先销毁）
+    for (const auto& node : m_audioSourceNodes) {
+        node->Detach();
+        m_bus.Unregister(node->Name());
+    }
+    m_audioSourceNodes.clear();
+    RemoveExternalAudioNodes();
     m_ownedVideoSources.clear();
     m_ownedAudioSources.clear();
     m_videoSource = nullptr;
@@ -1049,9 +960,7 @@ void TGCapturer::ReleaseAll()
     if (m_audioClock) {
         m_audioClock->Reset();
     }
-    if (m_mixer) {
-        m_mixer->Reset();
-    }
+    m_audioMixer->Mixer().Reset();
 }
 
 // ------------------------------------------------------------------ 帧流转
@@ -1214,10 +1123,10 @@ void TGCapturer::OnVideoFrame(core::FramePtr frame)
     }
 }
 
-// 外部注入的音频：同样进混流器（走 0 号通道，没有内部音频源时由它独占）
+// 外部注入的音频：每种 AudioCapSourceType 一个 asrc.ext.<type> 节点，首帧到达时接入混音器
 void TGCapturer::OnAudioFrame(AudioCapSourceType type, core::FramePtr frame)
 {
-    if (!frame || !m_audioEnabled || !m_mixer || m_state.load() != State::Running) {
+    if (!frame || !m_audioEnabled || m_state.load() != State::Running) {
         return;
     }
     if (!frame->audioData || frame->audioBytes == 0 || frame->channels <= 0) {
@@ -1226,40 +1135,28 @@ void TGCapturer::OnAudioFrame(AudioCapSourceType type, core::FramePtr frame)
     // 外部注入的音频按 type 分路：每种 AudioCapSourceType 独占一个混流通道。
     // 共享单一通道会把两路串成一条时间轴（表现为"交替输出"而非真正混音），且与内部麦克风源
     // 共用同一个通道时钟还会互相拉扯时间戳（音频抖动/变调）。
-    int id = -1;
+    std::shared_ptr<nodes::AudioSourceNode> node;
     {
         std::lock_guard<std::mutex> lock(m_externalAudioMutex);
         const int key = static_cast<int>(type);
-        auto it = m_externalAudioChannels.find(key);
-        if (it != m_externalAudioChannels.end()) {
-            id = it->second;
+        auto it = m_externalAudioNodes.find(key);
+        if (it != m_externalAudioNodes.end()) {
+            node = it->second;
         } else {
-            const int newId = static_cast<int>(m_mixer->ChannelCount());  // 追加在内部源之后
-            // 以第一个 active 通道（内部源或首路外部注入）的格式作为混流输出格式。
-            if (newId == 0) {
-                m_mixer->SetOutputFormat(frame->sampleRate, frame->channels);
-            }
-            if (m_mixer->AddChannel(newId, frame->sampleRate, frame->channels,
-                                    core::MonotonicClock::NowUs()) == 0) {
-                m_externalAudioChannels[key] = newId;
-                id = newId;
-                TG_LOGI("TGCapturer: 外部注入音频 type=%d 占用混流通道 %d（%dHz %dch）",
-                        static_cast<int>(type), id, frame->sampleRate, frame->channels);
-            } else {
-                // 通道建不起来 = 这一路音频被永久丢弃，原先静默 return，宿主完全无感
-                TG_LOGE("TGCapturer: 为外部音频 type=%d 创建混流通道失败",
-                        static_cast<int>(type));
+            const std::string name = UniqueAudioNodeName("asrc.ext." + std::to_string(key));
+            node = std::make_shared<nodes::AudioSourceNode>(name, type);
+            if (!m_bus.Begin().Register(name, node).Link(name, 0, "audio_mixer", core::kAnyPort).Commit()) {
+                // 接不进去 = 这一路音频被永久丢弃，原先静默 return，宿主完全无感
+                TG_LOGE("TGCapturer: 外部注入音频 type=%d 接入总线失败", key);
                 FireError(TGErr_Internal, 0, "add audio mixer channel failed");
                 return;
             }
+            m_externalAudioNodes[key] = node;
+            TG_LOGI("TGCapturer: 外部注入音频 type=%d 接入 %s（%dHz %dch）", key, name.c_str(),
+                    frame->sampleRate, frame->channels);
         }
     }
-    if (id < 0) {
-        return;
-    }
-    const int frames = static_cast<int>(frame->audioBytes / (sizeof(int16_t) * static_cast<size_t>(frame->channels)));
-    m_mixer->Push(id, reinterpret_cast<const int16_t*>(frame->audioData.get()), frames,
-                  frame->captureUs);
+    node->Push(std::move(frame));
 }
 
 // ------------------------------------------------------------------ 外部注入
@@ -1450,8 +1347,7 @@ int TGCapturer::SetAVTimeout(int64_t audioTimeoutMs, int64_t videoTimeoutMs)
 std::string TGCapturer::GetStatsInfo(StatsInfoType type)
 {
     auto mixerDiagJson = [this]() -> std::string {
-        if (!m_mixer) return std::string("[]");
-        auto diags = m_mixer->AllDiagnostics();
+        auto diags = m_audioMixer->Mixer().AllDiagnostics();
         std::string out = "[";
         for (size_t i = 0; i < diags.size(); ++i) {
             const auto& d = diags[i];

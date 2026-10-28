@@ -10,6 +10,7 @@
 #   --format flv|mpegts  封装格式，默认 flv
 #   --res 540|720|1080 分辨率档位（横屏），默认 720
 #   --codec <name>     视频编码器，默认 h264_mediacodec（模拟器不支持时内核会回退 libopenh264）
+#   --mic              同时开麦克风（原生采集源，自动 pm grant RECORD_AUDIO）
 #   --no-build         不重新编译 / 安装 demo
 #   --keep             保留拉回的录像（默认也保留，路径打印在最后）
 #
@@ -24,6 +25,7 @@ format="flv"
 res="720"
 codec="h264_mediacodec"
 build=1
+mic=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -32,8 +34,9 @@ while [[ $# -gt 0 ]]; do
         --res)     res="$2"; shift ;;
         --codec)   codec="$2"; shift ;;
         --no-build) build=0 ;;
+        --mic)     mic=true ;;
         --keep)    ;;
-        -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
         *) echo "未知参数: $1" >&2; exit 2 ;;
     esac
     shift
@@ -69,6 +72,7 @@ fi
 # ---------------------------------------------------------------- 2. 写设置（应用必须先停掉，否则退出时会把内存里的设置写回去）
 adb shell am force-stop "$pkg"
 adb shell pm grant "$pkg" android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true
+$mic && adb shell pm grant "$pkg" android.permission.RECORD_AUDIO >/dev/null 2>&1
 prefs=$(cat <<EOF
 <?xml version='1.0' encoding='utf-8' standalone='yes' ?>
 <map>
@@ -79,7 +83,7 @@ prefs=$(cat <<EOF
     <string name="pref_orientation">landscape</string>
     <string name="pref_fps">30</string>
     <string name="pref_video_codec">$codec</string>
-    <boolean name="pref_audio_mic" value="false" />
+    <boolean name="pref_audio_mic" value="$mic" />
     <boolean name="pref_audio_speaker" value="false" />
     <boolean name="pref_audio_tone" value="true" />
 </map>

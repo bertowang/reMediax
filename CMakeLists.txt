@@ -85,6 +85,7 @@ set(TG_CORE_SOURCES
     src/core/VideoTransform.cpp
     src/core/Watermark.cpp
     src/mux/Muxer.cpp
+    src/nodes/AudioNodes.cpp
 )
 
 set(TG_PLATFORM_SOURCES "")

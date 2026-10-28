@@ -23,6 +23,7 @@
 #include "core/PauseFrame.h"
 #include "core/Watermark.h"
 #include "mux/Muxer.h"
+#include "nodes/AudioNodes.h"
 
 namespace TGCapture
 {
@@ -116,12 +117,13 @@ private:
     void OnBusEvent(const core::BusEvent& event);
     void ReleaseAll();
 
-    // 多路音频（麦克风 + 扬声器 …）：统一进 AudioMixer，由混音线程产出一路
-    void OnAudioFrameFrom(capture::AudioSourceBase* source, core::FramePtr frame);
-    void StartAudioMixer();
-    void StopAudioMixer();
-    void MixLoop(std::stop_token token);
-    int ChannelIdOf(capture::AudioSourceBase* source) const;
+    // 多路音频（麦克风 + 扬声器 + 外部注入 …）：每路一个 asrc.* 节点接到 audio_mixer，
+    // 由混音节点的时钟线程产出一路（见 nodes/AudioNodes.h）
+    std::string UniqueAudioNodeName(const std::string& base) const;
+    // 拆掉外部注入音频的 asrc.ext.* 节点（Prepare 前 / 停止后），下一轮按首帧重新建
+    void RemoveExternalAudioNodes();
+    // 混音线程每 10s 回调：打印同步 / 混流 / 总线累计状态
+    void LogHeartbeat();
 
     // 断流看护：采集类故障（设备丢失 / 权限被撤销 / 采集重建失败 / 上层停推）没有失败返回值，
     // 共同表现就是"不再有数据"。在内核侧统一探测，比指望每个平台各自上报可靠得多
@@ -165,13 +167,6 @@ private:
     capture::AudioSourceBase* m_audioSource = nullptr;  // 非拥有（首个/主要音频源）
     std::vector<capture::AudioSourceBase*> m_audioSources;   // 全部音频源（麦克风 + 扬声器）
 
-    // 多源混流（core/AudioMixer：按采样点加和 + 每路 PI/BURST 时钟校正）
-    std::unique_ptr<core::AudioMixer> m_mixer;
-    int m_audioFrameSize = 1024;
-    // m_mixThread 不在这里声明：MixLoop 会访问 m_bus / m_audioIn / m_audioClock / m_videoPtsGen，
-    // 成员按声明逆序析构，线程必须声明在它访问的所有成员之后才能最先被 join。
-    // 见下方与 m_watchThread 相邻的声明。
-
     // 平台采集句柄（Android：MediaProjection jobject 全局引用，由 SetPrivateData 传入）
     void* m_mediaProjection = nullptr;
 
@@ -200,14 +195,18 @@ private:
     // 节点线程退出过程中发布的事件才不会落在已销毁的对象上
     core::Bus m_bus;
 
-    // 内核（总线节点）。数据流：采集 → video_encoder / audio_encoder → muxer
+    // 内核（总线节点）。数据流：
+    //   asrc.* → audio_mixer → audio_encoder ─┐
+    //   采集 ─────────────────→ video_encoder ─┴→ muxer
     std::shared_ptr<codec::VideoEncoder> m_videoEncoder;
     std::shared_ptr<codec::AudioEncoder> m_audioEncoder;
     std::shared_ptr<Muxer> m_muxer;
     std::shared_ptr<core::AVSync> m_sync;
+    // 音频链路：混音节点（按采样点加和 + 每路 PI/BURST 时钟校正，自带混音时钟线程）与各路源节点
+    std::shared_ptr<nodes::AudioMixerNode> m_audioMixer;
+    std::vector<std::shared_ptr<nodes::AudioSourceNode>> m_audioSourceNodes;   // 原生源（AddAudioSource）
     // 热路径入口缓存：每帧不再按字符串名查表
     core::BusNodePtr m_videoIn;
-    core::BusNodePtr m_audioIn;
 
     // 宿主回调：设置与调用可能在不同线程，用互斥保护。调用时先拷贝出来再在锁外执行
     std::mutex m_callbackMutex;
@@ -230,20 +229,19 @@ private:
     // 外部注入视频是否沿用调用方自带的 PTS（VideoEncoderParams::videoUseExternalPts）。
     // Prepare 写、采集/注入线程读，用 atomic 避免跨线程读写同一 bool。
     std::atomic_bool m_useExternalVideoPts{false};
-    // 外部注入音频按 AudioCapSourceType 分路，每种类型独占一个混流通道。
-    // 不能复用 0 号：那是内部麦克风源，两路共用一个通道时钟会互相拉扯时间戳；
+    // 外部注入音频按 AudioCapSourceType 分路，每种类型独占一个 asrc.ext.<type> 节点（= 一个混流通道）。
+    // 不能与内部麦克风源共用：两路共用一个通道时钟会互相拉扯时间戳；
     // 外部多路（如游戏音频 + 游戏麦克风）也必须各占一路，否则会被串成一条时间轴，
     // 结果不是"混音"而是"交替输出"。
-    std::unordered_map<int, int> m_externalAudioChannels;
+    std::unordered_map<int, std::shared_ptr<nodes::AudioSourceNode>> m_externalAudioNodes;
     std::mutex m_externalAudioMutex;
     // 断流阈值（SetAVTimeout 可改）与看护状态
     std::atomic<int64_t> m_audioTimeoutMs{3000};
     std::atomic<int64_t> m_videoTimeoutMs{3000};
     core::StallWatch m_videoWatch;
     core::StallWatch m_audioWatch;
-    // 两个工作线程声明在最后：它们访问 m_bus / 编码器节点 / 同步时钟，
-    // 逆序析构保证先 join 线程、再销毁线程正在用的东西
-    std::jthread m_mixThread;
+    // 看护线程声明在最后：它访问 m_bus / 编码器节点 / 同步时钟，
+    // 逆序析构保证先 join 线程、再销毁线程正在用的东西（混音线程归 audio_mixer 节点，Stop 时已 join）
     std::jthread m_watchThread;
     // 本轮运行期最后一次上报的错误码，Stop 时带给 OnStopCallback（0 = 全程无错误）
     std::atomic<int32_t> m_lastRuntimeError{0};
