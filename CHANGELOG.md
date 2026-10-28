@@ -4,6 +4,17 @@
 
 ## Unreleased
 
+### AudioEncoder 采样格式适配（R1）
+- 回退到 ffmpeg 内置 `aac`（只收 FLTP）时，S16 → FLTP 转换已在 iOS 回归中补上（swresample）；
+  本轮补齐回归测试与剩余缺口：
+  - 新增 `tests/test_audio_encoder.cpp`：真实编码 + 解码，校验回退路径无 NaN、43/43 帧编出、
+    解码后 RMS 与输入一致。在修复前的实现上可稳定复现（`Input contains NaN`、`send_frame -22`、1/43 帧）。
+  - 编码器采样格式改为"支持 S16/S16P 就直接用、否则取首选格式再转换"，不再无脑取 `sample_fmts[0]`。
+  - `Open` 校验输入必须是交错 S16（编码器内部按 int16 累积），其它格式直接失败（返回 -5，`extra=EINVAL`），
+    不再开起来后静默产出噪声。
+  - `swr_init` 失败时带出真实 `AVERROR`（此前统一记为 `EINVAL`）；`AVFrame` 声道布局改用
+    `av_channel_layout_copy`，不再按值浅拷贝。
+
 ### 错误定义与异常处理（本轮）
 
 #### 错误码

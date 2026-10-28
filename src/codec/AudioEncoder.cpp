@@ -1,6 +1,7 @@
 #include "codec/AudioEncoder.h"
 
 #include <cstdio>
+#include <cstring>
 
 #include "core/AvError.h"
 #include "core/Logger.h"
@@ -13,6 +14,34 @@ extern "C"
 
 namespace TGCapture::codec
 {
+
+namespace
+{
+
+// 混流器输出、也是 EncodeOne 累积缓冲（std::vector<int16_t>）的唯一格式
+constexpr AVSampleFormat kInputFormat = AV_SAMPLE_FMT_S16;
+
+// 编码器采样格式：能直接收 S16 / S16P 就用（零转换），否则取它的首选格式再经 swr 转换。
+// 只取 sample_fmts[0] 的话，同时支持 S16 与 FLT 的编码器也会被白白插一级转换。
+AVSampleFormat PickSampleFormat(const AVCodec* codec)
+{
+    if (!codec->sample_fmts) {
+        return kInputFormat;
+    }
+    for (const AVSampleFormat* f = codec->sample_fmts; *f != AV_SAMPLE_FMT_NONE; ++f) {
+        if (*f == AV_SAMPLE_FMT_S16) {
+            return *f;
+        }
+    }
+    for (const AVSampleFormat* f = codec->sample_fmts; *f != AV_SAMPLE_FMT_NONE; ++f) {
+        if (*f == AV_SAMPLE_FMT_S16P) {
+            return *f;
+        }
+    }
+    return codec->sample_fmts[0];
+}
+
+}  // namespace
 
 AudioEncoder::AudioEncoder(size_t queueCapacity)
     : core::BusNode("audio_encoder"),
@@ -44,6 +73,15 @@ int AudioEncoder::Open(const AudioEncoderParams& params, const core::AudioMediaT
     m_srcType = srcType;
     m_codecName = params.aCodec.empty() ? "libfdk_aac" : params.aCodec;
 
+    // 输入必须是交错 S16：EncodeOne 按 int16 累积、swr 也按 S16 配置输入端。
+    // 给了别的格式却照开不误，结果就是静默产出噪声 / NaN（与 R1 同类问题），这里直接拒绝。
+    if (srcType.SampleFormat() != AV_SAMPLE_FMT_NONE && srcType.SampleFormat() != kInputFormat) {
+        TG_LOGE("AudioEncoder: 不支持的输入采样格式 %s（要求交错 s16）",
+                av_get_sample_fmt_name(srcType.SampleFormat()));
+        m_lastAvError.store(AVERROR(EINVAL));
+        return -5;
+    }
+
     const AVCodec* codec = avcodec_find_encoder_by_name(m_codecName.c_str());
     if (!codec) {
         TG_LOGW("AudioEncoder: %s 不可用，回退 aac", m_codecName.c_str());
@@ -67,7 +105,7 @@ int AudioEncoder::Open(const AudioEncoderParams& params, const core::AudioMediaT
     m_ctx->sample_rate = params.sampleRate > 0 ? params.sampleRate : srcType.SampleRate();
     // ffmpeg 6.x 使用 ch_layout（channels / channel_layout 已移除）
     av_channel_layout_default(&m_ctx->ch_layout, channels);
-    m_ctx->sample_fmt = codec->sample_fmts ? codec->sample_fmts[0] : AV_SAMPLE_FMT_S16;
+    m_ctx->sample_fmt = PickSampleFormat(codec);
     m_ctx->bit_rate = params.aBitrate > 0 ? params.aBitrate : 128000;
     // 全链路统一微秒时间基：PTS 一律由混流器给的 ptsUs 换算，
     // 不能用"采样数"当 PTS（封装侧按 1/1000000 解释，单位不一致会让文件时间轴错乱）
@@ -85,18 +123,21 @@ int AudioEncoder::Open(const AudioEncoderParams& params, const core::AudioMediaT
 
     m_frameSize = m_ctx->frame_size > 0 ? m_ctx->frame_size : 1024;
 
-    // 输入恒为交错 S16。编码器要别的采样格式时（回退到 ffmpeg 内置 aac / aac_at 都是 FLTP）
+    // 输入恒为交错 S16。编码器要别的采样格式时（如回退到的 ffmpeg 内置 aac 只收 FLTP）
     // 必须做格式转换：原先直接 memcpy / 按 int16 拷进 FLTP 平面，float 位模式全是垃圾，
     // 编码器报 "Input contains NaN/+-Inf"，持续失败 1s 后上报 TGErr_AudioEncodeFailed。
     // 采样率与声道数两端一致，这里只转格式（swr 在同采样率下不引入延迟）。
     if (m_ctx->sample_fmt != AV_SAMPLE_FMT_S16 && m_ctx->sample_fmt != AV_SAMPLE_FMT_S16P) {
-        const int swrRet = swr_alloc_set_opts2(&m_swr, &m_ctx->ch_layout, m_ctx->sample_fmt,
-                                               m_ctx->sample_rate, &m_ctx->ch_layout,
-                                               AV_SAMPLE_FMT_S16, m_ctx->sample_rate, 0, nullptr);
-        if (swrRet < 0 || !m_swr || swr_init(m_swr) < 0) {
-            TG_LOGE("AudioEncoder: 采样格式转换初始化失败 codec=%s fmt=%s", m_codecName.c_str(),
-                    av_get_sample_fmt_name(m_ctx->sample_fmt));
-            m_lastAvError.store(swrRet < 0 ? swrRet : AVERROR(EINVAL));
+        int swrRet = swr_alloc_set_opts2(&m_swr, &m_ctx->ch_layout, m_ctx->sample_fmt,
+                                         m_ctx->sample_rate, &m_ctx->ch_layout,
+                                         kInputFormat, m_ctx->sample_rate, 0, nullptr);
+        if (swrRet >= 0) {
+            swrRet = m_swr ? swr_init(m_swr) : AVERROR(ENOMEM);
+        }
+        if (swrRet < 0) {
+            TG_LOGE("AudioEncoder: 采样格式转换初始化失败 %d (%s) codec=%s fmt=%s", swrRet,
+                    core::AvErr(swrRet), m_codecName.c_str(), av_get_sample_fmt_name(m_ctx->sample_fmt));
+            m_lastAvError.store(swrRet);
             swr_free(&m_swr);
             avcodec_free_context(&m_ctx);
             return -4;
@@ -205,7 +246,8 @@ int AudioEncoder::EncodeOne(const core::FramePtr& frame)
     while (m_pcmBuffer.size() >= need) {
         core::AVFramePtr avFrame = core::MakeAVFrame();
         avFrame->format = m_ctx->sample_fmt;
-        avFrame->ch_layout = m_ctx->ch_layout;
+        // AVChannelLayout 可能带堆分配的 map（custom order），不能按值浅拷贝
+        av_channel_layout_copy(&avFrame->ch_layout, &m_ctx->ch_layout);
         avFrame->sample_rate = m_ctx->sample_rate;
         avFrame->nb_samples = frameSize;   // 先确定样本数，再分配缓冲
 

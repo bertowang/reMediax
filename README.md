@@ -168,11 +168,19 @@ TGCapture::ITGCapturerMgr::UnInit();
 >
 > | 码 | 含义 |
 > | - | - |
-> | `TGErr_NotConfigured` (-1) | 编码器 / 封装器参数没设全（`Prepare` 返回 -2） |
+> | `TGErr_InvalidState` (-1) | 状态不允许：重复 `Prepare`、未 `Prepare` 就 `Start`、未 `Start` 就 `PushExternal*Frame` |
+> | `TGErr_NotConfigured` (-2) | 编码器 / 封装器参数没设全 |
 > | `TGErr_OpenVideoEncoder` (-3) | 视频编码器打开失败 |
-> | `TGErr_OpenAudioEncoder` (-4) | 音频编码器打开失败 |
+> | `TGErr_OpenAudioEncoder` (-4) | 音频编码器打开失败（含输入采样格式不是交错 S16、采样格式转换初始化失败）；`extra` = AVERROR 或子模块码 |
 > | `TGErr_OpenMuxer` (-5) | 封装器 / 推流地址打开失败 |
-> | `TGErr_MuxWriteFailed` (-101) | **运行期**写包持续失败超过 `writeFailReportMs`（断网 / 磁盘满 / 对端不收）；`extra` = 已持续毫秒数，每轮失败只上报一次 |
+> | `TGErr_OpenVideoSource` (-6) / `TGErr_StartFailed` (-7) | 原生视频采集源打不开 / 内部线程启动失败 |
+> | `TGErr_InvalidArgument` (-20) ~ `TGErr_Internal` (-23) | 入参非法 / 不支持 / 未实现 / 内部资源创建失败 |
+> | `TGErr_MuxWriteFailed` (-101) | **运行期**写包持续失败超过 `writeFailReportMs`（断网 / 磁盘满 / 对端不收）；`extra` = 最后一次的 AVERROR（持续时长写在 message 里），每轮失败只上报一次 |
+> | `TGErr_VideoEncodeFailed` (-102) / `TGErr_AudioEncodeFailed` (-103) | **运行期**视频 / 音频编码持续失败超过 1s；`extra` = AVERROR |
+> | `TGErr_VideoCaptureStalled` (-104) / `TGErr_AudioCaptureStalled` (-105) | 采集断流超过 `SetAVTimeout` 阈值；恢复时发 `*_Recovered` 通知 |
+> | `TGErr_MuxTrailerFailed` (-106) | `Stop` 时写文件尾 / 关闭连接失败，产出文件可能缺索引 |
+>
+> 完整定义与 `extra` 含义以 `include/TGCapture/TGCapturerInterface.h` 的 `TGCaptureError` 注释为准。
 >
 > 运行期出错**不会自动重连**：FFmpeg 的 I/O 错误是粘性的，宿主应 `Stop()` 后重新 `Prepare()`。
 
@@ -284,7 +292,7 @@ capturer->PushExternalAudioFrame(TGCapture::TypeOfGameMicphone4Slave, pcm, bytes
 | 字段 | 默认 | 说明 |
 | - | - | - |
 | `sampleRate` / `channels` | 44100 / 2 | 输出格式 |
-| `aCodec` | `libfdk_aac` | 也支持 `aac` |
+| `aCodec` | `libfdk_aac` | 也支持 `aac`（ffmpeg 内置）等任意 ffmpeg AAC 编码器名；指定的编码器不可用时自动回退内置 `aac`（打 Warn） |
 | `aBitrate` | 128000 | 音频码率 |
 | `enabled` | `true` | `false` = 纯视频（不建音频编码器与音频流） |
 
@@ -741,6 +749,16 @@ vp.vCodec = "h264_nvenc";
 
 硬编不可用时自动回退系统内存路径，功能不受影响，只是不再零拷贝。
 
+**音频采样格式**：混流器输出恒为交错 S16，`AudioEncoder` 按编码器能力自动适配：
+
+| 编码器 | 采样格式 | 处理 |
+| - | - | - |
+| `libfdk_aac` | S16 | 直接送入，零转换 |
+| 内置 `aac`（`aCodec` 不可用时的回退目标） | FLTP | swresample 转 S16 → FLTP（同采样率，不引入延迟） |
+
+编码器同时支持 S16 与其它格式时优先 S16；输入不是交错 S16 时 `Open` 直接失败
+（`TGErr_OpenAudioEncoder`，`extra = AVERROR(EINVAL)`），不会静默产出噪声。
+
 ---
 
 ## 9. 构建
@@ -805,6 +823,7 @@ Windows 产物是 `flat` 布局（无 abi 层），`cmake/Deps.cmake` 按 abi �
 ```bash
 python3 scripts/build.py --platform linux          # 同时编出 tg_tests 和 demo
 build/linux-x86_64/tg_tests                        # 单元测试（也可 ctest；可带名称过滤，如 tg_tests Bus）
+build/linux-x86_64/tg_tests AudioEncoder           # 只跑音频编码器：真实 ffmpeg 编码 + 解码校验波形
 scripts/accept_av.sh                               # 音画同步验收（6 个场景并行，约 20s，失败返回非 0）
 ```
 
@@ -1097,9 +1116,9 @@ cd build/linux-x86_64
 * **外部注入音频按 `AudioCapSourceType` 分路**：同一进程内多次 `PushExternalAudioFrame`
   传不同的 `type`（如 `TypeOfGameAudio4Slave` 与 `TypeOfGameMicphone4Slave`）会各自占用
   独立的混流通道并被真正做 sample-wise 相加；传相同 `type` 则串成同一时间轴（覆盖/交替）。
-* **Android / iOS 尚未在各自平台编译验证**（本机只有 Windows 工具链）：
-  `src/platform/android/*`、`src/platform/ios/*` 与 `TGCaptureSystemCapture.java`
-  需在有 SDK/NDK/Xcode 的环境跑一次。
+* **Android / iOS 尚未在真机上运行验证**：两端已用 NDK r29（arm64-v8a, api 23）/ Xcode（arm64）
+  编译通过，但 `src/platform/android/*`、`src/platform/ios/*` 与 `TGCaptureSystemCapture.java`
+  的采集 / 硬编路径还没在设备上跑过；`tg_tests` 也只在桌面平台执行。
 * **日志**：`Init` 的 `logDir` / `printLog` 未实现；移动端未接 `__android_log_print` / `os_log` sink（见 4.6）。
 * 暂停静帧、水印、本地文件采集为接口占位（返回 0 或告警）。
 * `GetStatsInfo` 当前返回基础 JSON（码率 / 队列 / 编码器统计）。
@@ -1143,3 +1162,4 @@ cd build/linux-x86_64
 | `flush_packets` 设在 `priv_data` 上 | 对 flv / mpegts 没有效果 | 低延迟用 `AVFMT_FLAG_FLUSH_PACKETS`（设在 `AVFormatContext::flags`） |
 | `Worker::Loop()` 抛异常 | 直接 `terminate`，不留日志 | 子类 `Loop` 目前没有 try/catch 兜底，新增循环体自己保证不抛 |
 | 改 `VideoEncoder::Close()` | 漏复位 `m_lastPtsUs` 会让重开的全视频帧被判成 PTS 回退丢弃 | 新增"随流状态"时一并考虑复位 |
+| 音频编码器换型 / 新增回退目标 | 把 S16 位模式直接写进 FLTP 平面 → `Input contains NaN`，1s 后上报 `TGErr_AudioEncodeFailed`(-103)，产物里没有音频 | 不要假设编码器收 S16，按 `sample_fmt` 走 `AudioEncoder` 里的 swr 转换；`tests/test_audio_encoder.cpp` 会解码校验波形 |

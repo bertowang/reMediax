@@ -203,7 +203,8 @@ if(TG_BUILD_TESTS AND (TG_PLATFORM STREQUAL "linux" OR TG_PLATFORM STREQUAL "win
         tests/test_health.cpp
         tests/test_error_codes.cpp
         tests/test_video_pts.cpp
-        tests/test_audio_mixer.cpp)
+        tests/test_audio_mixer.cpp
+        tests/test_audio_encoder.cpp)
     target_include_directories(tg_tests PRIVATE tests)
     target_link_libraries(tg_tests PRIVATE tgcapture)
     if(MSVC)
