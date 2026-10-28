@@ -7,6 +7,17 @@
 
 #include "core/Logger.h"
 
+// iOS 与 macOS 都定义 __APPLE__：原生采集（ReplayKit / AVAudioSession）只有 iOS 有，
+// macOS 本机构建（单测 / 命令行 demo）和 Linux 一样只走外灌帧
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define TG_OS_IOS 1
+#else
+#define TG_OS_IOS 0
+#endif
+
 #ifdef _WIN32
 #include "platform/windows/WinAudioCapture.h"
 #include "platform/windows/WinScreenCapture.h"
@@ -14,7 +25,7 @@
 #include "platform/android/AndroidAudioCapture.h"
 #include "platform/android/AndroidJni.h"
 #include "platform/android/AndroidScreenCapture.h"
-#elif defined(__APPLE__)
+#elif TG_OS_IOS
 #include "platform/ios/IOSAudioCapture.h"
 #include "platform/ios/IOSScreenCapture.h"
 #endif
@@ -22,7 +33,7 @@
 // 有原生采集实现的平台。Linux 等平台没有（屏幕需 X11/PipeWire、音频需 PulseAudio/ALSA）：
 // 采集接口一律返回不支持，但编码 / 封装 / 外灌帧不依赖它，故必须能编译通过。
 // 没有这个宏时，下面那些 `#else return` 分支之后仍会引用未声明的 source，编译不过。
-#if defined(_WIN32) || defined(__ANDROID__) || defined(__APPLE__)
+#if defined(_WIN32) || defined(__ANDROID__) || TG_OS_IOS
 #define TG_HAS_NATIVE_CAPTURE 1
 #else
 #define TG_HAS_NATIVE_CAPTURE 0
@@ -81,7 +92,7 @@ bool TGCapturer::IsSupported(CaptureFeature feature) const
 #elif defined(__ANDROID__)
     // Android 没有"窗口"概念；系统内录（扬声器）需 Android 10(API 29)+ 且持有 MediaProjection
     return feature != CaptureFeature::Window;
-#elif defined(__APPLE__)
+#elif TG_OS_IOS
     // iOS：ReplayKit 只能录本应用（系统级需 Broadcast Upload Extension）；无窗口概念、无系统内录
     return feature == CaptureFeature::Screen || feature == CaptureFeature::Microphone;
 #else
@@ -104,7 +115,7 @@ int TGCapturer::EnableMicrophoneCapture(bool usingGVoice)
     auto source = std::make_shared<platform::WinAudioCapture>(TypeOfSelfMicphone, false);
 #elif defined(__ANDROID__)
     auto source = std::make_shared<platform::AndroidAudioCapture>(TypeOfSelfMicphone, false);
-#elif defined(__APPLE__)
+#elif TG_OS_IOS
     auto source = std::make_shared<platform::IOSAudioCapture>(TypeOfSelfMicphone);
 #endif
 
@@ -157,7 +168,7 @@ IVideoSource* TGCapturer::CreateScreenCapture(int index, VideoCapMode mode, Vide
     auto source = std::make_shared<platform::AndroidScreenCapture>(strategy);
     // m_mediaProjection 是 void*（宿主经 SetPrivateData 传入），JNI 侧要的是 jobject
     source->SetProjection(static_cast<jobject>(m_mediaProjection));
-#elif defined(__APPLE__)
+#elif TG_OS_IOS
     auto source = std::make_shared<platform::IOSScreenCapture>(strategy);
 #endif
 

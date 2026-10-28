@@ -27,11 +27,18 @@ if(CMAKE_GENERATOR MATCHES "Visual Studio|Xcode")
 endif()
 
 # ---------------------------------------------------------------- 选项
-set(TG_PLATFORM "windows" CACHE STRING "目标平台: windows|linux|android|ios")
-set(TG_ABI "x64" CACHE STRING "ABI: x64 | arm64-v8a | armeabi-v7a | x86_64 | fat")
+set(TG_PLATFORM "windows" CACHE STRING "目标平台: windows|linux|android|ios|macos")
+set(TG_ABI "x64" CACHE STRING "ABI: x64 | arm64-v8a | armeabi-v7a | x86_64 | arm64 | fat")
 set(TG_3RD_ROOT "" CACHE PATH "TGCapture3rd 根目录（FfmpegCompileShell 的产出目录）")
 option(TG_BUILD_DEMO "编译测试 demo" ON)
 option(TG_BUILD_TESTS "编译单元测试 tg_tests" ON)
+# 内存/线程检查（仅 clang/gcc）：address | thread | undefined，留空不开启。
+# 作用于 tgcapture 及所有 demo / 测试目标，便于在 macOS 本机做 L1 回归。
+set(TG_SANITIZE "" CACHE STRING "Sanitizer: address | thread | undefined（留空关闭）")
+if(TG_SANITIZE AND NOT MSVC)
+    add_compile_options(-fsanitize=${TG_SANITIZE} -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=${TG_SANITIZE})
+endif()
 
 # 依赖目录解析优先级（默认值只在这里定义一处，build.py / CI 都不再重复猜，避免多处漂移）：
 #   1) 命令行 -DTG_3RD_ROOT=<dir>（scripts/build.py 的 --3rd 即透传此值）
@@ -120,6 +127,13 @@ elseif(TG_PLATFORM STREQUAL "linux")
     # 编码 / 封装 / 音画同步 / 混流与外灌帧（PushExternal*Frame）是全平台通用的，照常可用。
     # pthread/dl/m：ffmpeg（openssl、srt）静态链进来后需要的系统库。
     list(APPEND TG_PLATFORM_LIBS pthread dl m)
+elseif(TG_PLATFORM STREQUAL "macos")
+    # macOS 本机平台：只编内核（无原生采集，同 linux），用于本机单测 / 命令行 demo / sanitizer。
+    # 编码可走 VideoToolbox（h264_videotoolbox）或 openh264；外灌 CVPixelBuffer 路径同 iOS。
+    list(APPEND TG_PLATFORM_LIBS
+        "-framework CoreFoundation" "-framework CoreVideo" "-framework CoreMedia"
+        "-framework VideoToolbox" "-framework AudioToolbox" "-framework Security"
+        "-framework CoreServices" c++)
 endif()
 
 add_library(tgcapture STATIC ${TG_CORE_SOURCES} ${TG_PLATFORM_SOURCES})
@@ -205,9 +219,12 @@ endif()
 
 # Linux demo：本机没有采集设备也能验证"编码 → 封装"链路（走外灌帧，不依赖采集）。
 # 同时也是唯一的链接自检 —— 只编静态库不会触发链接，ffmpeg 依赖链不对照不出来。
-if(TG_BUILD_DEMO AND TG_PLATFORM STREQUAL "linux")
+if(TG_BUILD_DEMO AND (TG_PLATFORM STREQUAL "linux" OR TG_PLATFORM STREQUAL "macos"))
     add_executable(tg_capture_demo demo/linux/main.cpp)
     target_link_libraries(tg_capture_demo PRIVATE tgcapture)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "AppleClang")
+        target_compile_options(tg_capture_demo PRIVATE -fexperimental-library)
+    endif()
 endif()
 
 # iOS 开播测试 App（UIKit，真机 arm64）。用 Xcode 生成器打开：scripts/build.py --platform ios --ide
@@ -219,7 +236,8 @@ endif()
 # ---------------------------------------------------------------- 单元测试
 # 零依赖的迷你框架（tests/tg_test.h）；只测内核（Bus / Queue / 同步时钟 / 混音 / 脱敏），不依赖采集设备。
 # 运行：ctest --test-dir <build> 或直接执行 tg_tests [名称过滤]
-if(TG_BUILD_TESTS AND (TG_PLATFORM STREQUAL "linux" OR TG_PLATFORM STREQUAL "windows"))
+if(TG_BUILD_TESTS AND (TG_PLATFORM STREQUAL "linux" OR TG_PLATFORM STREQUAL "windows"
+                       OR TG_PLATFORM STREQUAL "macos"))
     enable_testing()
     add_executable(tg_tests
         tests/test_main.cpp
@@ -244,6 +262,9 @@ if(TG_BUILD_TESTS AND (TG_PLATFORM STREQUAL "linux" OR TG_PLATFORM STREQUAL "win
     endif()
     if(MSVC)
         target_compile_options(tg_tests PRIVATE /utf-8 /EHsc)
+    endif()
+    if(CMAKE_CXX_COMPILER_ID MATCHES "AppleClang")
+        target_compile_options(tg_tests PRIVATE -fexperimental-library)
     endif()
     add_test(NAME tg_tests COMMAND tg_tests)
 endif()
