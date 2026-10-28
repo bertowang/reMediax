@@ -15,10 +15,36 @@
 #include "core/MediaTypes.h"
 #include "platform/windows/WinAudioCapture.h"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+
 extern "C"
 {
 #include <libavutil/pixfmt.h>
 }
+
+namespace
+{
+// 每轮 Stop() 之后在同一个状态点打一次进程资源快照，用来判断重开是否泄漏。
+// 不按时间采样：机器繁忙时一轮可能跑几十秒，按时间比较会把"还在初始化"误判成泄漏。
+//   handles : 内核句柄（COM 端点、事件、线程句柄、D3D 设备等）
+//   gdi     : GDI 对象（DC、DIB 位图 —— 对应 GDI 采集"位图选中状态下 DeleteObject 失败"那条修复）
+//   privMB  : 私有提交内存（4K 采集一个 DIB 约 33MB，漏了一眼可见）
+void PrintResourceSnapshot(const char* tag)
+{
+    DWORD handles = 0;
+    GetProcessHandleCount(GetCurrentProcess(), &handles);
+    const DWORD gdi = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof(pmc);
+    GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
+    printf("[demo] RES %s handles=%lu gdi=%lu privMB=%.1f\n", tag, static_cast<unsigned long>(handles),
+           static_cast<unsigned long>(gdi), static_cast<double>(pmc.PrivateUsage) / (1024.0 * 1024.0));
+}
+}  // namespace
 
 namespace
 {
@@ -44,6 +70,7 @@ struct Options
     std::string perf = "cpu"; // cpu | gpu（全链路 GPU：采集帧不出显存）
     int restart = 0;          // 首轮结束后再 Stop→Prepare→Start 多少轮（重开回归）
     int concur = 0;           // >0 时改跑并发压测：Prepare 与 Stop 交错冲击 n 秒
+    bool failFirst = false;   // 首轮故意让 Prepare 失败（输出目录不存在），再重配真实输出重试
     int rotation = 0;         // 画面旋转 0/90/180/270
     bool flipH = false;       // 水平镜像
     bool flipV = false;       // 垂直翻转
@@ -138,6 +165,8 @@ void PrintUsage()
            "  --gpu            等价 --perf gpu\n"
            "  --restart <n>    首轮结束后再 Stop→Prepare→Start 跑 n 轮（重开回归，每轮时长同 --seconds）\n"
            "  --concur <n>     并发压测：Prepare 与 Stop 两条线程交错冲击 n 秒，验证生命周期互斥\n"
+           "  --fail-first     首轮故意让 Prepare 失败（输出目录不存在），再重配真实输出重试\n"
+           "                   （验证失败回滚：采集源/编码器释放干净、对象可原地复用）\n"
            "  --rotate <deg>   画面旋转，取 0/90/180/270\n"
            "  --flip <h|v|both> 画面翻转：h=水平镜像，v=垂直翻转\n"
            "  --crop <w,h>     从源帧左上角裁剪（如 --crop 960,540）\n"
@@ -188,6 +217,10 @@ Options ParseArgs(int argc, char** argv)
         }
         if (key == "--no-print-log") {
             opt.printLog = false;
+            continue;
+        }
+        if (key == "--fail-first") {
+            opt.failFirst = true;
             continue;
         }
         if (key == "--log-bench") {
@@ -397,6 +430,27 @@ int main(int argc, char** argv)
     printf("[demo] 输出: %s  编码器: %s  %dx%d@%d  时长: %ds\n",
            opt.output.c_str(), opt.vcodec.c_str(), opt.width, opt.height, opt.fps, opt.seconds);
 
+    // 「Prepare 失败 → 重配 → Prepare 成功」：首轮指向不存在的目录，
+    // 此时采集源与编码器都已打开、卡在 muxer —— 正好验证失败回滚是否把它们释放干净。
+    if (opt.failFirst) {
+        TGCapture::MuxerParams bad = mParams;
+        bad.muxerOutput = "Z:/tg_no_such_dir_xyz/out.flv";
+        capturer->SetupMuxer(bad);
+        const int pr = capturer->Prepare();
+        printf("[demo] 故意失败的 Prepare=%d（期望 <0）\n", pr);
+        if (pr == 0) {
+            printf("[demo] FAIL: 本应失败的 Prepare 返回了成功\n");
+            capturer->Stop();
+            TGCapture::ITGCapturer::Destroy(capturer);
+            return -4;
+        }
+        // 契约：失败后已回滚到干净 Idle，宿主顺手 Stop 应为无副作用的空操作
+        capturer->Stop();
+        PrintResourceSnapshot("after-failed-prepare");
+        capturer->SetupMuxer(mParams);
+        printf("[demo] 已重配为真实输出，原地重试 Prepare\n");
+    }
+
     if (capturer->Prepare() != 0) {
         printf("[demo] Prepare 失败\n");
         TGCapture::ITGCapturer::Destroy(capturer);
@@ -413,6 +467,7 @@ int main(int argc, char** argv)
 
     printf("[demo] 最终统计: %s\n", capturer->GetStatsInfo(TGCapture::StatsInfoType::videoInfo).c_str());
     capturer->Stop();
+    PrintResourceSnapshot("round=0");
 
     // 并发压测：Prepare 与 Stop 交错冲击，验证生命周期互斥（不死锁、不野线程、不崩溃）
     if (opt.concur > 0) {
@@ -461,6 +516,8 @@ int main(int argc, char** argv)
         }
         printf("[demo] 重开统计: %s\n", capturer->GetStatsInfo(TGCapture::StatsInfoType::videoInfo).c_str());
         capturer->Stop();
+        const std::string tag = "round=" + std::to_string(r);
+        PrintResourceSnapshot(tag.c_str());
     }
 
     TGCapture::ITGCapturer::Destroy(capturer);

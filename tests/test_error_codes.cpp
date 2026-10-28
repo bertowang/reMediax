@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdio>
 #include <chrono>
+#include <filesystem>
 #include <mutex>
 #include <set>
 #include <string>
@@ -94,6 +95,14 @@ struct Recorder
         return false;
     }
 };
+
+// 测试产物放系统临时目录：写死 "/tmp" 在 Windows 上会解析成 "<当前盘>:\tmp"，
+// 通常不存在 —— 所有本该成功的 Prepare 都会在 avio_open 失败，掩盖真正要测的逻辑。
+// "tg_no_such_dir_xyz/..." 这类故意不存在的子目录照样不存在，失败用例语义不变。
+std::string TmpPath(const char* name)
+{
+    return (std::filesystem::temp_directory_path() / name).string();
+}
 
 void ConfigureValid(ITGCapturer& c, const std::string& out)
 {
@@ -271,7 +280,7 @@ TG_TEST(ErrorCodes, PushRejectsBadArgumentsWhileRunning)
     TGCapturer c(GameID::GAME_ID_DEFAULT);
     Recorder rec;
     rec.Attach(c);
-    ConfigureValid(c, "/tmp/tg_test_err_push.flv");
+    ConfigureValid(c, TmpPath("tg_test_err_push.flv"));
     TG_ASSERT(c.Prepare() == TGErr_OK);
     TG_ASSERT(c.Start() == TGErr_OK);
 
@@ -299,7 +308,7 @@ TG_TEST(ErrorCodes, DuplicatePrepareIsReportedNotSilent)
     TGCapturer c(GameID::GAME_ID_DEFAULT);
     Recorder rec;
     rec.Attach(c);
-    ConfigureValid(c, "/tmp/tg_test_err_dup.flv");
+    ConfigureValid(c, TmpPath("tg_test_err_dup.flv"));
     TG_ASSERT(c.Prepare() == TGErr_OK);
     TG_EXPECT_EQ(rec.prepared.load(), 1);
     TG_EXPECT_EQ(rec.ErrorCount(), size_t{0});
@@ -317,7 +326,7 @@ TG_TEST(ErrorCodes, CleanStopReportsZeroToHost)
     TGCapturer c(GameID::GAME_ID_DEFAULT);
     Recorder rec;
     rec.Attach(c);
-    ConfigureValid(c, "/tmp/tg_test_err_clean.flv");
+    ConfigureValid(c, TmpPath("tg_test_err_clean.flv"));
     TG_ASSERT(c.Prepare() == TGErr_OK);
     TG_ASSERT(c.Start() == TGErr_OK);
     const auto pixels = Nv12Frame(320, 240);
@@ -338,7 +347,7 @@ TG_TEST(ErrorCodes, CaptureStallIsReportedAndRecoveryNotified)
     TGCapturer c(GameID::GAME_ID_DEFAULT);
     Recorder rec;
     rec.Attach(c);
-    ConfigureValid(c, "/tmp/tg_test_err_stall.flv");
+    ConfigureValid(c, TmpPath("tg_test_err_stall.flv"));
     TG_EXPECT_EQ(c.SetAVTimeout(300, 300), int{TGErr_OK});   // 缩短阈值，别让单测跑太久
     TG_ASSERT(c.Prepare() == TGErr_OK);
     TG_ASSERT(c.Start() == TGErr_OK);
@@ -366,7 +375,7 @@ TG_TEST(ErrorCodes, OpenMuxerFailureCarriesUnderlyingCode)
     Recorder rec;
     rec.Attach(c);
     // 不存在的目录：avio_open 必失败
-    ConfigureValid(c, "/tmp/tg_no_such_dir_xyz/out.flv");
+    ConfigureValid(c, TmpPath("tg_no_such_dir_xyz/out.flv"));
     TG_EXPECT_EQ(c.Prepare(), int{TGErr_OpenMuxer});
     TG_EXPECT(rec.HasError(TGErr_OpenMuxer));
     std::lock_guard<std::mutex> lock(rec.mutex);
@@ -385,9 +394,9 @@ TG_TEST(ErrorCodes, PrepareFailureLeavesObjectReusable)
     TGCapturer c(GameID::GAME_ID_DEFAULT);
     Recorder rec;
     rec.Attach(c);
-    ConfigureValid(c, "/tmp/tg_no_such_dir_xyz/out.flv");
+    ConfigureValid(c, TmpPath("tg_no_such_dir_xyz/out.flv"));
     TG_ASSERT(c.Prepare() == TGErr_OpenMuxer);
-    ConfigureValid(c, "/tmp/tg_test_err_retry.flv");
+    ConfigureValid(c, TmpPath("tg_test_err_retry.flv"));
     TG_EXPECT_EQ(c.Prepare(), int{TGErr_OK});
     c.Stop();
 }
@@ -397,7 +406,7 @@ TG_TEST(ErrorCodes, PrepareFailureRollsBackOpenedEncoders)
     // 回归：Prepare 在 muxer 这一步失败时，前面已经打开的编码器必须被关掉。
     // 不回滚的话，编码器的 Open() 开头 `if (m_opened) return 0` 会让下一轮静默复用上一轮的
     // 上下文 —— 第二次 Prepare 返回成功，但新设的分辨率根本没生效（产出文件仍是旧尺寸）。
-    const std::string out = "/tmp/tg_test_err_rollback.flv";
+    const std::string out = TmpPath("tg_test_err_rollback.flv");
     std::remove(out.c_str());
 
     TGCapturer c(GameID::GAME_ID_DEFAULT);
@@ -405,7 +414,7 @@ TG_TEST(ErrorCodes, PrepareFailureRollsBackOpenedEncoders)
     rec.Attach(c);
 
     // 第一轮：320x240，输出目录不存在 → 卡在 muxer，此时两个编码器已经打开
-    ConfigureValid(c, "/tmp/tg_no_such_dir_xyz/out.flv");
+    ConfigureValid(c, TmpPath("tg_no_such_dir_xyz/out.flv"));
     TG_ASSERT(c.Prepare() == TGErr_OpenMuxer);
 
     // 第二轮：换成 640x480 且输出可写
@@ -449,7 +458,7 @@ TG_TEST(ErrorCodes, StopClosesCaptureSourceAndBlocksLateCallbacks)
     //   1) Stop 会调采集源的 Close()，设备资源不再留到析构
     //   2) StopCapture 返回后，平台侧迟到的回调会被栅栏挡住，不会再进下游
     ProbeVideoSource src;
-    const std::string out = "/tmp/tg_test_err_srcclose.flv";
+    const std::string out = TmpPath("tg_test_err_srcclose.flv");
     {
         TGCapturer c(GameID::GAME_ID_DEFAULT);
         Recorder rec;
@@ -482,7 +491,7 @@ TG_TEST(ErrorCodes, PrepareFailureClosesAlreadyOpenedSource)
     Recorder rec;
     rec.Attach(c);
     TG_ASSERT(c.AddVideoSource(&src) == TGErr_OK);
-    ConfigureValid(c, "/tmp/tg_no_such_dir_xyz/out.flv");
+    ConfigureValid(c, TmpPath("tg_no_such_dir_xyz/out.flv"));
     TG_ASSERT(c.Prepare() == TGErr_OpenMuxer);
     TG_EXPECT_EQ(src.opened.load(), 1);
     TG_EXPECT_EQ(src.closed.load(), 1);
@@ -495,7 +504,7 @@ TG_TEST(ErrorCodes, ConcurrentStopIsSerializedAndSettled)
     TGCapturer c(GameID::GAME_ID_DEFAULT);
     Recorder rec;
     rec.Attach(c);
-    ConfigureValid(c, "/tmp/tg_test_err_concurrent.flv");
+    ConfigureValid(c, TmpPath("tg_test_err_concurrent.flv"));
     TG_ASSERT(c.Prepare() == TGErr_OK);
     TG_ASSERT(c.Start() == TGErr_OK);
 
@@ -509,7 +518,7 @@ TG_TEST(ErrorCodes, ConcurrentStopIsSerializedAndSettled)
     }
     // 只有真正执行停机的那一个会发 Stopped，其余等它收尾后看到 Idle 直接返回
     TG_EXPECT_EQ(rec.stopped.load(), 1);
-    std::remove("/tmp/tg_test_err_concurrent.flv");
+    std::remove(TmpPath("tg_test_err_concurrent.flv").c_str());
 }
 
 TG_TEST(ErrorCodes, StopFromStopCallbackDoesNotDeadlock)
@@ -523,12 +532,12 @@ TG_TEST(ErrorCodes, StopFromStopCallbackDoesNotDeadlock)
             c.Stop();   // 重入
         }
     });
-    ConfigureValid(c, "/tmp/tg_test_err_reentrant.flv");
+    ConfigureValid(c, TmpPath("tg_test_err_reentrant.flv"));
     TG_ASSERT(c.Prepare() == TGErr_OK);
     TG_ASSERT(c.Start() == TGErr_OK);
     c.Stop();
     TG_EXPECT_EQ(stopped.load(), 1);   // 重入那次直接返回，不会再发一遍 Stopped
-    std::remove("/tmp/tg_test_err_reentrant.flv");
+    std::remove(TmpPath("tg_test_err_reentrant.flv").c_str());
 }
 
 TG_TEST(ErrorCodes, StopAfterFailedPrepareIsCleanNoop)
@@ -538,7 +547,7 @@ TG_TEST(ErrorCodes, StopAfterFailedPrepareIsCleanNoop)
     TGCapturer c(GameID::GAME_ID_DEFAULT);
     Recorder rec;
     rec.Attach(c);
-    ConfigureValid(c, "/tmp/tg_no_such_dir_xyz/out.flv");
+    ConfigureValid(c, TmpPath("tg_no_such_dir_xyz/out.flv"));
     TG_ASSERT(c.Prepare() == TGErr_OpenMuxer);
     const size_t before = rec.ErrorCount();
     c.Stop();

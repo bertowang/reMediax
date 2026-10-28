@@ -158,7 +158,8 @@ endif()
 # ---------------------------------------------------------------- demo
 if(TG_BUILD_DEMO AND TG_PLATFORM STREQUAL "windows")
     add_executable(tg_capture_demo demo/windows/main.cpp)
-    target_link_libraries(tg_capture_demo PRIVATE tgcapture)
+    # psapi：demo 每轮 Stop 后打印进程句柄/GDI/私有内存快照，用于重开泄漏回归
+    target_link_libraries(tg_capture_demo PRIVATE tgcapture psapi)
     if(MSVC)
         target_compile_options(tg_capture_demo PRIVATE /utf-8 /EHsc)
     endif()
@@ -218,6 +219,11 @@ if(TG_BUILD_TESTS AND (TG_PLATFORM STREQUAL "linux" OR TG_PLATFORM STREQUAL "win
         tests/test_encoder_probe.cpp)
     target_include_directories(tg_tests PRIVATE tests)
     target_link_libraries(tg_tests PRIVATE tgcapture)
+    if(TG_PLATFORM STREQUAL "windows")
+        # 平台层实测：直接驱动真实 WASAPI / GDI / DXGI 源，验证失败与重开路径不泄漏
+        target_sources(tg_tests PRIVATE tests/test_win_platform.cpp)
+        target_link_libraries(tg_tests PRIVATE psapi ole32)
+    endif()
     if(MSVC)
         target_compile_options(tg_tests PRIVATE /utf-8 /EHsc)
     endif()

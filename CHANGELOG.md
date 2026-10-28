@@ -71,7 +71,7 @@
 - `m_lifecycleMutex` 由 `recursive_mutex` 降为 `mutex`，`m_mixThread` 声明移到末尾
   （成员逆序析构，线程必须最先 join）。
 
-#### 平台层失败路径（Linux 上无法编译验证，需在目标平台复测）
+#### 平台层失败路径（Windows 已实测，见下方"Windows 回归"；iOS / Android 仍需在目标平台复测）
 - Windows WASAPI：`InitWASAPI` / `RetryOpen` 的每个失败分支统一走 `ReleaseEndpoint()`
   （此前每失败一轮泄漏一个 `IMMDevice` + 一个已 `Initialize` 的 `IAudioClient`，后者还占着端点）；
   `RPC_E_CHANGED_MODE` 不再记为"COM 初始化成功"（它不增加引用计数，误记会让
@@ -144,13 +144,43 @@
 - 新增单元测试 `tg_tests`（Bus / Queue / 视频 PTS / 混音 / URL 脱敏）与 `scripts/accept_av.sh`、`scripts/ci.sh`。
 - `build/` 不再纳入版本管理。
 
+### Windows 回归（MSVC 2022 / x64 Release）
+本轮平台层改动此前只做过语法检查，这次在 Windows 上完整编译并实测：
+
+- **编译**：`tgcapture` / `tg_capture_demo` / `tg_tests` 零警告零错误。
+- **单元测试**：100 个用例，连跑 3 次全绿（含 Windows 平台层 12 个；已在合入 iOS / Android 回归提交后复跑）。
+- **新增 `tests/test_win_platform.cpp`**（仅 Windows 编译）：直接驱动真实 WASAPI / GDI / DXGI 源，
+  在固定状态点（Close 之后）比较进程句柄 / GDI 对象 / 私有内存，覆盖
+  Open/Close 循环、同对象 Close→Open、非法设备 id 回落默认、loopback、非法窗口句柄、
+  宿主 STA 线程上 Open/Close 不打乱 COM 计数、自有 COM 配平。
+  **做过变异验证**：把 `RPC_E_CHANGED_MODE` 记账改回旧逻辑，`WasapiDoesNotUnbalanceHostCom` 立即失败。
+- **GDI 修复的实际影响比描述的小**（实测）：未选回就 `DeleteObject` 确实失败、DIB 留着，
+  但随后 `DeleteDC` 会把它一并释放；本代码 `ReleaseGdi` 总是紧接着删 DC，所以旧代码**并不会**
+  每轮漏 33 MB。修复仍然正确（顺序符合 GDI 规定，且对"DC 复用"的改法是必要的前提），
+  但不是一个可观测的泄漏。
+- **生命周期**（真实 DXGI 屏幕 + WASAPI 麦克风）：
+  `Prepare 失败 → 重配 → 原地 Prepare 成功`（新增 demo 开关 `--fail-first`）、
+  `Stop → Prepare` 重开 4~6 轮、GDI 屏幕 / 窗口采集重开、GPU 零拷贝（nvenc）失败回滚 + 重开、
+  Prepare/Stop 两线程交错 15s：均无死锁、无崩溃，每轮 Stop 后句柄数恒定（demo 新增 `RES` 快照行）。
+- **媒体链路**：flip both 与 rotate 180 的包大小序列逐包一致；音视频 PTS 严格单调；
+  推流中途被对端 RST → 3s 后上报 `TGErr_MuxWriteFailed(extra=-10054)`，`Stop` 正常返回且 `OnStop` 带 `-101`；
+  连接被拒 → `TGErr_OpenMuxer(extra=-138)`，日志里推流地址已脱敏；`--log-dir` 落盘与 `--no-print-log` 生效。
+
+本轮 Windows 回归发现两处问题：
+- **`VideoPtsGenerator` Pause 档上限失效**：Windows 上 5/5 稳定复现（`AudioStallKeepsMonotonicAndBoundedLead`）。
+  与上方"iOS 回归修复"中的同一条是同一个缺陷，代码修复以那次提交为准；Windows 上复验通过。
+- **`test_error_codes` 写死 `/tmp`**：Windows 上解析为 `<当前盘>:\tmp`（通常不存在），
+  9 个本该成功的 `Prepare` 全部 `TGErr_OpenMuxer`，掩盖了真正要测的逻辑。改用 `temp_directory_path()`。
+
 ### 已知限制
 - 写失败后不自动重连（FFmpeg I/O 错误为粘性），需宿主 `Stop()` 后重新 `Prepare()`。
-- 以上改动在 Linux 与 iOS（模拟器 x86_64 全链路回归 + 真机 arm64 编译）验证，Windows / Android 待复测。
+- 以上改动在 Linux、iOS（模拟器 x86_64 全链路回归 + 真机 arm64 编译）与 Windows（见上方"Windows 回归"）验证，
+  Android 待复测。
 - iOS 麦克风采集与 ReplayKit 出帧未在真机实测：模拟器命令行进程中 `AURemoteIO` 初始化会 RPC 超时 abort（系统限制），
   ReplayKit 无授权不出帧（仅验证了 Prepare / Stop / 重新 Prepare 不崩、断流看护上报 -104）。
 - 音频运行中断流时，视频在 `maxLead`（500ms）到 `audioTimeoutMs` 之间按设计丢帧，产物中会有
   `audioTimeoutMs - 500ms` 的视频空档；需要更短空档可调小 `SetAVTimeout` 的 `audioTimeoutMs`。
 - 部分平台的音频采集源在 `Open` 失败后仍会注入静音帧，混流照常出帧，断流看护探测不到。
   这种"有声道但全静音"只能靠日志排查，无法自动上报。
-- 本轮的平台层改动（Windows / iOS / Android）未在目标平台编译验证，需复测。
+- Windows 下 `WinAudioCapture::RetryOpen`（默认设备热切换）未自动化覆盖：需要真实插拔 / 切换默认设备，
+  只能人工验证。
