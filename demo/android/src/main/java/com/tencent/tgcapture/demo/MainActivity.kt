@@ -1,6 +1,8 @@
 package com.tencent.tgcapture.demo
 
 import android.Manifest
+import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjection
 import android.os.Build
@@ -8,6 +10,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.util.Log
 import android.view.View
 import android.view.WindowManager
 import androidx.activity.result.contract.ActivityResultContracts
@@ -84,6 +87,29 @@ class MainActivity : AppCompatActivity() {
         }
         setState(State.IDLE)
         probeEncoders()
+        handleAutomation(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleAutomation(intent)
+    }
+
+    /**
+     * 回归脚本入口（scripts/regress_android_demo.sh），只在 debuggable 包里生效：
+     *   adb shell am start -n com.tencent.tgcapture.demo/.MainActivity --es tg_cmd start|stop
+     * 状态变化与日志同步打到 logcat（tag TGDemo），脚本据此等待 LIVE / IDLE。
+     */
+    private fun handleAutomation(intent: Intent?) {
+        val cmd = intent?.getStringExtra(EXTRA_CMD) ?: return
+        intent.removeExtra(EXTRA_CMD)
+        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) return
+        Log.i(LOG_TAG, "automation cmd=$cmd state=$state")
+        when (cmd) {
+            "start" -> if (state == State.IDLE) onStartClicked()
+            "stop" -> if (state == State.LIVE) stopLive()
+            else -> Log.w(LOG_TAG, "unknown automation cmd: $cmd")
+        }
     }
 
     // 硬编探测会真的建一次编码会话（几十 ~ 几百 ms），放后台线程；结果进程内缓存，转屏重建不会重复探测
@@ -178,6 +204,7 @@ class MainActivity : AppCompatActivity() {
     // ------------------------------------------------------------------ UI
     private fun setState(s: State) {
         state = s
+        Log.i(LOG_TAG, "state=$s")
         binding.textState.text = getString(
             when (s) {
                 State.IDLE -> R.string.state_idle
@@ -205,6 +232,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun appendLog(line: String) {
+        Log.i(LOG_TAG, line)
         val stamp = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
         logLines.addLast("$stamp  $line")
         while (logLines.size > MAX_LOG_LINES) logLines.removeFirst()
@@ -217,5 +245,7 @@ class MainActivity : AppCompatActivity() {
 
     private companion object {
         const val MAX_LOG_LINES = 200
+        const val LOG_TAG = "TGDemo"
+        const val EXTRA_CMD = "tg_cmd"
     }
 }

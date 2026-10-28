@@ -236,8 +236,10 @@ endif()
 # ---------------------------------------------------------------- 单元测试
 # 零依赖的迷你框架（tests/tg_test.h）；只测内核（Bus / Queue / 同步时钟 / 混音 / 脱敏），不依赖采集设备。
 # 运行：ctest --test-dir <build> 或直接执行 tg_tests [名称过滤]
-if(TG_BUILD_TESTS AND (TG_PLATFORM STREQUAL "linux" OR TG_PLATFORM STREQUAL "windows"
-                       OR TG_PLATFORM STREQUAL "macos"))
+# 全平台可编：macos / linux / windows 本机直接跑；android 用 adb push 到设备/模拟器跑，
+# ios 用 iphonesimulator SDK 编出后 xcrun simctl spawn 跑（见 scripts/test.sh）。
+# Gradle 驱动的 JNI 构建会强制 TG_BUILD_TESTS=OFF，不受影响。
+if(TG_BUILD_TESTS)
     enable_testing()
     add_executable(tg_tests
         tests/test_main.cpp
@@ -265,6 +267,12 @@ if(TG_BUILD_TESTS AND (TG_PLATFORM STREQUAL "linux" OR TG_PLATFORM STREQUAL "win
     endif()
     if(CMAKE_CXX_COMPILER_ID MATCHES "AppleClang")
         target_compile_options(tg_tests PRIVATE -fexperimental-library)
+    endif()
+    if(TG_PLATFORM STREQUAL "ios")
+        # 命令行可执行文件（非 .app），只在模拟器上 simctl spawn 跑，不需要签名
+        set_target_properties(tg_tests PROPERTIES
+            XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED NO
+            XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED NO)
     endif()
     add_test(NAME tg_tests COMMAND tg_tests)
 endif()

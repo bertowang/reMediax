@@ -83,6 +83,21 @@ def open_in_ide(platform: str, build_dir: Path) -> None:
             subprocess.run(["open", str(host)], check=False)
 
 
+def _default_ndk() -> str | None:
+    """~/Library/Android/sdk/ndk（或 ANDROID_HOME/ndk）下版本号最大的 NDK。"""
+    sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") \
+        or str(Path.home() / "Library" / "Android" / "sdk")
+    ndk_root = Path(sdk) / "ndk"
+    if not ndk_root.is_dir():
+        return None
+
+    def version_key(p: Path):
+        return [int(x) if x.isdigit() else 0 for x in p.name.split(".")]
+
+    versions = sorted((p for p in ndk_root.iterdir() if p.is_dir()), key=version_key)
+    return str(versions[-1]) if versions else None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="构建 TGCapture")
     parser.add_argument("-p", "--platform", required=True,
@@ -96,7 +111,10 @@ def main() -> int:
     parser.add_argument("--no-tests", action="store_true", help="不编译单元测试 tg_tests")
     parser.add_argument("--sanitize", default=None, choices=["address", "thread", "undefined"],
                         help="开启 sanitizer（仅 clang/gcc；构建目录会带上后缀以免与普通构建混用）")
-    parser.add_argument("--ndk", default=None, help="Android NDK 路径")
+    parser.add_argument("--ndk", default=None,
+                        help="Android NDK 路径（默认 ANDROID_NDK_HOME，再找 ~/Library/Android/sdk/ndk 下最新版本）")
+    parser.add_argument("--sim", action="store_true",
+                        help="iOS 模拟器构建（iphonesimulator，默认 x86_64；只编内核 + tg_tests，不编 demo App）")
     parser.add_argument("--generator", default=None, help="cmake 生成器")
     parser.add_argument("--ide", action="store_true", help="只生成 IDE 工程并打开，不编译")
     parser.add_argument("--team", default=None,
@@ -105,13 +123,15 @@ def main() -> int:
                         help="iOS demo 的 Bundle ID（默认 com.tencent.tgcapture.demo；个人账号需改成唯一值）")
     args = parser.parse_args()
 
-    abi = args.abi or PLATFORM_ABI[args.platform]
+    if args.sim and args.platform != "ios":
+        parser.error("--sim 只用于 --platform ios")
+    abi = args.abi or ("x86_64" if args.sim else PLATFORM_ABI[args.platform])
     if args.platform == "windows" and abi not in VS_PLATFORM:
         parser.error(f"windows 的 --abi 只支持 {'/'.join(VS_PLATFORM)}，收到 {abi}")
     if args.sanitize and args.platform == "windows":
         parser.error("--sanitize 只支持 clang/gcc 平台")
     suffix = {"address": "-asan", "thread": "-tsan", "undefined": "-ubsan"}.get(args.sanitize, "")
-    build_dir = DEFAULT_BUILD_DIR / f"{args.platform}-{abi}{suffix}"
+    build_dir = DEFAULT_BUILD_DIR / f"{args.platform}{'-sim' if args.sim else ''}-{abi}{suffix}"
     if args.platform in ("ios", "macos") and (args.ide or args.generator == "Xcode"):
         # Xcode 工程与命令行构建（Makefiles）分目录：同一目录换生成器 CMake 会直接报错
         build_dir = DEFAULT_BUILD_DIR / f"{args.platform}-{abi}{suffix}-xcode"
@@ -123,7 +143,8 @@ def main() -> int:
     build_dir.mkdir(parents=True, exist_ok=True)
 
     # demo：windows / linux / macos 为命令行程序，ios 为 App（demo/ios）；android 的 demo 由 Gradle 构建
-    with_demo = not args.no_demo and args.platform in ("windows", "linux", "ios", "macos")
+    with_demo = (not args.no_demo and not args.sim
+                 and args.platform in ("windows", "linux", "ios", "macos"))
     configure = [
         "cmake",
         "-S", PROJECT_ROOT,
@@ -154,17 +175,27 @@ def main() -> int:
             configure += ["-A", VS_PLATFORM.get(abi, "x64")]
 
     if args.platform == "android":
-        if not args.ndk:
-            print("提示: 未指定 --ndk，将使用环境变量 ANDROID_NDK_HOME")
-        toolchain = None
-        if args.ndk:
-            toolchain = Path(args.ndk) / "build" / "cmake" / "android.toolchain.cmake"
+        ndk = args.ndk or os.environ.get("ANDROID_NDK_HOME") or _default_ndk()
+        if not ndk:
+            print("提示: 未指定 --ndk，也没有 ANDROID_NDK_HOME，且 ~/Library/Android/sdk/ndk 下没找到 NDK")
+        toolchain = Path(ndk) / "build" / "cmake" / "android.toolchain.cmake" if ndk else None
         if toolchain and toolchain.exists():
-            configure += [f"-DCMAKE_TOOLCHAIN_FILE={toolchain}", f"-DANDROID_ABI={abi}"]
+            configure += [f"-DCMAKE_TOOLCHAIN_FILE={toolchain}", f"-DANDROID_ABI={abi}",
+                          # 与 TGCapture3rd 的 android 产物（api23）、Gradle 的 c++_shared 保持一致
+                          # （ffmpeg 的传递依赖本就带 -lc++）；adb 跑 tg_tests 时把 libc++_shared.so 一并推过去
+                          "-DANDROID_PLATFORM=android-23", "-DANDROID_STL=c++_shared"]
         else:
             print("警告: 未找到 android.toolchain.cmake，请确认 NDK 路径")
 
-    if args.platform == "ios":
+    if args.platform == "ios" and args.sim:
+        configure += [
+            "-DCMAKE_SYSTEM_NAME=iOS",
+            "-DCMAKE_OSX_SYSROOT=iphonesimulator",
+            # TGCapture3rd 的 iOS 产物是 arm64(真机)+x86_64(模拟器) 的 fat 库，模拟器只能用 x86_64（Rosetta）
+            f"-DCMAKE_OSX_ARCHITECTURES={abi}",
+            "-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0",
+        ]
+    elif args.platform == "ios":
         configure += [
             "-DCMAKE_SYSTEM_NAME=iOS",
             # 不给 sysroot 时 CMake 会按宿主的 macOS SDK 推断成 macabi，
