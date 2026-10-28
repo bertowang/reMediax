@@ -12,6 +12,7 @@
 #include "platform/windows/WinScreenCapture.h"
 #elif defined(__ANDROID__)
 #include "platform/android/AndroidAudioCapture.h"
+#include "platform/android/AndroidJni.h"
 #include "platform/android/AndroidScreenCapture.h"
 #elif defined(__APPLE__)
 #include "platform/ios/IOSAudioCapture.h"
@@ -148,7 +149,8 @@ IVideoSource* TGCapturer::CreateScreenCapture(int index, VideoCapMode mode, Vide
     auto source = std::make_shared<platform::WinScreenCapture>(index, mode, strategy);
 #elif defined(__ANDROID__)
     auto source = std::make_shared<platform::AndroidScreenCapture>(strategy);
-    source->SetProjection(m_mediaProjection);
+    // m_mediaProjection 是 void*（宿主经 SetPrivateData 传入），JNI 侧要的是 jobject
+    source->SetProjection(static_cast<jobject>(m_mediaProjection));
 #elif defined(__APPLE__)
     auto source = std::make_shared<platform::IOSScreenCapture>(strategy);
 #endif

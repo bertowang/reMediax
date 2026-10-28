@@ -2,6 +2,7 @@
 
 #include "platform/android/AndroidAudioCapture.h"
 
+#include "core/Clock.h"
 #include "core/Logger.h"
 #include "platform/android/AndroidJni.h"
 
