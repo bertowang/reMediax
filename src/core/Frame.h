@@ -24,6 +24,16 @@ enum class MediaKind
     Packet,
 };
 
+// 带内控制消息：与数据走同一条通道、严格保序（例如分辨率切换必须排在旧分辨率的最后一帧之后）。
+// 控制帧不携带媒体数据，队列满时也不会被丢弃（见 Bus 的 Queued 连线）。
+enum class ControlKind : uint8_t
+{
+    None = 0,        // 普通数据帧
+    FormatChanged,   // 格式变化（分辨率 / 帧率 / 码率），controlData 指向新格式描述
+    Flush,           // 丢弃该点之前尚未处理的积压
+    EOS,             // 流结束
+};
+
 // 零拷贝硬件载体类型
 enum class HwKind
 {
@@ -74,11 +84,30 @@ struct Frame
     int rotation = 0;
     uint32_t sourceId = 0;
     bool endOfStream = false;
+
+    // ---- 带内控制（control != None 时本帧只是控制消息）----
+    ControlKind control = ControlKind::None;
+    std::shared_ptr<const void> controlData;   // 控制消息的载荷，类型由 control 约定
+
+    [[nodiscard]] bool IsControl() const noexcept { return control != ControlKind::None; }
 };
 
 using FramePtr = std::shared_ptr<Frame>;
 
 inline FramePtr MakeVideoFrame() { return std::make_shared<Frame>(); }
+
+// 构造控制帧。kind 表示它属于哪条流（视频 / 音频 / 编码包），便于节点按流分发
+inline FramePtr MakeControlFrame(ControlKind control, MediaKind kind,
+                                 std::shared_ptr<const void> data = {})
+{
+    auto f = std::make_shared<Frame>();
+    f->kind = kind;
+    f->streamKind = kind == MediaKind::Audio ? MediaKind::Audio : MediaKind::Video;
+    f->control = control;
+    f->controlData = std::move(data);
+    f->endOfStream = control == ControlKind::EOS;
+    return f;
+}
 
 // 用 shared_ptr 托管的 AVFrame（RAII，杜绝 av_frame_free 漏调用）
 using AVFramePtr = std::shared_ptr<AVFrame>;

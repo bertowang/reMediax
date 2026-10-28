@@ -246,6 +246,7 @@ if(TG_BUILD_TESTS)
         tests/test_url_redact.cpp
         tests/test_queue.cpp
         tests/test_bus.cpp
+        tests/test_bus_topology.cpp
         tests/test_health.cpp
         tests/test_traffic_meter.cpp
         tests/test_error_codes.cpp
