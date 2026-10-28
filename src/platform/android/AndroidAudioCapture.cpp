@@ -9,11 +9,6 @@
 namespace TGCapture::platform
 {
 
-namespace
-{
-constexpr const char* kHelperClass = "com/tencent/tgcapture/TGCaptureSystemCapture";
-}  // namespace
-
 AndroidAudioCapture::AndroidAudioCapture(AudioCapSourceType type, bool loopback)
     : capture::AudioSourceBase(type), m_loopback(loopback)
 {
@@ -46,9 +41,9 @@ bool AndroidAudioCapture::StartJava()
         TG_LOGE("AndroidAudioCapture: 拿不到 JNIEnv（是否忘了传 android.JavaVM？）");
         return false;
     }
-    jclass clazz = env->FindClass(kHelperClass);
+    jclass clazz = AndroidJni::HelperClass(env);
     if (!clazz) {
-        TG_LOGE("AndroidAudioCapture: 找不到 %s", kHelperClass);
+        TG_LOGE("AndroidAudioCapture: 找不到 TGCaptureSystemCapture（是否漏打包 bindings/android 的 Java 类？）");
         return false;
     }
     jmethodID start = env->GetStaticMethodID(clazz, "startAudio",
@@ -84,11 +79,12 @@ void AndroidAudioCapture::StopJava()
         return;
     }
     if (JNIEnv* env = AndroidJni::Env()) {
-        jclass clazz = env->FindClass(kHelperClass);
+        jclass clazz = AndroidJni::HelperClass(env);
         if (clazz) {
-            jmethodID stop = env->GetStaticMethodID(clazz, "stopAudio", "()V");
+            // 按 nativePtr 停自己那一路：麦克风与系统内录可以同时开，各自一个 AudioRecord
+            jmethodID stop = env->GetStaticMethodID(clazz, "stopAudio", "(J)V");
             if (stop) {
-                env->CallStaticVoidMethod(clazz, stop);
+                env->CallStaticVoidMethod(clazz, stop, reinterpret_cast<jlong>(this));
             }
             env->DeleteLocalRef(clazz);
         }

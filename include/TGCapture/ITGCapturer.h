@@ -17,6 +17,16 @@ public:
     static int Init(int logLevel = 2, const std::string& logDir = "", bool printLog = false);
     static void UnInit();
     static const char* GetVersion();
+
+    // ---------------- 编码器探测 ----------------
+    // 编进 ffmpeg 不等于本机能用：硬编还取决于设备 / 系统 / 驱动。这里用最小参数真正打开一次判定，
+    // 结果进程内缓存。硬编首次探测会真的创建一次编码会话（几十 ~ 几百 ms），别在 UI 线程上批量调。
+    // 不探测也能开播：Setup 时请求的编码器打不开会自动回落（视频 → libopenh264，音频 → aac），
+    // 并在 Prepare 期间发 EsCap_Notify_Encoder_Fallback。
+    static bool IsEncoderAvailable(const std::string& name);
+    // 本机可用的编码器，逗号分隔、按推荐顺序（视频：系统硬编在前）。
+    // 只列 TGCapture 认识的 H.264 / AAC 编码器，例如 "h264_mediacodec,libopenh264" / "libfdk_aac,aac"。
+    static std::string GetAvailableEncoders(bool video);
 };
 
 // 错误处理约定（细节见 TGCapturerInterface.h 的 TGCaptureError）

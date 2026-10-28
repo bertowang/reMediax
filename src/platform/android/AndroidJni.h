@@ -21,6 +21,14 @@ public:
 
     // 与 Env() 成对使用（仅当本线程是被 Attach 的才 Detach）
     static void DetachIfNeeded();
+
+    // 采集桥接类 com.tencent.tgcapture.TGCaptureSystemCapture 的全局引用。
+    // 由 JNI_OnLoad（bindings/android）在 App 的 ClassLoader 上预先解析并缓存：
+    // 被 AttachCurrentThread 挂上来的 native 线程里调 FindClass 走的是系统 ClassLoader，
+    // 找不到 App 自己的类。未缓存时（宿主自己加载 so、没走我们的 JNI_OnLoad）回退 FindClass。
+    static void SetHelperClass(JNIEnv* env, jclass clazz);
+    // 返回 local ref（调用方 DeleteLocalRef），失败返回 nullptr
+    static jclass HelperClass(JNIEnv* env);
 };
 
 }  // namespace TGCapture::platform

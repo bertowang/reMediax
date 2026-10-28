@@ -35,6 +35,8 @@ public:
     explicit AudioEncoder(size_t queueCapacity = 64);
     ~AudioEncoder() override;
 
+    // 打开编码器。请求的编码器未编进 / 本机打不开时自动回落 ffmpeg 内置 aac 并返回成功，
+    // 实际用的编码器以 CodecName() 为准。
     int Open(const AudioEncoderParams& params, const core::AudioMediaType& srcType);
     void Close();
 
@@ -60,6 +62,7 @@ protected:
     void OnThreadExit() override;
 
 private:
+    int OpenCodec(const AudioEncoderParams& params, const core::AudioMediaType& srcType);
     int EncodeOne(const core::FramePtr& frame);
     // 把 m_pcmBuffer 头部 frameSize 个交错 S16 样本写进 avFrame（按编码器 sample_fmt 转换）
     bool FillFrame(AVFrame* avFrame, const int16_t* chunk, int frameSize, int channels);

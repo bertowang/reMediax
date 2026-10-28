@@ -9,7 +9,7 @@
     # 只生成 IDE 工程并打开（VS2022 / Android Studio / Xcode），不编译
     python scripts/build.py --platform windows --ide
     python scripts/build.py --platform android --ide
-    python scripts/build.py --platform ios --ide
+    python scripts/build.py --platform ios --ide [--team <Team ID>]   # 含 demo/ios 开播测试 App
 
 依赖目录（3rd）不给时由 CMake 解析：环境变量 TG_3RD_ROOT > 工程同级 TGCapture3rd。
 """
@@ -64,7 +64,8 @@ def open_in_ide(platform: str, build_dir: Path) -> None:
     elif platform == "android":
         host = PROJECT_ROOT / "ide" / "android"
         print("用 Android Studio 打开（File > Open）: " + str(host))
-        print("  首次打开按向导配置 Gradle / SDK 即可；Native 构建由 app/build.gradle 驱动。")
+        print("  模块 :tgcapture = bindings/android（SDK/AAR），:demo = demo/android（开播测试 App）；")
+        print("  Native 构建由 bindings/android/build.gradle.kts 的 externalNativeBuild 驱动。")
         if sys.platform.startswith("win"):
             os.startfile(str(host))
         elif sys.platform == "darwin":
@@ -83,10 +84,17 @@ def main() -> int:
     parser.add_argument("--ndk", default=None, help="Android NDK 路径")
     parser.add_argument("--generator", default=None, help="cmake 生成器")
     parser.add_argument("--ide", action="store_true", help="只生成 IDE 工程并打开，不编译")
+    parser.add_argument("--team", default=None,
+                        help="iOS 签名用的开发者 Team ID（写入 demo 工程；也可用环境变量 TG_IOS_TEAM_ID）")
+    parser.add_argument("--bundle-id", default=None,
+                        help="iOS demo 的 Bundle ID（默认 com.tencent.tgcapture.demo；个人账号需改成唯一值）")
     args = parser.parse_args()
 
     abi = args.abi or PLATFORM_ABI[args.platform]
     build_dir = DEFAULT_BUILD_DIR / f"{args.platform}-{abi}"
+    if args.platform == "ios" and (args.ide or args.generator == "Xcode"):
+        # Xcode 工程与命令行构建（Makefiles）分目录：同一目录换生成器 CMake 会直接报错
+        build_dir = DEFAULT_BUILD_DIR / f"{args.platform}-{abi}-xcode"
 
     if args.clean and build_dir.exists():
         print(f"清理 {build_dir}")
@@ -94,6 +102,8 @@ def main() -> int:
 
     build_dir.mkdir(parents=True, exist_ok=True)
 
+    # demo：windows / linux 为命令行程序，ios 为 App（demo/ios）；android 的 demo 由 Gradle 构建
+    with_demo = not args.no_demo and args.platform in ("windows", "linux", "ios")
     configure = [
         "cmake",
         "-S", PROJECT_ROOT,
@@ -101,11 +111,15 @@ def main() -> int:
         f"-DCMAKE_BUILD_TYPE={args.build_type}",
         f"-DTG_PLATFORM={args.platform}",
         f"-DTG_ABI={abi}",
-        f"-DTG_BUILD_DEMO={'OFF' if (args.no_demo or args.platform not in ('windows', 'linux')) else 'ON'}",
+        f"-DTG_BUILD_DEMO={'ON' if with_demo else 'OFF'}",
     ]
     if args.third:
         # 显式指定才透传；不给时由 CMakeLists.txt 按 环境变量 > 同级目录 解析
         configure.append(f"-DTG_3RD_ROOT={args.third}")
+    if args.team:
+        configure.append(f"-DTG_IOS_TEAM_ID={args.team}")
+    if args.bundle_id:
+        configure.append(f"-DTG_IOS_BUNDLE_ID={args.bundle_id}")
     generator = args.generator
     if args.platform == "windows" and not generator:
         # ffmpeg 等依赖由 MSVC 编译，必须使用 MSVC 生成器（ABI 一致）

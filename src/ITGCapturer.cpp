@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "TGCapturer.h"
+#include "codec/EncoderProbe.h"
 #include "core/Logger.h"
 
 extern "C"
@@ -103,6 +104,23 @@ const char* ITGCapturerMgr::GetVersion()
 {
     // 来自 CMakeLists.txt 的 project(VERSION)，单一事实来源
     return TGCAPTURE_VERSION_STRING;
+}
+
+bool ITGCapturerMgr::IsEncoderAvailable(const std::string& name)
+{
+    return !name.empty() && codec::ProbeEncoder(name);
+}
+
+std::string ITGCapturerMgr::GetAvailableEncoders(bool video)
+{
+    std::string out;
+    for (const std::string& name : codec::AvailableEncoders(video)) {
+        if (!out.empty()) {
+            out += ',';
+        }
+        out += name;
+    }
+    return out;
 }
 
 }  // namespace TGCapture

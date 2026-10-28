@@ -1,5 +1,7 @@
 #include "codec/VideoEncoder.h"
 
+#include "codec/EncoderProbe.h"
+
 #include <algorithm>
 #include <limits>
 
@@ -10,6 +12,9 @@
 
 #ifdef _WIN32
 #include <d3d11.h>
+#endif
+#if defined(__APPLE__)
+#include <CoreVideo/CoreVideo.h>
 #endif
 
 extern "C"
@@ -35,9 +40,10 @@ AVPixelFormat HwInputFormat(const std::string& name)
     if (name == "h264_videotoolbox") {
         return AV_PIX_FMT_VIDEOTOOLBOX;
     }
-    if (name == "h264_mediacodec") {
-        return AV_PIX_FMT_MEDIACODEC;
-    }
+    // h264_mediacodec 不走硬件帧：Android 的采集源产出的都是系统内存 NV12（ImageReader 回读 / 外部注入），
+    // 编码器 Surface 直连尚未实现。原先这里返回 AV_PIX_FMT_MEDIACODEC，GPU 模式下会白建一个
+    // MEDIACODEC hwdevice，再在 hw_frames_ctx 上失败（mediacodec 不支持帧池）后回落 —— 结果一样是 CPU 帧，
+    // 只多了一条误导性的 Warn。MediaCodec 吃 NV12 内存帧本身就是硬编，性能模式对它没有区别。
     return AV_PIX_FMT_NONE;
 }
 
@@ -81,6 +87,75 @@ AVHWDeviceType HwDeviceType(AVPixelFormat fmt)
             return AV_HWDEVICE_TYPE_NONE;
     }
 }
+
+#if defined(__APPLE__)
+// CVPixelBuffer（ReplayKit / 外部注入）→ 系统内存帧。
+// CPU 模式（软编 libopenh264，或 VideoToolbox 走系统内存输入）下编码器拿不到硬件句柄里的像素，
+// 原先这类帧在下面"收到硬件帧但编码器为软件链路"分支被整帧丢弃 —— iOS 上表现为推流成功但没有画面。
+// 这里锁住像素缓冲逐行拷出，交给通用的 sws 归一化（缩放 + 转编码器像素格式）。
+core::FramePtr ReadBackCVPixelBuffer(const core::FramePtr& frame)
+{
+    auto pb = static_cast<CVPixelBufferRef>(frame->hwHandle);
+    if (!pb) {
+        return nullptr;
+    }
+    const OSType fourcc = CVPixelBufferGetPixelFormatType(pb);
+    AVPixelFormat fmt = AV_PIX_FMT_NONE;
+    if (fourcc == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
+        fourcc == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) {
+        fmt = AV_PIX_FMT_NV12;
+    } else if (fourcc == kCVPixelFormatType_32BGRA) {
+        fmt = AV_PIX_FMT_BGRA;
+    } else {
+        TG_LOGW_THROTTLED(5000000, "VideoEncoder: 不支持回读的 CVPixelBuffer 格式 0x%08x", static_cast<unsigned>(fourcc));
+        return nullptr;
+    }
+    const int w = static_cast<int>(CVPixelBufferGetWidth(pb));
+    const int h = static_cast<int>(CVPixelBufferGetHeight(pb));
+    if (w <= 0 || h <= 0) {
+        return nullptr;
+    }
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+        return nullptr;
+    }
+    auto out = std::make_shared<core::Frame>(*frame);
+    out->hwKind = core::HwKind::None;
+    out->hwHandle = nullptr;
+    out->hwOwner.reset();
+    out->width = w;
+    out->height = h;
+    out->pixFmt = fmt;
+
+    const bool planar = CVPixelBufferIsPlanar(pb);
+    const size_t planeCount = planar ? CVPixelBufferGetPlaneCount(pb) : 1;
+    // 单块分配、按紧凑 stride 存放，planes[i] 是同一 buffer 的别名
+    size_t rowBytes[2] = {0, 0};
+    size_t rows[2] = {0, 0};
+    size_t total = 0;
+    for (size_t p = 0; p < planeCount && p < 2; ++p) {
+        const size_t pw = planar ? CVPixelBufferGetWidthOfPlane(pb, p) : static_cast<size_t>(w);
+        rows[p] = planar ? CVPixelBufferGetHeightOfPlane(pb, p) : static_cast<size_t>(h);
+        rowBytes[p] = (fmt == AV_PIX_FMT_BGRA) ? pw * 4 : (p == 0 ? pw : pw * 2);
+        total += rowBytes[p] * rows[p];
+    }
+    std::shared_ptr<uint8_t> buffer(new uint8_t[total], std::default_delete<uint8_t[]>());
+    size_t offset = 0;
+    for (size_t p = 0; p < planeCount && p < 2; ++p) {
+        const auto* src = static_cast<const uint8_t*>(planar ? CVPixelBufferGetBaseAddressOfPlane(pb, p)
+                                                             : CVPixelBufferGetBaseAddress(pb));
+        const size_t srcStride = planar ? CVPixelBufferGetBytesPerRowOfPlane(pb, p) : CVPixelBufferGetBytesPerRow(pb);
+        uint8_t* dst = buffer.get() + offset;
+        for (size_t y = 0; y < rows[p]; ++y) {
+            memcpy(dst + y * rowBytes[p], src + y * srcStride, rowBytes[p]);
+        }
+        out->planes[p] = (p == 0) ? buffer : std::shared_ptr<uint8_t>(buffer, dst);
+        out->strides[p] = static_cast<int>(rowBytes[p]);
+        offset += rowBytes[p] * rows[p];
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    return out;
+}
+#endif
 }  // namespace
 
 VideoEncoder::VideoEncoder(size_t queueCapacity)
@@ -97,6 +172,26 @@ VideoEncoder::~VideoEncoder()
 }
 
 int VideoEncoder::Open(const VideoEncoderParams& params, const core::VideoMediaType& srcType)
+{
+    const int ret = OpenCodec(params, srcType);
+    if (ret == 0) {
+        return 0;
+    }
+    // 硬编能否打开取决于设备 / 驱动（模拟器、老机型、无对应显卡），属于运行环境问题，
+    // 不该让开播直接失败：回落软编。软编失败是配置问题（名字写错 / 未编进），照常报错。
+    const std::string requested = params.vCodec.empty() ? kSoftwareVideoEncoder : params.vCodec;
+    if (!IsHardwareVideoEncoder(requested) || !avcodec_find_encoder_by_name(kSoftwareVideoEncoder)) {
+        return ret;
+    }
+    TG_LOGW("VideoEncoder: 硬编 %s 在本机打不开（ret=%d averr=%d），回退 %s", requested.c_str(), ret,
+            static_cast<int>(m_lastAvError.load()), kSoftwareVideoEncoder);
+    Close();   // 失败路径可能残留 ctx / 硬件上下文
+    VideoEncoderParams soft = params;
+    soft.vCodec = kSoftwareVideoEncoder;
+    return OpenCodec(soft, srcType);
+}
+
+int VideoEncoder::OpenCodec(const VideoEncoderParams& params, const core::VideoMediaType& srcType)
 {
     if (m_opened.load()) {
         return 0;
@@ -149,6 +244,15 @@ int VideoEncoder::Open(const VideoEncoderParams& params, const core::VideoMediaT
         m_useHwFrame = true;
         TG_LOGI("VideoEncoder: GPU 链路就绪（硬件帧直通，pix_fmt=%d）", static_cast<int>(hwFmt));
     } else {
+        // hwdevice 建好了但帧池失败：设备上下文必须一并撤掉，否则软件帧编码器身上挂着一个
+        // 用不上的 hw_device_ctx（部分编码器据此改走硬件输入分支，表现为 open 失败或丢帧）
+        if (m_hwDeviceCtx) {
+            av_buffer_unref(&m_ctx->hw_device_ctx);
+            av_buffer_unref(&m_hwDeviceCtx);
+#ifdef _WIN32
+            m_d3dContext = nullptr;
+#endif
+        }
         // 软编或硬编降级：优先 NV12（硬编友好），否则 YUV420P
         m_ctx->pix_fmt = AV_PIX_FMT_NV12;
         if (!codec->pix_fmts || !avcodec_find_best_pix_fmt_of_list(codec->pix_fmts, AV_PIX_FMT_NV12, 0, nullptr)) {
@@ -746,6 +850,15 @@ core::AVFramePtr VideoEncoder::BuildAVFrame(const core::FramePtr& frame)
     // 硬件帧但编码器没走硬件链路（hwdevice / 帧池初始化失败时会出现）：
     // 这种情况 CPU 侧拿不到任何像素，只能丢弃，必须显式说出来 ——
     // 否则现象是"流正常、包在写、画面全黑"，排查时完全没有线索。
+#if defined(__APPLE__)
+    // iOS 例外：CVPixelBuffer 可以锁住直接读，回读后照常走系统内存链路
+    if (frame->hwHandle != nullptr && frame->hwKind == core::HwKind::CVPixelBuffer) {
+        if (const core::FramePtr cpu = ReadBackCVPixelBuffer(frame)) {
+            const core::FramePtr source = NormalizeFrame(cpu);
+            return FillFromCpuFrame(source ? source : cpu, avFrame) ? avFrame : nullptr;
+        }
+    }
+#endif
     if (frame->hwHandle != nullptr) {
         TG_LOGW_THROTTLED(2000000, "VideoEncoder: 收到硬件帧但编码器为软件链路（hw=%d），丢帧；"
                                    "请把采集侧一并切回 CPU 模式",

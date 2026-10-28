@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 开播参数。key 与 DemoConfig.load 一一对应；数值型 ListPreference 存的是字符串 -->
+<PreferenceScreen xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <PreferenceCategory app:title="@string/cat_output">
+        <ListPreference
+            app:defaultValue="publish"
+            app:entries="@array/output_mode_entries"
+            app:entryValues="@array/output_mode_values"
+            app:key="pref_output_mode"
+            app:title="@string/pref_output_mode"
+            app:useSimpleSummaryProvider="true" />
+        <EditTextPreference
+            app:defaultValue="rtmp://101.91.22.77/live/test-1"
+            app:key="pref_publish_url"
+            app:title="@string/pref_publish_url"
+            app:useSimpleSummaryProvider="true" />
+        <ListPreference
+            app:defaultValue="flv"
+            app:entries="@array/muxer_entries"
+            app:entryValues="@array/muxer_values"
+            app:key="pref_muxer_format"
+            app:title="@string/pref_muxer_format"
+            app:useSimpleSummaryProvider="true" />
+    </PreferenceCategory>
+
+    <PreferenceCategory app:title="@string/cat_video">
+        <ListPreference
+            app:defaultValue="screen"
+            app:entries="@array/video_source_entries"
+            app:entryValues="@array/video_source_values"
+            app:key="pref_video_source"
+            app:title="@string/pref_video_source"
+            app:useSimpleSummaryProvider="true" />
+        <ListPreference
+            app:defaultValue="720"
+            app:entries="@array/resolution_entries"
+            app:entryValues="@array/resolution_values"
+            app:key="pref_resolution"
+            app:title="@string/pref_resolution"
+            app:useSimpleSummaryProvider="true" />
+        <ListPreference
+            app:defaultValue="auto"
+            app:entries="@array/orientation_entries"
+            app:entryValues="@array/orientation_values"
+            app:key="pref_orientation"
+            app:title="@string/pref_orientation"
+            app:useSimpleSummaryProvider="true" />
+        <ListPreference
+            app:defaultValue="30"
+            app:entries="@array/fps_values"
+            app:entryValues="@array/fps_values"
+            app:key="pref_fps"
+            app:title="@string/pref_fps"
+            app:useSimpleSummaryProvider="true" />
+        <ListPreference
+            app:defaultValue="3000"
+            app:entries="@array/video_bitrate_entries"
+            app:entryValues="@array/video_bitrate_values"
+            app:key="pref_video_bitrate"
+            app:title="@string/pref_video_bitrate"
+            app:useSimpleSummaryProvider="true" />
+        <ListPreference
+            app:defaultValue="h264_mediacodec"
+            app:entries="@array/video_codec_entries"
+            app:entryValues="@array/video_codec_values"
+            app:key="pref_video_codec"
+            app:title="@string/pref_video_codec"
+            app:useSimpleSummaryProvider="true" />
+        <ListPreference
+            app:defaultValue="2"
+            app:entries="@array/gop_entries"
+            app:entryValues="@array/gop_values"
+            app:key="pref_gop_seconds"
+            app:title="@string/pref_gop"
+            app:useSimpleSummaryProvider="true" />
+        <ListPreference
+            app:defaultValue="0"
+            app:entries="@array/perf_mode_entries"
+            app:entryValues="@array/perf_mode_values"
+            app:key="pref_perf_mode"
+            app:title="@string/pref_perf_mode"
+            app:useSimpleSummaryProvider="true" />
+    </PreferenceCategory>
+
+    <PreferenceCategory app:title="@string/cat_audio">
+        <SwitchPreferenceCompat
+            app:defaultValue="true"
+            app:key="pref_audio_mic"
+            app:title="@string/pref_audio_mic" />
+        <SwitchPreferenceCompat
+            app:defaultValue="false"
+            app:key="pref_audio_speaker"
+            app:summary="@string/pref_audio_speaker_summary"
+            app:title="@string/pref_audio_speaker" />
+        <SwitchPreferenceCompat
+            app:defaultValue="false"
+            app:key="pref_audio_tone"
+            app:summary="@string/pref_audio_tone_summary"
+            app:title="@string/pref_audio_tone" />
+        <ListPreference
+            app:defaultValue="libfdk_aac"
+            app:entries="@array/audio_codec_values"
+            app:entryValues="@array/audio_codec_values"
+            app:key="pref_audio_codec"
+            app:title="@string/pref_audio_codec"
+            app:useSimpleSummaryProvider="true" />
+        <ListPreference
+            app:defaultValue="128"
+            app:entries="@array/audio_bitrate_entries"
+            app:entryValues="@array/audio_bitrate_values"
+            app:key="pref_audio_bitrate"
+            app:title="@string/pref_audio_bitrate"
+            app:useSimpleSummaryProvider="true" />
+        <ListPreference
+            app:defaultValue="44100"
+            app:entries="@array/sample_rate_values"
+            app:entryValues="@array/sample_rate_values"
+            app:key="pref_audio_sample_rate"
+            app:title="@string/pref_audio_sample_rate"
+            app:useSimpleSummaryProvider="true" />
+        <ListPreference
+            app:defaultValue="2"
+            app:entries="@array/channels_entries"
+            app:entryValues="@array/channels_values"
+            app:key="pref_audio_channels"
+            app:title="@string/pref_audio_channels"
+            app:useSimpleSummaryProvider="true" />
+    </PreferenceCategory>
+
+    <PreferenceCategory app:title="@string/cat_advanced">
+        <ListPreference
+            app:defaultValue="3000"
+            app:entries="@array/av_timeout_entries"
+            app:entryValues="@array/av_timeout_values"
+            app:key="pref_av_timeout"
+            app:title="@string/pref_av_timeout"
+            app:useSimpleSummaryProvider="true" />
+    </PreferenceCategory>
+</PreferenceScreen>

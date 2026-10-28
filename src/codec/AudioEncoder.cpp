@@ -58,6 +58,22 @@ AudioEncoder::~AudioEncoder()
 
 int AudioEncoder::Open(const AudioEncoderParams& params, const core::AudioMediaType& srcType)
 {
+    const int ret = OpenCodec(params, srcType);
+    // 回落 ffmpeg 内置 aac（永远编进）：请求的编码器未编进（-1），或本机打不开（-3，如 aac_at 不支持
+    // 某采样率、fdk 不收某码率）。输入格式不对（-5）是调用方错误，换编码器也没用，不回落。
+    if ((ret == -1 || ret == -3) && m_codecName != "aac") {
+        TG_LOGW("AudioEncoder: %s 不可用（ret=%d averr=%d），回退 aac", m_codecName.c_str(), ret,
+                static_cast<int>(m_lastAvError.load()));
+        Close();
+        AudioEncoderParams fallback = params;
+        fallback.aCodec = "aac";
+        return OpenCodec(fallback, srcType);
+    }
+    return ret;
+}
+
+int AudioEncoder::OpenCodec(const AudioEncoderParams& params, const core::AudioMediaType& srcType)
+{
     if (m_opened.load()) {
         return 0;
     }
@@ -84,12 +100,7 @@ int AudioEncoder::Open(const AudioEncoderParams& params, const core::AudioMediaT
 
     const AVCodec* codec = avcodec_find_encoder_by_name(m_codecName.c_str());
     if (!codec) {
-        TG_LOGW("AudioEncoder: %s 不可用，回退 aac", m_codecName.c_str());
-        codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
-        m_codecName = "aac";
-    }
-    if (!codec) {
-        TG_LOGE("AudioEncoder: 找不到 AAC 编码器");
+        TG_LOGE("AudioEncoder: 找不到编码器 %s", m_codecName.c_str());
         m_lastAvError.store(AVERROR_ENCODER_NOT_FOUND);
         return -1;
     }

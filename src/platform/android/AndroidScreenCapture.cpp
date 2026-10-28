@@ -14,11 +14,6 @@ extern "C"
 namespace TGCapture::platform
 {
 
-namespace
-{
-constexpr const char* kHelperClass = "com/tencent/tgcapture/TGCaptureSystemCapture";
-}  // namespace
-
 AndroidScreenCapture::~AndroidScreenCapture()
 {
     Stop();
@@ -58,9 +53,9 @@ bool AndroidScreenCapture::StartJava()
         TG_LOGE("AndroidScreenCapture: 拿不到 JNIEnv（是否忘了传 android.JavaVM？）");
         return false;
     }
-    jclass clazz = env->FindClass(kHelperClass);
+    jclass clazz = AndroidJni::HelperClass(env);
     if (!clazz) {
-        TG_LOGE("AndroidScreenCapture: 找不到 %s", kHelperClass);
+        TG_LOGE("AndroidScreenCapture: 找不到 TGCaptureSystemCapture（是否漏打包 bindings/android 的 Java 类？）");
         return false;
     }
     jmethodID start = env->GetStaticMethodID(clazz, "startScreen",
@@ -96,7 +91,7 @@ void AndroidScreenCapture::StopJava()
         return;
     }
     if (JNIEnv* env = AndroidJni::Env()) {
-        jclass clazz = env->FindClass(kHelperClass);
+        jclass clazz = AndroidJni::HelperClass(env);
         if (clazz) {
             jmethodID stop = env->GetStaticMethodID(clazz, "stopScreen", "()V");
             if (stop) {
@@ -164,7 +159,53 @@ void AndroidScreenCapture::OnFrame(const uint8_t* y, int yStride,
     Emit(std::move(frame));
 }
 
+void AndroidScreenCapture::OnRgbaFrame(const uint8_t* rgba, int rowStride, int width, int height, int64_t ptsUs)
+{
+    if (!rgba || width <= 0 || height <= 0 || rowStride < width * 4) {
+        return;
+    }
+    const int w = width & ~1;
+    const int h = height & ~1;
+    const size_t ySize = static_cast<size_t>(w) * h;
+    const size_t uvSize = static_cast<size_t>(w) * h / 2;
+    auto buffer = std::shared_ptr<uint8_t>(new uint8_t[ySize + uvSize], std::default_delete<uint8_t[]>());
+    uint8_t* dstY = buffer.get();
+    uint8_t* dstUV = buffer.get() + ySize;
+
+    // Android RGBA_8888 的内存字节序是 R,G,B,A —— 对应 libyuv 的 "ABGR"（libyuv 按小端 32 位字命名）。
+    // rowStride 可能大于 width*4（行尾对齐填充），必须按 rowStride 取行
+    if (libyuv::ABGRToNV12(rgba, rowStride, dstY, w, dstUV, w, w, h) != 0) {
+        TG_LOGW_THROTTLED(3000000, "AndroidScreenCapture: RGBA->NV12 转换失败 %dx%d stride=%d", w, h, rowStride);
+        return;
+    }
+
+    auto frame = std::make_shared<core::Frame>();
+    frame->kind = core::MediaKind::Video;
+    frame->width = w;
+    frame->height = h;
+    frame->pixFmt = AV_PIX_FMT_NV12;
+    frame->ptsUs = ptsUs > 0 ? ptsUs : core::MonotonicClock::NowUs();
+    frame->captureUs = core::MonotonicClock::NowUs();
+    frame->planes[0] = buffer;
+    frame->strides[0] = w;
+    frame->planes[1] = std::shared_ptr<uint8_t>(buffer, dstUV);
+    frame->strides[1] = w;
+    Emit(std::move(frame));
+}
+
 }  // namespace TGCapture::platform
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_tencent_tgcapture_TGCaptureSystemCapture_nativeOnRgbaFrame(
+    JNIEnv* env, jclass, jlong ptr, jobject buf, jint rowStride, jint width, jint height, jlong ptsUs)
+{
+    auto* self = reinterpret_cast<TGCapture::platform::AndroidScreenCapture*>(ptr);
+    if (!self || !buf) {
+        return;
+    }
+    auto* rgba = static_cast<const uint8_t*>(env->GetDirectBufferAddress(buf));
+    self->OnRgbaFrame(rgba, rowStride, width, height, ptsUs);
+}
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_tencent_tgcapture_TGCaptureSystemCapture_nativeOnVideoFrame(

@@ -42,7 +42,9 @@ public:
     explicit VideoEncoder(size_t queueCapacity = 12);
     ~VideoEncoder() override;
 
-    // 打开编码器
+    // 打开编码器。请求的是硬编（MediaCodec / VideoToolbox / NVENC…）但本机打不开时，
+    // 自动回落 libopenh264 并返回成功 —— 实际用的编码器以 CodecName() 为准。
+    // 软编本身打不开（名字写错 / 未编进 ffmpeg）不回落，照常返回失败。
     int Open(const VideoEncoderParams& params, const core::VideoMediaType& srcType);
     void Close();
 
@@ -85,6 +87,7 @@ protected:
     void OnThreadExit() override;
 
 private:
+    int OpenCodec(const VideoEncoderParams& params, const core::VideoMediaType& srcType);
     int EncodeOne(const core::FramePtr& frame);
     // 编码结果归集：连续失败超过 1s 上报一次 TGErr_VideoEncodeFailed（extra = AVERROR）
     void OnEncodeResult(bool ok, int ret);

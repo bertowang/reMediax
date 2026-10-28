@@ -71,6 +71,7 @@ set(TG_CORE_SOURCES
     src/TGCapturer.cpp
     src/codec/VideoEncoder.cpp
     src/codec/AudioEncoder.cpp
+    src/codec/EncoderProbe.cpp
     src/core/AVSyncClock.cpp
     src/core/AudioMixer.cpp
     src/core/PauseFrame.cpp
@@ -149,6 +150,9 @@ else()
     endif()
     # iOS 的 .mm 用了 __weak / __bridge_transfer，必须开 ARC（CMake 默认不给 OBJCXX 加）
     target_compile_options(tgcapture PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+    # Xcode 生成器不认上面按语言区分的编译选项（.mm 实际以非 ARC 编译：bridge cast 失效、对象泄漏），
+    # 必须走 Xcode 自己的构建设置
+    set_target_properties(tgcapture PROPERTIES XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES)
 endif()
 
 # ---------------------------------------------------------------- demo
@@ -190,6 +194,12 @@ if(TG_BUILD_DEMO AND TG_PLATFORM STREQUAL "linux")
     target_link_libraries(tg_capture_demo PRIVATE tgcapture)
 endif()
 
+# iOS 开播测试 App（UIKit，真机 arm64）。用 Xcode 生成器打开：scripts/build.py --platform ios --ide
+# Android 的 demo 不走这里：由 Gradle（ide/android）驱动，见 demo/android
+if(TG_BUILD_DEMO AND TG_PLATFORM STREQUAL "ios")
+    add_subdirectory(demo/ios)
+endif()
+
 # ---------------------------------------------------------------- 单元测试
 # 零依赖的迷你框架（tests/tg_test.h）；只测内核（Bus / Queue / 同步时钟 / 混音 / 脱敏），不依赖采集设备。
 # 运行：ctest --test-dir <build> 或直接执行 tg_tests [名称过滤]
@@ -204,7 +214,8 @@ if(TG_BUILD_TESTS AND (TG_PLATFORM STREQUAL "linux" OR TG_PLATFORM STREQUAL "win
         tests/test_error_codes.cpp
         tests/test_video_pts.cpp
         tests/test_audio_mixer.cpp
-        tests/test_audio_encoder.cpp)
+        tests/test_audio_encoder.cpp
+        tests/test_encoder_probe.cpp)
     target_include_directories(tg_tests PRIVATE tests)
     target_link_libraries(tg_tests PRIVATE tgcapture)
     if(MSVC)

@@ -21,5 +21,11 @@ cmake-build-*/
 __pycache__/
 *.pyc
 
-# Android Studio 宿主工程（ide/android 有自己的 .gitignore）
+# Android（根工程在 ide/android，模块目录 bindings/android、demo/android 在其外，产物需在这里忽略）
 ide/android/local.properties
+.cxx/
+.gradle/
+.kotlin/
+.externalNativeBuild/
+*.iml
+local.properties

@@ -57,6 +57,10 @@ enum NotifyMsgType
     // 收到它表示该路又有数据了（data = 本次断流持续的毫秒数）
     EsCap_Notify_VideoCapture_Recovered = 30,
     EsCap_Notify_AudioCapture_Recovered = 31,
+    // 编码器回落（Prepare 期间发出）：请求的编码器本机打不开，已自动换成兜底编码器。
+    // content = "video:h264_mediacodec->libopenh264" 或 "audio:aac_at->aac"；data = 0 视频 / 1 音频。
+    // 想提前知道哪些编码器可用，用 ITGCapturerMgr::IsEncoderAvailable / GetAvailableEncoders。
+    EsCap_Notify_Encoder_Fallback = 40,
 };
 
 // ------------------------------------------------------------------ 错误码

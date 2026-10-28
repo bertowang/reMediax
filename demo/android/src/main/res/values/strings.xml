@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TGCapture 开播测试</string>
+
+    <string name="version_fmt">TGCapture %1$s</string>
+    <string name="bitrate_fmt">%1$.1f kbps</string>
+
+    <string name="state_idle">空闲</string>
+    <string name="state_authorizing">等待授权…</string>
+    <string name="state_starting">连接中…</string>
+    <string name="state_live">● 直播中</string>
+    <string name="state_stopping">停止中…</string>
+
+    <string name="action_start">开始</string>
+    <string name="action_stop">停止</string>
+    <string name="mute_audio">静音</string>
+    <string name="mute_video">关画面</string>
+    <string name="clear_log">清空</string>
+    <string name="event_log">事件日志（完整内核日志见 logcat: TGCapture）</string>
+
+    <string name="cat_output">输出</string>
+    <string name="cat_video">视频</string>
+    <string name="cat_audio">音频</string>
+    <string name="cat_advanced">高级</string>
+
+    <string name="pref_output_mode">输出方式</string>
+    <string name="pref_publish_url">推流地址</string>
+    <string name="pref_muxer_format">封装格式</string>
+    <string name="pref_video_source">视频源</string>
+    <string name="pref_resolution">分辨率</string>
+    <string name="pref_orientation">画面方向</string>
+    <string name="pref_fps">帧率</string>
+    <string name="pref_video_bitrate">视频码率</string>
+    <string name="pref_video_codec">视频编码器</string>
+    <string name="pref_gop">关键帧间隔</string>
+    <string name="pref_perf_mode">性能模式</string>
+    <string name="pref_audio_mic">麦克风</string>
+    <string name="pref_audio_speaker">系统内录</string>
+    <string name="pref_audio_speaker_summary">AudioPlaybackCapture，需 Android 10+，会触发录屏授权</string>
+    <string name="pref_speaker_unsupported">当前系统低于 Android 10，不支持</string>
+    <string name="pref_audio_tone">测试音</string>
+    <string name="pref_audio_tone_summary">1kHz 正弦（外部注入），模拟器 / 无麦克风时使用</string>
+    <string name="pref_audio_codec">音频编码器</string>
+    <string name="pref_audio_bitrate">音频码率</string>
+    <string name="pref_audio_sample_rate">采样率</string>
+    <string name="pref_audio_channels">声道</string>
+    <string name="pref_av_timeout">断流告警阈值</string>
+</resources>

@@ -4,6 +4,19 @@
 
 ## Unreleased
 
+### 编码器探测与回落
+- 新增 `ITGCapturerMgr::IsEncoderAvailable(name)` / `GetAvailableEncoders(video)`（`src/codec/EncoderProbe.*`）：
+  用最小参数真正 `avcodec_open2` 一次判定可用性，进程内缓存。Java 侧对应
+  `TGCapturer.isEncoderAvailable` / `getAvailableEncoders`。
+- `VideoEncoder::Open`：请求的硬编本机打不开时回落 `libopenh264`（此前直接 `TGErr_OpenVideoEncoder`，
+  模拟器 / 老机型上选 `h264_mediacodec` 就开不了播）；软编失败照常报错。
+- `AudioEncoder::Open`：回落 `aac` 的条件扩大到"编进了但打不开"（此前只覆盖"未编进"）；输入格式错误仍不回落。
+- 新增通知 `EsCap_Notify_Encoder_Fallback = 40`（`content = "video:A->B"` / `"audio:A->B"`，`data = 0/1`），
+  Prepare 期间发出。
+- Android：`h264_mediacodec` 不再走 `AV_PIX_FMT_MEDIACODEC` 硬件帧链路（采集侧没有 Surface 直连，
+  此前 GPU 模式会白建一个 hwdevice 并刷"hw_frames_ctx 初始化失败"）；帧池初始化失败时同时撤掉 hwdevice。
+- 新增 `tests/test_encoder_probe.cpp`（6 个用例）。全部 88 个用例已在 Android arm64 模拟器上通过。
+
 ### AudioEncoder 采样格式适配（R1）
 - 回退到 ffmpeg 内置 `aac`（只收 FLTP）时，S16 → FLTP 转换已在 iOS 回归中补上（swresample）；
   本轮补齐回归测试与剩余缺口：

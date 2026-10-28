@@ -10,8 +10,36 @@ namespace TGCapture::platform
 namespace
 {
 std::atomic<JavaVM*> g_vm{nullptr};
+std::atomic<jclass> g_helperClass{nullptr};
 thread_local bool tls_attached = false;
+constexpr const char* kHelperClass = "com/tencent/tgcapture/TGCaptureSystemCapture";
 }  // namespace
+
+void AndroidJni::SetHelperClass(JNIEnv* env, jclass clazz)
+{
+    if (!env || !clazz) {
+        return;
+    }
+    auto global = static_cast<jclass>(env->NewGlobalRef(clazz));
+    if (jclass old = g_helperClass.exchange(global, std::memory_order_acq_rel)) {
+        env->DeleteGlobalRef(old);
+    }
+}
+
+jclass AndroidJni::HelperClass(JNIEnv* env)
+{
+    if (!env) {
+        return nullptr;
+    }
+    if (jclass cached = g_helperClass.load(std::memory_order_acquire)) {
+        return static_cast<jclass>(env->NewLocalRef(cached));
+    }
+    jclass clazz = env->FindClass(kHelperClass);
+    if (!clazz && env->ExceptionCheck()) {
+        env->ExceptionClear();   // 不清掉的话后续任何 JNI 调用都是未定义行为
+    }
+    return clazz;
+}
 
 void AndroidJni::SetJavaVM(JavaVM* vm) noexcept
 {

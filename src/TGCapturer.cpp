@@ -127,6 +127,12 @@ int TGCapturer::EnableSpeakerCapture()
     auto source = std::make_shared<platform::WinAudioCapture>(TypeOfSpeaker, true);  // WASAPI loopback
 #elif defined(__ANDROID__)
     auto source = std::make_shared<platform::AndroidAudioCapture>(TypeOfSpeaker, true);  // AudioPlaybackCapture
+    // AudioPlaybackCapture 与屏幕采集共用同一个 MediaProjection；不传的话 Open 直接返回 -1，
+    // 表现为"内录开了但没声音"。因此宿主须先 SetPrivateData("android.MediaProjection") 再调本接口
+    if (!m_mediaProjection) {
+        TG_LOGW("TGCapturer: 系统内录需要先 SetPrivateData(\"android.MediaProjection\")，否则打开会失败");
+    }
+    source->SetProjection(static_cast<jobject>(m_mediaProjection));
 #endif
 
 #if defined(_WIN32) || defined(__ANDROID__)
@@ -707,6 +713,14 @@ int TGCapturer::PrepareLocked(PrepareError& err)
         return fail(TGErr_OpenVideoEncoder, m_videoEncoder->LastAvError(),
                     "open video encoder failed");
     }
+    {
+        // 硬编打不开时 VideoEncoder 已自动回落软编：告诉宿主实际用的是谁（否则只能翻日志）
+        const std::string requested = m_videoParams.vCodec.empty() ? "libopenh264" : m_videoParams.vCodec;
+        if (requested != m_videoEncoder->CodecName()) {
+            FireNotify(EsCap_Notify_Encoder_Fallback,
+                       "video:" + requested + "->" + m_videoEncoder->CodecName(), 0);
+        }
+    }
     // 编码器没能建起硬件链路（hwdevice / hw_frames_ctx 初始化失败）时，采集侧必须一并退回系统内存。
     // 否则采集继续产出 GPU 纹理帧，而编码器走软件路径，BuildAVFrame 拿不到 planes[0]，
     // 结果是每帧被丢弃 —— 表现为"流能开、包在写、画面全黑"，且没有任何显式报错。
@@ -724,6 +738,11 @@ int TGCapturer::PrepareLocked(PrepareError& err)
         if (m_audioEncoder->Open(m_audioParams, audioType) < 0) {
             return fail(TGErr_OpenAudioEncoder, m_audioEncoder->LastAvError(),
                         "open audio encoder failed");
+        }
+        const std::string requested = m_audioParams.aCodec.empty() ? "libfdk_aac" : m_audioParams.aCodec;
+        if (requested != m_audioEncoder->CodecName()) {
+            FireNotify(EsCap_Notify_Encoder_Fallback,
+                       "audio:" + requested + "->" + m_audioEncoder->CodecName(), 1);
         }
     } else {
         TG_LOGI("TGCapturer: 纯视频模式（audio disabled）");

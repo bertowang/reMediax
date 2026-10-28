@@ -68,10 +68,14 @@ TGCapture/
 │   ├── platform/ios/           ReplayKit 屏幕 + AVAudioEngine 麦克风（.mm）
 │   ├── TGCapturer.cpp          门面（状态机、回调、统计、背压）
 │   └── ITGCapturer.cpp         Create/Destroy/Init/UnInit
-├── demo/windows/ demo/linux/   控制台测试 demo（第 10 节）
-├── tests/                      单元测试 tg_tests（零依赖迷你框架，第 10.0 节）
+├── demo/                       测试 demo（第 10 节）
+│   ├── windows/ linux/         命令行 demo tg_capture_demo（原生采集 / 外灌帧）
+│   ├── android/                UI demo：Kotlin 开播测试 App（Gradle :demo）
+│   └── ios/                    UI demo：UIKit 开播测试 App（CMake → Xcode）
+├── bindings/android/           Android SDK（Gradle :tgcapture → AAR）：Java API + JNI 胶水
+├── tests/                      单元测试 tg_tests（零依赖迷你框架，第 10.4 节）
 ├── cmake/Deps.cmake            TGCapture3rd 依赖定位
-├── ide/android/                Android Studio 宿主工程（gradle + externalNativeBuild）
+├── ide/android/                Android Studio 宿主工程（只做模块聚合：:tgcapture + :demo）
 ├── CMakeLists.txt
 ├── CHANGELOG.md
 └── scripts/
@@ -236,7 +240,7 @@ capturer.SetPrivateData("android.MediaProjection", projection);
 // 之后照常：EnableMicrophoneCapture / EnableSpeakerCapture / CreateScreenCapture(0, AndroidSurface)
 ```
 
-Java 桥接在 `ide/android/.../TGCaptureSystemCapture.java`（VirtualDisplay + ImageReader + AudioRecord/AudioPlaybackCapture）；
+Java 桥接在 `bindings/android/src/main/java/com/tencent/tgcapture/TGCaptureSystemCapture.java`（VirtualDisplay + ImageReader + AudioRecord/AudioPlaybackCapture）；
 绑定编码器输入 Surface（`SetEncoderSurface`）时走零拷贝，C++ 不搬运像素。
 
 **iOS**：`RPScreenRecorder.startCaptureWithHandler`（iOS 11+），CVPixelBuffer 零拷贝直送 VideoToolbox；
@@ -279,7 +283,7 @@ capturer->PushExternalAudioFrame(TGCapture::TypeOfGameMicphone4Slave, pcm, bytes
 | 字段 | 默认 | 说明 |
 | - | - | - |
 | `width` / `height` / `fps` | 1280 / 720 / 30 | 推流分辨率与帧率 |
-| `vCodec` | `libopenh264` | 也支持 `h264_nvenc` / `h264_amf` / `h264_mf` / `h264_mediacodec` / `h264_videotoolbox` |
+| `vCodec` | `libopenh264` | 也支持 `h264_nvenc` / `h264_amf` / `h264_mf` / `h264_mediacodec` / `h264_videotoolbox`；硬编本机打不开时自动回落 `libopenh264` 并发 `EsCap_Notify_Encoder_Fallback`（第 8 节） |
 | `vBitrate` / `vBitrateMaxFactor` / `gop` | 3000000 / 3.0 / 15 | 码率与 GOP |
 | `threads` | 4 | 软编线程数 |
 | `perfMode` | `Cpu` | `Gpu` = 全链路 GPU（第 7 节） |
@@ -292,7 +296,7 @@ capturer->PushExternalAudioFrame(TGCapture::TypeOfGameMicphone4Slave, pcm, bytes
 | 字段 | 默认 | 说明 |
 | - | - | - |
 | `sampleRate` / `channels` | 44100 / 2 | 输出格式 |
-| `aCodec` | `libfdk_aac` | 也支持 `aac`（ffmpeg 内置）等任意 ffmpeg AAC 编码器名；指定的编码器不可用时自动回退内置 `aac`（打 Warn） |
+| `aCodec` | `libfdk_aac` | 也支持 `aac`（ffmpeg 内置）等任意 ffmpeg AAC 编码器名；指定的编码器不可用时自动回退内置 `aac`（打 Warn，发 `EsCap_Notify_Encoder_Fallback`） |
 | `aBitrate` | 128000 | 音频码率 |
 | `enabled` | `true` | `false` = 纯视频（不建音频编码器与音频流） |
 
@@ -469,7 +473,7 @@ Debug 日志在 Release 里也保留，好处是线上能临时打开排查。
 > 维护者注意：`BoundedQueue::Close()` 是**永久关闭**语义（用来唤醒阻塞的消费者），
 > 重开必须显式 `Reopen()`。各模块的 `Open()` 已经调用，新增队列时别漏。
 
-验证：`--restart <n>`（重开回归）、`--concur <n>`（Prepare/Stop 并发压测），见 §10。
+验证：`--restart <n>`（重开回归）、`--concur <n>`（Prepare/Stop 并发压测），见 §10.2.1。
 
 ### 4.8 画面变换（旋转 / 翻转 / 裁剪）
 
@@ -743,11 +747,35 @@ vp.vCodec = "h264_nvenc";
 
 | 平台 | 每帧流转 | 编码器名 | 像素格式 |
 | - | - | - | - |
-| Android | 采集 Surface → 编码器输入 Surface | `h264_mediacodec` | `AV_PIX_FMT_MEDIACODEC` |
+| Android | 系统内存 NV12 → MediaCodec（暂无 Surface 直连，GPU 模式等价 CPU） | `h264_mediacodec` | `AV_PIX_FMT_NV12` |
 | iOS | `CVPixelBuffer` → VideoToolbox | `h264_videotoolbox` | `AV_PIX_FMT_VIDEOTOOLBOX` |
 | Windows | D3D11 纹理 → NVENC / MF / AMF | `h264_nvenc` / `h264_mf` / `h264_amf` | `AV_PIX_FMT_D3D11` |
 
-硬编不可用时自动回退系统内存路径，功能不受影响，只是不再零拷贝。
+硬件帧链路建不起来（hwdevice / 帧池失败）时退回系统内存路径，功能不受影响，只是不再零拷贝；
+iOS 上收到 `CVPixelBuffer` 但编码器走软件链路时，锁住 buffer 回读到系统内存再编码。
+
+**编码器回落**（`Prepare` 期间）：
+
+| 请求的编码器 | 打不开时 | 通知 |
+| - | - | - |
+| 视频硬编（`*_mediacodec` / `*_videotoolbox` / `*_nvenc` / `*_amf` / `*_qsv` / `*_mf`） | 回落 `libopenh264` | `EsCap_Notify_Encoder_Fallback`，`content = "video:h264_mediacodec->libopenh264"`，`data = 0` |
+| 视频软编（名字写错 / 未编进） | 不回落，`Prepare` 返回 `TGErr_OpenVideoEncoder` | — |
+| 音频（未编进 / 打不开） | 回落内置 `aac` | 同上，`content = "audio:aac_at->aac"`，`data = 1` |
+| 音频输入格式不对 | 不回落，返回 `TGErr_OpenAudioEncoder` | — |
+
+实际使用的编码器以 `GetStatsInfo` / 日志里的 `codec=` 为准。
+
+**编码器探测**：编进 ffmpeg 不等于本机能用（模拟器、老机型、无对应显卡）。想在开播前给用户列可选项：
+
+```cpp
+ITGCapturerMgr::IsEncoderAvailable("h264_mediacodec");   // 用最小参数真正 avcodec_open2 一次
+ITGCapturerMgr::GetAvailableEncoders(true);              // "h264_mediacodec,libopenh264"（推荐顺序，硬编在前）
+ITGCapturerMgr::GetAvailableEncoders(false);             // "libfdk_aac,aac"
+```
+
+Java：`TGCapturer.isEncoderAvailable(name)` / `TGCapturer.getAvailableEncoders(video)`（返回 `String[]`）。
+结果进程内缓存；硬编首次探测要建一次真实编码会话（Android 模拟器上 h264_mediacodec 实测 40~340ms），
+不要放在 UI 线程。两个 demo 启动时都会在后台探测一次，并把结果打到日志面板。
 
 **音频采样格式**：混流器输出恒为交错 S16，`AudioEncoder` 按编码器能力自动适配：
 
@@ -763,16 +791,18 @@ vp.vCodec = "h264_nvenc";
 
 ## 9. 构建
 
-命令行与 IDE **共用同一套 CMake 工程**，产物完全一致。
+命令行与 IDE **共用同一套 CMake 工程**，产物完全一致。Android 例外：App 和 AAR 由 Gradle（`ide/android`）驱动，
+Gradle 内部仍然调用同一个根 `CMakeLists.txt`。各个 demo 的构建和使用方式见第 10 节。
 
 ### 9.1 命令行
 
 ```powershell
 python scripts/build.py --platform windows --abi x64
 python scripts/build.py --platform linux --3rd ~/TGCapture3rd-linux   # 需先编出 linux 版依赖
-python scripts/build.py --platform android --abi arm64-v8a --ndk $ANDROID_NDK_HOME
-python scripts/build.py --platform ios
+python scripts/build.py --platform android --abi arm64-v8a --ndk $ANDROID_NDK_HOME   # 只出内核 .a；App / AAR 见 10.3.1
+python scripts/build.py --platform ios                                # 含 demo/ios App（未签名）
 # 开关：--clean / --build-type Debug|Release / --no-demo / --3rd <依赖目录> / --ide
+# iOS 签名：--team <Team ID> / --bundle-id <id>（写进 Xcode 工程，见 10.3.2）
 ```
 
 ### 9.2 IDE（VS2022 / Android Studio / Xcode）
@@ -782,16 +812,17 @@ python scripts/build.py --platform ios
 ```powershell
 python scripts/build.py --platform windows --ide
 python scripts/build.py --platform android --ide
-python scripts/build.py --platform ios    --ide
+python scripts/build.py --platform ios    --ide [--team <Team ID>]
 ```
 
 | 平台 | IDE | 工程 | 说明 |
 | - | - | - | - |
 | Windows | VS2022 | `build/windows-x64/TGCapture.sln` | 只保留 `Debug`/`Release`；`tg_capture_demo` 为启动工程；调试环境变量已带 ffmpeg DLL 目录，**F5 直接跑** |
-| Android | Android Studio | `ide/android` | gradle 宿主工程，`externalNativeBuild` 驱动根目录 `CMakeLists.txt` |
-| iOS | Xcode | `build/ios-fat/TGCapture.xcodeproj` | `--ide` 自动切 Xcode 生成器 |
+| Android | Android Studio | `ide/android` | Gradle 宿主工程：`:tgcapture`（`bindings/android`）通过 `externalNativeBuild` 驱动根 `CMakeLists.txt`，`:demo` 是 App |
+| iOS | Xcode | `build/ios-fat-xcode/TGCapture.xcodeproj` | `--ide` 自动切换到 Xcode 生成器；`TGCaptureDemo` 为默认 scheme |
 
-* Android 换 ABI 要**同时**改 `abiFilters` 与 `-DTG_ABI`；NDK 版本改 `ndkVersion`（默认 r27c）。
+* Android 换 ABI 时，`bindings/android` 和 `demo/android` 里的 `abiFilters` 要一起改；
+  NDK / CMake 版本在 `ide/android/gradle.properties` 里用 `tg.ndkVersion` / `tg.cmakeVersion` 覆盖（默认 `29.0.14033849` / `4.1.1`）。
 
 ### 9.3 依赖目录怎么指定
 
@@ -807,35 +838,60 @@ Windows 产物是 `flat` 布局（无 abi 层），`cmake/Deps.cmake` 按 abi �
 
 ### 9.4 产物
 
-| 平台 | 产物 |
-| - | - |
-| Linux | `build/linux-x86_64/libtgcapture.a`、`tg_capture_demo`（外灌帧 demo，不依赖采集设备） |
-| Windows | `build/windows-x64/Release/tgcapture.lib`、`tg_capture_demo.exe`（+ 同目录 ffmpeg DLL） |
-| Android | `libtgcapture.a`（gradle 输出到 `ide/android/app/build/…`） |
-| iOS | `build/ios-fat/libtgcapture.a` |
+| 平台 | 内核 | demo |
+| - | - | - |
+| Linux | `build/linux-x86_64/libtgcapture.a` | 命令行：`build/linux-x86_64/tg_capture_demo`（外灌帧，不依赖采集设备） |
+| Windows | `build/windows-x64/Release/tgcapture.lib` | 命令行：`build/windows-x64/Release/tg_capture_demo.exe`（+ 同目录 ffmpeg DLL） |
+| Android | `bindings/android/build/outputs/aar/tgcapture-release.aar`（内含 `libtgcapture_jni.so`）；`build.py` 只出 `build/android-arm64-v8a/libtgcapture.a` | UI：`demo/android/build/outputs/apk/debug/demo-debug.apk` |
+| iOS | `build/ios-fat/libtgcapture.a` | UI：`build/ios-fat/demo/ios/TGCaptureDemo.app`（命令行构建，未签名）；装到真机请用 Xcode 工程 |
 
 ---
 
-## 10. 测试与验证
+## 10. Demo（命令行 / UI 两类）
 
-### 10.0 自动化检查
+### 10.1 分类一览
 
-```bash
-python3 scripts/build.py --platform linux          # 同时编出 tg_tests 和 demo
-build/linux-x86_64/tg_tests                        # 单元测试（也可 ctest；可带名称过滤，如 tg_tests Bus）
-build/linux-x86_64/tg_tests AudioEncoder           # 只跑音频编码器：真实 ffmpeg 编码 + 解码校验波形
-scripts/accept_av.sh                               # 音画同步验收（6 个场景并行，约 20s，失败返回非 0）
+| 类别 | 平台 | 目录 | 形态 | 构建方式 | 视频源 | 音频源 | 主要用途 |
+| - | - | - | - | - | - | - | - |
+| **命令行** | Windows | `demo/windows` | 控制台 `tg_capture_demo.exe` | 根 `CMakeLists.txt`（`build.py` / VS2022） | 屏幕 DXGI·GDI、窗口、人造帧 | WASAPI 麦克风 + 扬声器 | 原生采集、GPU 链路、重开 / 并发回归 |
+| **命令行** | Linux | `demo/linux` | 控制台 `tg_capture_demo` | 根 `CMakeLists.txt`（`build.py`） | 外灌：系统 `ffmpeg` 解素材 → NV12 | 外灌：两路素材 → S16 | 编码 / 混流 / 音画同步压测、故障注入、CI 验收 |
+| **UI** | Android | `demo/android` | Kotlin App（APK） | Gradle（`ide/android`，`:demo` 模块） | MediaProjection 录屏、测试图案 | 麦克风、系统内录、测试音 | 移动端开播联调、模拟器自测 |
+| **UI** | iOS | `demo/ios` | UIKit App（.app） | 根 `CMakeLists.txt` → Xcode 工程 | ReplayKit（App 内画面）、测试图案 | 麦克风、测试音 | 移动端开播联调（仅真机） |
+
+两类 demo 的区别：
+
+* **命令行 demo** 一次运行 = 一次开播，参数全部在命令行，跑完自动 `Stop` 并打印统计，适合脚本化回归和 CI。
+* **UI demo** 把参数做成设置页，可以手动反复开播 / 停播、切换静音和关画面，日志面板会显示内核回调。
+  它们只调用公开 API（Android 用 `bindings/android` 的 Java 接口，iOS 直接用 C++ 接口），也可以当作接入示例来看。
+
+两类都依赖 `TGCapture3rd`（依赖目录的指定方式见 9.3）。
+
+### 10.2 命令行 demo
+
+#### 10.2.1 Windows（`demo/windows`）：原生采集
+
+**构建**
+
+```powershell
+# 命令行：产物 build\windows-x64\Release\tg_capture_demo.exe（ffmpeg DLL 已自动拷到同目录）
+python scripts/build.py --platform windows --abi x64 [--build-type Debug]
+
+# IDE：生成并打开 build\windows-x64\TGCapture.sln，tg_capture_demo 是启动工程，F5 直接运行
+python scripts/build.py --platform windows --ide
 ```
 
-CI 平台里直接调 `scripts/ci.sh`（构建 → 单测；`TG_CI_ACCEPT=1` 再加验收，需要素材 `TG_MEDIA_DIR` 与系统 ffmpeg）。
-依赖目录由 `TG_3RD_ROOT` 指定（见 9.3）。仓库不绑定具体 CI 平台，没有提交 workflow 文件。
+在 VS 里调试时，命令行参数填在 `tg_capture_demo` → 属性 → 调试 → 命令参数。
 
-### 10.1 demo 参数
+**运行**
 
 ```powershell
 cd build\windows-x64\Release
 .\tg_capture_demo.exe --help
+.\tg_capture_demo.exe --out out.flv --seconds 3            # 录 3 秒屏幕 + 麦克风
+.\tg_capture_demo.exe --out rtmp://127.0.0.1/live/stream   # 推流
 ```
+
+##### 参数
 
 | 参数 | 说明 |
 | - | - |
@@ -869,7 +925,7 @@ cd build\windows-x64\Release
 '{0:X}' -f 853962     # -> D07CA
 ```
 
-### 10.2 回归用例
+##### 回归用例
 
 | # | 命令 | 预期 |
 | - | - | - |
@@ -910,7 +966,7 @@ cd build\windows-x64\Release
 [TGCapturer] 音画同步 avDiff=…ms clamp=0 forceSync=0 adapt=0 stall=0 skip=0 jump=0 staleReset=0 syncDrop=0 bpDrop=0
 ```
 
-### 10.3 产物校验
+##### 产物校验
 
 ```powershell
 $env:PATH = "D:\bertonwang\bing\TGCapture3rd\ffmpeg\windows\bin;" + $env:PATH
@@ -922,7 +978,7 @@ ffplay out.flv                      # 实际播放确认音画同步
 推流场景可先起本地服务验证：`ffmpeg -f flv -listen 1 -i rtmp://0.0.0.0/live/stream -c copy out.flv`，
 然后 `--out rtmp://127.0.0.1/live/stream`。
 
-### 10.4 Windows 实测结果（当前版本）
+##### 实测结果（当前版本）
 
 > 以下除"音画同步"一行外均为既有结果；音画同步的判据已随本次修复收紧
 > （基线稳态 `avDiff` 由 ±25ms 收敛到 ±12ms），Windows 侧待复测后更新数值。
@@ -940,13 +996,23 @@ ffplay out.flv                      # 实际播放确认音画同步
 | GPU 全链路 | `h264_nvenc` + D3D11 帧池（fmt=`AV_PIX_FMT_D3D11`, sw=`BGRA`），3 秒 98 帧，文件可解析 |
 | 稳定性 | 同配置连跑 5 次均 `exit=0`、产物有效 |
 
-### 10.5 Linux 外灌帧 demo（真实素材 1 视频 + 2 音频）
+#### 10.2.2 Linux（`demo/linux`）：外灌帧（真实素材 1 视频 + 2 音频）
 
 Linux 没有原生采集，但是**整条编码 / 封装 / 混流 / 音画同步链路都可以用外灌帧跑通**。
 `demo/linux/main.cpp` 用系统 `ffmpeg` CLI 把素材解成裸 NV12 / S16LE PCM 经管道喂入，
 两路音频走不同的 `AudioCapSourceType` 各占独立混流通道，由内核做 sample-wise mix。
 
-#### 参数速查
+**构建**
+
+```bash
+# 需先用 FfmpegCompileShell 编出 linux 版依赖；运行时还要系统 ffmpeg CLI（拿来解码素材）
+python3 scripts/build.py --platform linux --3rd ~/TGCapture3rd-linux
+# 产物：build/linux-x86_64/tg_capture_demo（同时编出 tg_tests，见 10.4）
+```
+
+默认素材路径写死在 `demo/linux/main.cpp`（`/data/home/bertonwang/mov/…`）。换机器时请用 `--video` / `--audio1` / `--audio2` 指定。
+
+##### 参数速查
 
 ```bash
 ./tg_capture_demo --help
@@ -984,7 +1050,7 @@ Linux 没有原生采集，但是**整条编码 / 封装 / 混流 / 音画同步
 每路一个独立预读线程 + 有界队列（约 500ms），主循环只从队列取块，
 某一路管道抖动不会拖住其它路的节奏（旧实现单线程阻塞 `fread`，三路会一起停）。
 
-#### 典型用例
+##### 典型用例
 
 ```bash
 cd build/linux-x86_64
@@ -1023,7 +1089,7 @@ cd build/linux-x86_64
 ./tg_capture_demo --seconds 0 --out /tmp/live.flv   # Ctrl+C 结束
 ```
 
-#### 日志判读
+##### 日志判读
 
 **运行期心跳（10s / 条，MixLoop 发出）** — 长压测时在时间轴上就能看到 drift 分布，不用等 Stop 聚合：
 
@@ -1067,7 +1133,7 @@ cd build/linux-x86_64
 —— 只在持续 500ms 没有任何输出时才提示（3s 节流一条）。
 混流按输出时钟出帧，轮询时取空属于正常节律，不需要告警。
 
-#### 故障注入矩阵（压测用）
+##### 故障注入矩阵（压测用）
 
 每个场景 60s，都带 `--video-loops 0 --audio1-loops 0`：
 
@@ -1082,7 +1148,7 @@ cd build/linux-x86_64
 
 每种故障**都有专属响应字段**：如果某场景跑出来跟 baseline 完全一样，说明通路没正确传递 PTS。
 
-#### 验收判据
+##### 验收判据
 
 产物侧（用 `ffprobe` 导 `pts_time` 后统计）：
 
@@ -1094,11 +1160,161 @@ cd build/linux-x86_64
 | 音频 PTS 间隔异常（<16ms 或 >30ms） | 0 次 |
 | 最终 `avDiff` | ≤ ±12ms（音频时钟 1024 样本量化抖动下限） |
 
-#### 已知时间轴行为
+##### 已知时间轴行为
 
 两路音频 `speed` 不同时，输出帧数由**输出时钟**决定而非各路之和
 （旧实现会让输出帧数 ≈ 各路帧数之和，60s 墙钟产出 114s 音频，flv Duration 虚增一倍）。
 改按 `base + 已输出样本数 / 采样率` 累加后，Duration 与 wallclock 一致（实测 60s → 60.02s）。
+
+### 10.3 UI demo
+
+Android 和 iOS 两个 App 的界面和设置项是对齐的：
+
+* **上半部分**：状态（空闲 / 等待授权 / 连接中 / 直播中）、开始 / 停止按钮、静音、关画面、实时码率和统计、事件日志。
+  日志里会显示 `onPrepared` / `onError` / `onNotify` 等回调，包括 `EncoderFallback`。
+* **下半部分**：设置页，直播期间置灰不可改。每次点「开始」时读一次设置，所以改完设置要停播后重新开始才生效。
+* **启动时**：在后台探测一次本机可用的编码器，结果写进日志（`本机可用编码器 视频: … 音频: …`），见第 8 节。
+
+| 设置分组 | 设置项 | 说明 |
+| - | - | - |
+| 输出 | 输出方式 / 推流地址 / 封装格式 | 推流（RTMP / SRT）或录制到本地文件；`flv` / `mpegts` |
+| 视频 | 视频源 | **屏幕录制**或**测试图案**（NV12 彩条 + 移动白块，经 `PushExternalVideoFrame` 注入，模拟器 / 排查采集问题用） |
+| | 分辨率 / 方向 / 帧率 / 码率 / 关键帧间隔 | 540P / 720P / 1080P；方向可选跟随屏幕、横屏、竖屏 |
+| | 视频编码器 / 性能模式 | 硬编或 `libopenh264`；CPU / GPU。硬编打不开时内核会自动回落 |
+| 音频 | 麦克风 / 系统内录 / 测试音 | 三者可叠加，由内核混流；测试音是 1kHz 正弦，每秒响 0.5s，便于听出断音 |
+| | 编码器 / 码率 / 采样率 / 声道 | — |
+| 高级 | 断流告警阈值 | 即 `SetAVTimeout` |
+
+#### 10.3.1 Android（`demo/android`）
+
+**工程结构**：Gradle 宿主工程在 `ide/android`，它本身不放源码，只做聚合：
+
+| Gradle 模块 | 目录 | 内容 |
+| - | - | - |
+| `:tgcapture` | `bindings/android` | SDK（AAR）：Java API `com.tencent.tgcapture.*` + JNI 胶水，生成 `libtgcapture_jni.so`。通过 `externalNativeBuild` 引入仓库根目录的 `CMakeLists.txt` |
+| `:demo` | `demo/android` | Kotlin 开播测试 App，依赖 `:tgcapture` |
+
+改了内核 C++ 后直接 Run，Gradle 会增量重编 `.so`。
+
+**环境要求**：JDK 17（AGP 8.10 要求；可以直接用 Android Studio 自带的 JBR）、Android SDK 36、
+NDK `29.0.14033849`、CMake `4.1.1`。目前只编 `arm64-v8a`，可以跑在 arm64 真机或 Apple Silicon 上的 arm64 模拟器上。
+
+| 本机版本不一致时 | 改法 |
+| - | - |
+| NDK / CMake 版本 | `ide/android/gradle.properties` 中设置 `tg.ndkVersion=…` / `tg.cmakeVersion=…` |
+| 依赖目录 | `-PTG_3RD_ROOT=<dir>`，或环境变量 `TG_3RD_ROOT`；都不给时自动探测同级的 `TGCapture3rd` |
+| ABI | `bindings/android` 和 `demo/android` 两个 `build.gradle.kts` 里的 `abiFilters` 要一起改，并确保 `TGCapture3rd` 有对应 ABI 的库 |
+
+**构建**
+
+```bash
+# IDE：Android Studio 打开 ide/android（或执行下面这条，会打印路径并打开）
+python3 scripts/build.py --platform android --ide
+#   运行配置选 demo，点 Run 即可编译、安装并启动
+
+# 命令行（JAVA_HOME 指向 JDK 17）
+cd ide/android
+export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"   # macOS 示例
+./gradlew :demo:assembleDebug      # → demo/android/build/outputs/apk/debug/demo-debug.apk
+./gradlew :demo:installDebug       # 编译并安装到已连接的设备 / 模拟器
+./gradlew :tgcapture:assembleRelease   # 只出 SDK：bindings/android/build/outputs/aar/
+```
+
+> `python3 scripts/build.py --platform android --ndk …` 只编内核静态库 `libtgcapture.a`，不含 JNI，也不生成 App；
+> 要构建 demo 请走 Gradle。
+
+**使用**
+
+1. 打开 App，日志里会先出现本机可用编码器。
+2. 在设置页选好输出方式和视频 / 音频源，点「开始」。
+   * 选了麦克风或内录：会申请录音权限（Android 13+ 还会申请通知权限，拒绝不影响开播）。
+   * 选了屏幕录制或系统内录（需 Android 10+）：会弹出系统录屏授权，同意后启动前台服务 `TGProjectionService` 拿到 MediaProjection。
+   * 两者都没选（测试图案 + 测试音）：不申请任何权限，直接开播。
+3. 直播中可以切换静音或关画面；点「停止」结束。推流写失败（`MuxWriteFailed`）时会自动停播。
+
+| 场景 | 推荐设置 |
+| - | - |
+| 模拟器自测（无屏幕授权、无麦克风） | 视频源选测试图案，音频只开测试音，输出到本地文件 |
+| 真机录屏推流 | 视频源选屏幕录制，开麦克风，推流地址填 `rtmp://…` |
+| 系统内录 | 打开「系统内录」，只能录到允许被捕获的 App 的声音（AudioPlaybackCapture 的限制） |
+
+**取产物和日志**
+
+```bash
+adb pull /sdcard/Android/data/com.tencent.tgcapture.demo/files/records   # 本地录制 tgcapture_<时间>.flv|ts
+adb pull /sdcard/Android/data/com.tencent.tgcapture.demo/files/logs      # 内核滚动日志
+adb logcat -s 'TGCapture:*'                                              # 完整内核日志（界面上只显示回调事件）
+```
+
+**命令行驱动 UI demo**（无人值守回归时用；设置项保存在 SharedPreferences 里，key 见 `res/xml/preferences.xml`）：
+
+```bash
+P=com.tencent.tgcapture.demo; F=shared_prefs/${P}_preferences.xml
+adb shell run-as $P cat $F > prefs.xml          # 导出当前设置，按需修改，例如 pref_video_codec / pref_perf_mode
+adb push prefs.xml /data/local/tmp/p.xml && adb shell "cat /data/local/tmp/p.xml | run-as $P sh -c 'cat > $F'"
+adb shell am force-stop $P && adb shell am start -n $P/.MainActivity
+adb shell input tap <x> <y>                     # 点开始 / 停止；坐标可用 uiautomator dump 查 btn_start
+```
+
+模拟器（API 36，`sdk_gphone64_arm64`）上的实测结果：测试图案 + 测试音录制到文件，`h264_mediacodec` 在 CPU / GPU 模式下都正常出流。
+把编码器设成本机不存在的 `h264_videotoolbox` / `aac_at` 时，日志出现两条 `EncoderFallback`，回落到 `libopenh264` + `aac` 后录出的文件可以正常解析。
+
+#### 10.3.2 iOS（`demo/ios`）
+
+**工程结构**：`demo/ios/CMakeLists.txt` 由仓库根目录的 `CMakeLists.txt` 引入（条件：`TG_PLATFORM=ios` 且 `TG_BUILD_DEMO=ON`，默认开启），
+生成 `TGCaptureDemo` 这个 App target。代码是纯 UIKit，没有 storyboard；部署目标为 iOS 14。
+
+> `TGCapture3rd` 的 iOS 库**只有 arm64 真机切片**，所以 demo 只能跑在真机上，不支持模拟器。
+
+**构建**
+
+```bash
+# IDE（推荐）：生成 build/ios-fat-xcode/TGCapture.xcodeproj 并用 Xcode 打开，scheme 默认已选 TGCaptureDemo
+python3 scripts/build.py --platform ios --ide --team <10 位 Team ID> [--bundle-id com.xxx.tgdemo]
+#   连上真机，点 Run。Team ID 也可以用环境变量 TG_IOS_TEAM_ID 传入；
+#   个人账号需要把 Bundle ID 改成全局唯一值（默认 com.tencent.tgcapture.demo）
+
+# 命令行（Makefiles）：生成 build/ios-fat/demo/ios/TGCaptureDemo.app（未签名，只用于检查能否编过）
+python3 scripts/build.py --platform ios [--build-type Debug]
+# 不需要 demo 时加 --no-demo，只出 build/ios-fat/libtgcapture.a
+```
+
+> 签名信息要通过 `--team` / `--bundle-id` 传入。在 Xcode 里手动改的 Signing 设置，下次重新生成工程时会被覆盖。
+> Xcode 工程（`ios-fat-xcode`）和命令行构建（`ios-fat`）使用不同目录，因为同一目录换生成器时 CMake 会报错。
+
+**使用**
+
+1. 首次安装后，需要在「设置 → 通用 → VPN 与设备管理」里信任开发者证书。
+2. 打开 App，日志里会先出现本机可用编码器。默认配置为 `h264_videotoolbox` + `aac_at` + GPU 模式。
+   当前 iOS 版 ffmpeg 没有编进 `aac_at`，所以开播时日志会出现一条 `EncoderFallback audio:aac_at->aac`，属于正常现象；
+   想用 fdk，在设置里把音频编码器改成 `libfdk_aac`。
+3. 点「开始」：开麦克风时会申请麦克风权限；选屏幕录制时 ReplayKit 会弹出录屏确认。
+4. 静音、关画面、停止的用法和 Android 一致。
+
+| 限制 | 说明 |
+| - | - |
+| 屏幕录制范围 | ReplayKit 应用内录制，**只能录本 App 的画面**；系统级录屏需要 Broadcast Upload Extension（未实现） |
+| 系统内录 | 不支持（同样需要 Broadcast Upload Extension），设置页里没有这一项 |
+
+**取产物和日志**：Info.plist 已开启文件共享（`UIFileSharingEnabled`），可以在「文件」App → 我的 iPhone → TGCaptureDemo，
+或者 Finder 的设备页 → 文件，取出 `Documents/records`（本地录制文件）和 `Documents/logs`（内核日志）。
+Xcode 运行时，内核日志同时会输出到控制台（`Init(…, printLog=true)`）。
+
+### 10.4 自动化检查（单元测试 / 验收）
+
+```bash
+python3 scripts/build.py --platform linux          # 同时编出 tg_tests 和 demo
+build/linux-x86_64/tg_tests                        # 单元测试（也可 ctest；可带名称过滤，如 tg_tests Bus）
+build/linux-x86_64/tg_tests AudioEncoder           # 只跑音频编码器：真实 ffmpeg 编码 + 解码校验波形
+scripts/accept_av.sh                               # 音画同步验收（6 个场景并行，约 20s，失败返回非 0）
+```
+
+CI 平台里直接调用 `scripts/ci.sh`：先构建再跑单测；设置 `TG_CI_ACCEPT=1` 时再加跑验收，验收需要素材 `TG_MEDIA_DIR` 和系统 ffmpeg。
+依赖目录由 `TG_3RD_ROOT` 指定（见 9.3）。仓库不绑定具体的 CI 平台，没有提交 workflow 文件。
+
+`tg_tests` 在根 `CMakeLists.txt` 里只对 linux / windows 启用。在 Android 上跑的方法：用 NDK 交叉编译一份
+（新建一个 wrapper 工程，`add_subdirectory` 仓库根目录，再加 `tg_tests` target），然后 `adb push` 到 arm64 设备或模拟器上的 `/data/local/tmp` 执行。
+当前 88 个用例在 Android arm64 模拟器上全部通过。
 
 ---
 
@@ -1116,9 +1332,9 @@ cd build/linux-x86_64
 * **外部注入音频按 `AudioCapSourceType` 分路**：同一进程内多次 `PushExternalAudioFrame`
   传不同的 `type`（如 `TypeOfGameAudio4Slave` 与 `TypeOfGameMicphone4Slave`）会各自占用
   独立的混流通道并被真正做 sample-wise 相加；传相同 `type` 则串成同一时间轴（覆盖/交替）。
-* **Android / iOS 尚未在真机上运行验证**：两端已用 NDK r29（arm64-v8a, api 23）/ Xcode（arm64）
-  编译通过，但 `src/platform/android/*`、`src/platform/ios/*` 与 `TGCaptureSystemCapture.java`
-  的采集 / 硬编路径还没在设备上跑过；`tg_tests` 也只在桌面平台执行。
+* **Android / iOS 尚未在真机上运行验证**：Android 端已在 arm64 模拟器（API 36）上用 UI demo 跑通了测试图案 / 测试音
+  → `h264_mediacodec` / `libfdk_aac` → 本地文件这条链路，`tg_tests` 也在模拟器上通过（见 10.3.1、10.4）；
+  但真机上的录屏、麦克风、内录还没验证过。iOS 只验证了编译（真机 arm64，Xcode），还没有在设备上运行。
 * **日志**：`Init` 的 `logDir` / `printLog` 未实现；移动端未接 `__android_log_print` / `os_log` sink（见 4.6）。
 * 暂停静帧、水印、本地文件采集为接口占位（返回 0 或告警）。
 * `GetStatsInfo` 当前返回基础 JSON（码率 / 队列 / 编码器统计）。
