@@ -4,6 +4,19 @@
 
 ## Unreleased
 
+### 流量统计：实时值 + 累计值
+- 修复 `GetStatsInfo(bitrateInfo).bytes`：此前是 1s 码率窗口内的字节数（每秒清零），并不是注释里说的累计值，
+  现在改为真正的累计载荷字节。`bitrate_bps` / `packets` 的含义不变。
+- 修复实时码率在写出停滞后一直保持断流前的值：现在超过 2 个窗口（2s）没有新数据就归 0
+  （`GetTrafficStats` 同样受益）。
+- `bitrateInfo` 新增字段：
+  - 实时：`video_bps` / `audio_bps` / `io_bps`；
+  - 累计：`video_bytes` / `audio_bytes` / `io_bytes`；
+  - 其他：`avg_bps` / `duration_ms`。
+  其中 `io_*` 是封装后实际写进 AVIO 的量（含文件头尾）。实测录 flv / ts 时，`io_bytes` 与最终文件大小逐字节一致。
+- 新增 `src/core/TrafficMeter.h`（单写者、读端无锁），以及 `tests/test_traffic_meter.cpp`（8 个用例）。
+- Windows 命令行 demo 在 `Stop` 之后再打印一次 `bitrateInfo`，用来核对累计值。
+
 ### 编码器探测与回落
 - 新增 `ITGCapturerMgr::IsEncoderAvailable(name)` / `GetAvailableEncoders(video)`（`src/codec/EncoderProbe.*`）：
   用最小参数真正 `avcodec_open2` 一次判定可用性，进程内缓存。Java 侧对应

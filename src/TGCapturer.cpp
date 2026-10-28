@@ -1454,7 +1454,7 @@ int TGCapturer::SetAVTimeout(int64_t audioTimeoutMs, int64_t videoTimeoutMs)
 // ------------------------------------------------------------------ 统计
 // 全部走 JSON（简单 escape 不处理，key 为已知 ASCII，value 来自内部数值/枚举字符串）。
 // 对齐 MediaX ESCapturer::GetStatsInfo：
-//   bitrateInfo  → 下行 bitrate_bps + 累计字节/包
+//   bitrateInfo  → 实时码率（总 / 音视频分路 / 封装后）+ 累计字节（同口径）/ 包数 / 平均码率 / 时长
 //   videoInfo    → encoder codec/encoded/dropped/pending/latency_us
 //   audioInfo    → encoder codec/encoded/pending/latency_us + mixer 每路诊断
 //   pktInfo      → muxer 底层 Stats（含 stall）
@@ -1497,14 +1497,22 @@ std::string TGCapturer::GetStatsInfo(StatsInfoType type)
         (type == StatsInfoType::audioInfo || type == StatsInfoType::metaInfo) ? mixerDiagJson() : std::string();
     std::vector<char> buffer(1024 + muxerJson.size() + diag.size());
     switch (type) {
-        case StatsInfoType::bitrateInfo:
-            // 对齐 MediaX：bitrate + bytes + packets，统一报告"写出到网络/文件"的字节量
+        case StatsInfoType::bitrateInfo: {
+            // 实时 + 累计两种口径（字段说明见 ITGCapturer.h GetStatsInfo）。
+            // 兼容：bitrate_bps / packets 含义不变；bytes 此前误为"1s 窗口内字节数"（每秒清零），现为真正的累计值
+            const Muxer::TrafficSnapshot t = m_muxer ? m_muxer->Traffic() : Muxer::TrafficSnapshot{};
             snprintf(buffer.data(), buffer.size(),
-                     "{\"bitrate_bps\":%.0f,\"bytes\":%llu,\"packets\":%llu}",
-                     m_muxer ? m_muxer->TrafficBps() : 0.0f,
-                     m_muxer ? static_cast<unsigned long long>(m_muxer->WrittenBytes()) : 0ULL,
-                     m_muxer ? static_cast<unsigned long long>(m_muxer->WrittenPackets()) : 0ULL);
+                     "{\"bitrate_bps\":%llu,\"video_bps\":%llu,\"audio_bps\":%llu,\"io_bps\":%llu,"
+                     "\"bytes\":%llu,\"video_bytes\":%llu,\"audio_bytes\":%llu,\"io_bytes\":%llu,"
+                     "\"packets\":%llu,\"avg_bps\":%llu,\"duration_ms\":%lld}",
+                     static_cast<unsigned long long>(t.bps), static_cast<unsigned long long>(t.videoBps),
+                     static_cast<unsigned long long>(t.audioBps), static_cast<unsigned long long>(t.ioBps),
+                     static_cast<unsigned long long>(t.bytes), static_cast<unsigned long long>(t.videoBytes),
+                     static_cast<unsigned long long>(t.audioBytes), static_cast<unsigned long long>(t.ioBytes),
+                     static_cast<unsigned long long>(t.packets), static_cast<unsigned long long>(t.avgBps),
+                     static_cast<long long>(t.durationUs / 1000));
             break;
+        }
         case StatsInfoType::videoInfo:
             snprintf(buffer.data(), buffer.size(),
                      "{\"codec\":\"%s\",\"encoded\":%llu,\"dropped\":%llu,"

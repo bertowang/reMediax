@@ -108,8 +108,17 @@ public:
     // 非法入参返回 TGErr_InvalidArgument。可在运行期调用，立即生效。
     virtual int SetAVTimeout(int64_t audioTimeoutMs, int64_t videoTimeoutMs) = 0;
 
+    // 运行统计（扁平 JSON）。bitrateInfo 同时给出实时值与累计值：
+    //   实时（1s 窗口；写出停滞超过 2s 归 0）
+    //     bitrate_bps / video_bps / audio_bps  编码载荷码率：合计 / 视频 / 音频（与编码码率设置直接可比）
+    //     io_bps                               封装后实际写出速率（含 flv/ts 封装开销 ≈ 上行带宽）
+    //   累计（自第一包起；Stop 后仍可读，下次 Prepare 清零）
+    //     bytes / video_bytes / audio_bytes    编码载荷字节：合计 / 视频 / 音频
+    //     io_bytes                             封装后写出字节（含文件头尾 ≈ 文件大小 / 上行总流量）
+    //     packets                              已写出包数
+    //     avg_bps / duration_ms                平均载荷码率 = bytes / duration；duration 自第一包起
     virtual std::string GetStatsInfo(StatsInfoType type) = 0;
-    virtual float GetTrafficStats() = 0;      // bps
+    virtual float GetTrafficStats() = 0;      // 实时载荷码率 bps（= bitrateInfo.bitrate_bps）
 
     // ---------------- 外部帧注入（Android/iOS/游戏引擎） ----------------
     // 两个接口的失败码：

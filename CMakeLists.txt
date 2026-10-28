@@ -123,6 +123,7 @@ elseif(TG_PLATFORM STREQUAL "linux")
 endif()
 
 add_library(tgcapture STATIC ${TG_CORE_SOURCES} ${TG_PLATFORM_SOURCES})
+set_target_properties(tgcapture PROPERTIES FOLDER "sdk")   # VS 解决方案文件夹
 
 # 版本号只在 project(VERSION) 写一处，GetVersion() 通过宏取用
 target_compile_definitions(tgcapture PRIVATE TGCAPTURE_VERSION_STRING="${PROJECT_VERSION}")
@@ -156,35 +157,45 @@ else()
 endif()
 
 # ---------------------------------------------------------------- demo
+# Windows 可执行程序（命令行 demo / 图形界面测试工具）共用的运行时配置：
+#   - ffmpeg 是 DLL：把 <3rd>/ffmpeg/windows/bin/*.dll 拷到 exe 同目录，
+#     这样 VS 里 F5、以及直接双击 exe 都能跑，不必手工改 PATH；
+#   - VS2022 调试工作目录/环境变量指向 exe 所在目录；
+#   - 在 VS 解决方案里归到 demo 文件夹。
+function(tg_setup_windows_app target)
+    if(TG_FFMPEG_BIN_DIR)
+        file(GLOB _tg_ffmpeg_dlls "${TG_FFMPEG_BIN_DIR}/*.dll")
+        foreach(dll IN LISTS _tg_ffmpeg_dlls)
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${dll}" "$<TARGET_FILE_DIR:${target}>"
+                COMMENT "拷贝 ${dll} 到 ${target} 输出目录")
+        endforeach()
+    endif()
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /utf-8 /EHsc)
+        set_target_properties(${target} PROPERTIES
+            FOLDER "demo"
+            VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:${target}>"
+            VS_DEBUGGER_ENVIRONMENT "PATH=$<TARGET_FILE_DIR:${target}>;%PATH%")
+    endif()
+endfunction()
+
 if(TG_BUILD_DEMO AND TG_PLATFORM STREQUAL "windows")
+    set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+
     add_executable(tg_capture_demo demo/windows/main.cpp)
     # psapi：demo 每轮 Stop 后打印进程句柄/GDI/私有内存快照，用于重开泄漏回归
     target_link_libraries(tg_capture_demo PRIVATE tgcapture psapi)
-    if(MSVC)
-        target_compile_options(tg_capture_demo PRIVATE /utf-8 /EHsc)
-    endif()
+    tg_setup_windows_app(tg_capture_demo)
 
-    # ffmpeg 是 DLL：把 <3rd>/ffmpeg/windows/bin/*.dll 拷到 exe 同目录，
-    # 这样 VS 里 F5、以及直接双击 exe 都能跑，不必手工改 PATH。
-    if(TG_FFMPEG_BIN_DIR)
-        file(GLOB TG_FFMPEG_DLLS "${TG_FFMPEG_BIN_DIR}/*.dll")
-        foreach(dll IN LISTS TG_FFMPEG_DLLS)
-            add_custom_command(TARGET tg_capture_demo POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        "${dll}" "$<TARGET_FILE_DIR:tg_capture_demo>"
-                COMMENT "拷贝 ${dll} 到 demo 输出目录")
-        endforeach()
-    endif()
+    # 图形界面开播测试工具（Win32 对话框），见 demo/windows_gui
+    add_subdirectory(demo/windows_gui)
 
-    # VS2022 体验：把 demo 设为启动工程，调试工作目录/环境变量指向 exe 所在目录
-    if(MSVC)
-        if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.21")
-            set_property(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-                         PROPERTY VS_STARTUP_PROJECT tg_capture_demo)
-        endif()
-        set_target_properties(tg_capture_demo PROPERTIES
-            VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:tg_capture_demo>"
-            VS_DEBUGGER_ENVIRONMENT "PATH=$<TARGET_FILE_DIR:tg_capture_demo>;%PATH%")
+    # VS2022 打开解决方案后 F5 直接启动图形界面工具
+    if(MSVC AND CMAKE_VERSION VERSION_GREATER_EQUAL "3.21")
+        set_property(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                     PROPERTY VS_STARTUP_PROJECT tg_capture_gui)
     endif()
 endif()
 
@@ -212,12 +223,14 @@ if(TG_BUILD_TESTS AND (TG_PLATFORM STREQUAL "linux" OR TG_PLATFORM STREQUAL "win
         tests/test_queue.cpp
         tests/test_bus.cpp
         tests/test_health.cpp
+        tests/test_traffic_meter.cpp
         tests/test_error_codes.cpp
         tests/test_video_pts.cpp
         tests/test_audio_mixer.cpp
         tests/test_audio_encoder.cpp
         tests/test_encoder_probe.cpp)
     target_include_directories(tg_tests PRIVATE tests)
+    set_target_properties(tg_tests PROPERTIES FOLDER "tests")
     target_link_libraries(tg_tests PRIVATE tgcapture)
     if(TG_PLATFORM STREQUAL "windows")
         # 平台层实测：直接驱动真实 WASAPI / GDI / DXGI 源，验证失败与重开路径不泄漏

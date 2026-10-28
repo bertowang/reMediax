@@ -21,6 +21,7 @@
 #include "core/Health.h"
 #include "core/Queue.h"
 #include "core/Thread.h"
+#include "core/TrafficMeter.h"
 
 extern "C"
 {
@@ -61,8 +62,20 @@ public:
     void SetInterleaveUs(int64_t us) noexcept { m_interleaveUs.store(us > 0 ? us : 0); }
     [[nodiscard]] int64_t InterleaveUs() const noexcept { return m_interleaveUs.load(); }
 
-    [[nodiscard]] float TrafficBps() const;
-    [[nodiscard]] uint64_t WrittenBytes() const noexcept { return m_bytes.load(); }
+    // 流量统计：实时（1s 窗口，停滞归 0）+ 累计（自第一包起）两种口径，见 core/TrafficMeter.h。
+    //   载荷 = 编码器产出的包大小（可分音视频，和编码码率设置直接可比）；
+    //   封装 = 实际写进 AVIO 的字节（含 flv tag / ts 分包等封装开销，≈ 文件大小 / 推流上行量）
+    struct TrafficSnapshot
+    {
+        uint64_t packets = 0;
+        uint64_t bps = 0, videoBps = 0, audioBps = 0, ioBps = 0;               // 实时
+        uint64_t bytes = 0, videoBytes = 0, audioBytes = 0, ioBytes = 0;       // 累计
+        uint64_t avgBps = 0;                                                   // 累计载荷 / 时长
+        int64_t durationUs = 0;                                                // 自第一包起
+    };
+    [[nodiscard]] TrafficSnapshot Traffic() const;
+    [[nodiscard]] float TrafficBps() const;   // 实时载荷码率
+    [[nodiscard]] uint64_t WrittenBytes() const noexcept { return m_traffic.TotalBytes(); }   // 累计载荷字节
     [[nodiscard]] uint64_t WrittenPackets() const noexcept { return m_packets.load(); }
     [[nodiscard]] uint64_t FailedPackets() const noexcept { return m_writeFail.Failures(); }
     [[nodiscard]] std::string Stats() const;
@@ -72,7 +85,7 @@ protected:
 
 private:
     int WriteOne(core::AVPacketPtr packet, bool isVideo);
-    void UpdateBitrate(size_t bytes);
+    void UpdateTraffic(size_t payloadBytes, bool isVideo);
     void OnWriteResult(bool ok, int ret, int64_t startUs, int64_t endUs);
 
     // I/O 中断：返回 1 让 ffmpeg 立即放弃当前阻塞操作
@@ -91,9 +104,12 @@ private:
     std::unique_ptr<core::BoundedQueue<core::AVPacketPtr>> m_videoQueue;
     std::unique_ptr<core::BoundedQueue<core::AVPacketPtr>> m_audioQueue;
 
-    std::atomic<uint64_t> m_bytes{0};
     std::atomic<uint64_t> m_packets{0};
-    std::atomic<float> m_bps{0.0f};
+    core::TrafficMeter m_traffic;        // 载荷：音视频合计
+    core::TrafficMeter m_videoTraffic;   // 载荷：视频
+    core::TrafficMeter m_audioTraffic;   // 载荷：音频
+    core::TrafficMeter m_ioTraffic;      // 封装后写进 AVIO 的字节（含文件头 / 尾）
+    int64_t m_ioPos = 0;                 // 上次结算时的 avio_tell；仅写包线程（及其停止后的 Close）访问
     std::atomic_bool m_opened{false};
     std::atomic_bool m_headerWritten{false};
 
@@ -105,7 +121,6 @@ private:
     std::atomic<int64_t> m_interleaveUs{350000};
     std::atomic<uint64_t> m_diagStallVideo{0};
     std::atomic<uint64_t> m_diagStallAudio{0};
-    int64_t m_lastStatUs = 0;
 
     // ---- I/O 超时与中断 ----
     std::atomic_bool m_abort{false};

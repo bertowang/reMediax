@@ -59,9 +59,11 @@ int Muxer::Open(const MuxerParams& params, AVCodecContext* videoCtx, AVCodecCont
     m_videoQueue->Reopen();
     m_audioQueue->Reopen();
     m_packets.store(0);
-    m_bytes.store(0);
-    m_bps.store(0.0f);
-    m_lastStatUs = core::MonotonicClock::NowUs();
+    m_traffic.Reset();
+    m_videoTraffic.Reset();
+    m_audioTraffic.Reset();
+    m_ioTraffic.Reset();
+    m_ioPos = 0;   // 文件头在 write_header 里写出，随第一包一起结算进封装字节
     m_diagStallVideo.store(0);
     m_diagStallAudio.store(0);
     m_lastVideoArrivalUs.store(0);
@@ -174,7 +176,6 @@ int Muxer::Open(const MuxerParams& params, AVCodecContext* videoCtx, AVCodecCont
 
     m_headerWritten.store(true);
     m_opened.store(true);
-    m_lastStatUs = core::MonotonicClock::NowUs();
     TG_LOGI("Muxer: 就绪 fmt=%s url=%s connectTimeout=%lldms ioTimeout=%lldms", m_format.c_str(),
             m_urlSafe.c_str(), static_cast<long long>(m_connectTimeoutUs / 1000),
             static_cast<long long>(m_ioTimeoutUs / 1000));
@@ -259,6 +260,21 @@ void Muxer::Close()
                 ReportError(TGErr_MuxTrailerFailed, "write trailer failed", ret);
             } else if (ret < 0) {
                 TG_LOGW("Muxer: 写文件尾被中断（拆除路径）ret=%d", ret);
+            }
+            // 文件尾也计入封装字节，累计值才能和最终文件大小对上（写包线程此时已停止）。
+            // 不能只看 avio_tell：flv 写尾会 seek 回文件头回填 duration/filesize，之后位置停在头部附近，
+            // 而写尾期间 lavf 交织队列里的残包 + EOS tag 已经写到了文件末尾。
+            // 可 seek 的输出（本地文件）取真实大小；推流不可 seek，写尾不会回跳，tell 即末尾
+            if (m_fmt->pb) {
+                avio_flush(m_fmt->pb);
+                int64_t end = (m_fmt->pb->seekable & AVIO_SEEKABLE_NORMAL) ? avio_size(m_fmt->pb) : -1;
+                if (end < 0) {
+                    end = avio_tell(m_fmt->pb);
+                }
+                if (end > m_ioPos) {
+                    m_ioTraffic.Add(static_cast<uint64_t>(end - m_ioPos), core::MonotonicClock::NowUs());
+                    m_ioPos = end;
+                }
             }
         }
         if (!(m_fmt->oformat->flags & AVFMT_NOFILE) && m_fmt->pb) {
@@ -422,7 +438,7 @@ int Muxer::WriteOne(core::AVPacketPtr packet, bool isVideo)
                           core::AvErr(ret), isVideo ? 1 : 0, static_cast<long long>(ptsUs));
         return -3;
     }
-    UpdateBitrate(static_cast<size_t>(packetSize));
+    UpdateTraffic(static_cast<size_t>(packetSize), isVideo);
     m_packets.fetch_add(1);
     return 0;
 }
@@ -461,22 +477,43 @@ void Muxer::OnWriteResult(bool ok, int ret, int64_t startUs, int64_t endUs)
     }
 }
 
-void Muxer::UpdateBitrate(size_t bytes)
+void Muxer::UpdateTraffic(size_t payloadBytes, bool isVideo)
 {
-    m_bytes.fetch_add(bytes);
     const int64_t nowUs = core::MonotonicClock::NowUs();
-    const int64_t elapsed = nowUs - m_lastStatUs;
-    if (elapsed >= 1000000) {
-        const uint64_t bytesDelta = m_bytes.load();
-        m_bps.store(static_cast<float>(bytesDelta * 8) / (elapsed / 1000000.0f));
-        m_bytes.store(0);
-        m_lastStatUs = nowUs;
+    m_traffic.Add(payloadBytes, nowUs);
+    (isVideo ? m_videoTraffic : m_audioTraffic).Add(payloadBytes, nowUs);
+    // 封装字节取 AVIO 位置增量：flush_packets=1 下每包写完即刷出，增量就是本包实际写出的量
+    // （flv tag 头、ts 188 字节分包 / PAT·PMT·PCR 等开销都在里面）
+    if (m_fmt && m_fmt->pb) {
+        const int64_t pos = avio_tell(m_fmt->pb);
+        if (pos > m_ioPos) {
+            m_ioTraffic.Add(static_cast<uint64_t>(pos - m_ioPos), nowUs);
+            m_ioPos = pos;
+        }
     }
 }
 
 float Muxer::TrafficBps() const
 {
-    return m_bps.load();
+    return static_cast<float>(m_traffic.Bps(core::MonotonicClock::NowUs()));
+}
+
+Muxer::TrafficSnapshot Muxer::Traffic() const
+{
+    const int64_t nowUs = core::MonotonicClock::NowUs();
+    TrafficSnapshot s;
+    s.packets = m_packets.load();
+    s.bps = m_traffic.Bps(nowUs);
+    s.videoBps = m_videoTraffic.Bps(nowUs);
+    s.audioBps = m_audioTraffic.Bps(nowUs);
+    s.ioBps = m_ioTraffic.Bps(nowUs);
+    s.bytes = m_traffic.TotalBytes();
+    s.videoBytes = m_videoTraffic.TotalBytes();
+    s.audioBytes = m_audioTraffic.TotalBytes();
+    s.ioBytes = m_ioTraffic.TotalBytes();
+    s.avgBps = m_traffic.AverageBps(nowUs);
+    s.durationUs = m_traffic.ElapsedUs(nowUs);
+    return s;
 }
 
 std::string Muxer::Stats() const

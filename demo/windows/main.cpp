@@ -467,6 +467,8 @@ int main(int argc, char** argv)
 
     printf("[demo] 最终统计: %s\n", capturer->GetStatsInfo(TGCapture::StatsInfoType::videoInfo).c_str());
     capturer->Stop();
+    // 累计值 Stop 后仍可读：io_bytes 已含文件尾，录本地文件时应与最终文件大小一致
+    printf("[demo] 停止后累计: %s\n", capturer->GetStatsInfo(TGCapture::StatsInfoType::bitrateInfo).c_str());
     PrintResourceSnapshot("round=0");
 
     // 并发压测：Prepare 与 Stop 交错冲击，验证生命周期互斥（不死锁、不野线程、不崩溃）
