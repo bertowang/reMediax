@@ -19,6 +19,7 @@
 #include "TGCapturer.h"
 #include "core/PauseFrame.h"
 #include "core/Watermark.h"
+#include "test_media.h"
 #include "tg_test.h"
 
 extern "C" {
@@ -40,73 +41,7 @@ std::string TmpPath(const char* name)
     return (std::filesystem::temp_directory_path() / name).string();
 }
 
-// ---- 最小 PNG 编码（RGB8、deflate 存储块、不压缩）：测试里造图片用，不依赖 zlib 头文件 ----
-uint32_t Crc32(const uint8_t* data, size_t n, uint32_t crc = 0)
-{
-    crc = ~crc;
-    for (size_t i = 0; i < n; ++i) {
-        crc ^= data[i];
-        for (int k = 0; k < 8; ++k) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
-    }
-    return ~crc;
-}
-
-void PutBe32(std::vector<uint8_t>& out, uint32_t v)
-{
-    for (int s = 24; s >= 0; s -= 8) out.push_back(static_cast<uint8_t>(v >> s));
-}
-
-void PutChunk(std::vector<uint8_t>& out, const char* type, const std::vector<uint8_t>& body)
-{
-    PutBe32(out, static_cast<uint32_t>(body.size()));
-    std::vector<uint8_t> tb(type, type + 4);
-    tb.insert(tb.end(), body.begin(), body.end());
-    out.insert(out.end(), tb.begin(), tb.end());
-    PutBe32(out, Crc32(tb.data(), tb.size()));
-}
-
-bool WriteSolidPng(const std::string& path, int w, int h, uint8_t r, uint8_t g, uint8_t b)
-{
-    std::vector<uint8_t> raw;
-    for (int y = 0; y < h; ++y) {
-        raw.push_back(0);   // filter none
-        for (int x = 0; x < w; ++x) {
-            raw.push_back(r);
-            raw.push_back(g);
-            raw.push_back(b);
-        }
-    }
-    std::vector<uint8_t> z{0x78, 0x01};
-    size_t pos = 0;
-    while (pos < raw.size()) {
-        const size_t len = std::min<size_t>(65535, raw.size() - pos);
-        z.push_back(pos + len == raw.size() ? 1 : 0);
-        z.push_back(static_cast<uint8_t>(len));
-        z.push_back(static_cast<uint8_t>(len >> 8));
-        z.push_back(static_cast<uint8_t>(~len));
-        z.push_back(static_cast<uint8_t>(~len >> 8));
-        z.insert(z.end(), raw.begin() + static_cast<long>(pos), raw.begin() + static_cast<long>(pos + len));
-        pos += len;
-    }
-    uint32_t a = 1, bsum = 0;
-    for (uint8_t c : raw) {
-        a = (a + c) % 65521;
-        bsum = (bsum + a) % 65521;
-    }
-    PutBe32(z, (bsum << 16) | a);
-
-    std::vector<uint8_t> png{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
-    std::vector<uint8_t> ihdr;
-    PutBe32(ihdr, static_cast<uint32_t>(w));
-    PutBe32(ihdr, static_cast<uint32_t>(h));
-    ihdr.insert(ihdr.end(), {8, 2, 0, 0, 0});   // 8bit RGB
-    PutChunk(png, "IHDR", ihdr);
-    PutChunk(png, "IDAT", z);
-    PutChunk(png, "IEND", {});
-    std::ofstream f(path, std::ios::binary);
-    f.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
-    return f.good();
-}
+using tgmedia::WriteSolidPng;
 
 core::FramePtr MakeNv12(int w, int h, uint8_t y, uint8_t uv)
 {

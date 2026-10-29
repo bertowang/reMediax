@@ -73,6 +73,12 @@ public:
                                               VideoScaleStrategy strategy = VideoScaleStrategy::SCALE_FIT_V0) = 0;
     virtual IVideoSource* CreateWindowCapture(void* handle, VideoCapMode mode = WGC,
                                               VideoScaleStrategy strategy = VideoScaleStrategy::SCALE_FIT_V0) = 0;
+    // 本地视频文件作主画面（mp4 / mov / flv 里的 H.264），按文件时间戳以实时节奏出帧，按原生尺寸采集、由编码器缩放。
+    // loopPlay = true 播完从头再来；false 播完停在最后一帧（继续按帧率出帧，不触发断流看护），
+    // 并发 EsCap_Notify_LocalFile_EOF（content = "video:main"）。index 仅用于日志。
+    // 文件里的音轨不会自动加入：需要声音请另外 AddAudioSource({File, path})（两者各自按墙钟播放，
+    // 同时开始时音画对齐，循环多遍后可能有一帧以内的累计偏差）。
+    // 失败返回 nullptr：文件打不开 / 没有视频轨 / 解码器未编进；视频源已打开（预览 / 推流中）时不能更换主画面
     virtual IVideoSource* CreateLocalFileCapture(int index, const std::string& filePath, bool loopPlay = false) = 0;
 
     // 失败：TGErr_InvalidArgument（空指针，或对象不是本 SDK 创建的源）
@@ -210,6 +216,26 @@ public:
     // 失败：TGErr_InvalidArgument（id 不存在 / 不是 External / 参数非法）/ TGErr_InvalidState（未开播）
     virtual int PushAudioSourceFrame(const std::string& id, const uint8_t* data, int size, int sampleRate,
                                      int channels, int64_t ptsUs) = 0;
+
+    // ---------------- 视频叠加层：暂存 / 提交（任意状态可调，推流不中断） ----------------
+    // 修改先进暂存区，CommitOverlays 时一次性原子生效：推流画面在同一帧里从旧场景切到新场景，
+    // 不会出现"改了一半"的中间画面（例如同时换掉三张图、挪动画中画）。
+    // 预览画面显示暂存场景（未提交的修改在预览里先看到，确认后再提交）；推流画面只含已提交的。
+    // 场景跨 Prepare / Stop 保留，直到移除或销毁。视频层在暂存时就开始解码播放（预览可见），
+    // 提交只是让推流画面也用上它；只修改位置 / 透明度 / 层级 / 可见性时沿用原内容，视频不会从头播。
+    //
+    // StageOverlay：新增，或整体替换同 id 的层。失败：
+    //   TGErr_InvalidArgument（id 非法 / 几何或透明度越界 / 路径为空 / 文件打不开 / 图片解不出 / 没有视频轨）
+    //   TGErr_NotSupported（视频轨的解码器未编进，目前只支持 H.264）
+    virtual int StageOverlay(const OverlayDesc& desc) = 0;
+    // 失败：TGErr_InvalidArgument（暂存区里没有该 id）
+    virtual int StageRemoveOverlay(const std::string& id) = 0;
+    // 暂存区 → 推流画面。没有改动时直接返回 0；有改动时生效后发 EsCap_Notify_Overlay_Committed
+    virtual int CommitOverlays() = 0;
+    // 丢弃未提交的修改（暂存区回到已提交的状态）
+    virtual int DiscardOverlayChanges() = 0;
+    // 当前的叠加层（staged = true 取暂存区，否则取已提交的），按绘制顺序（下层在前）
+    virtual int GetOverlays(std::vector<OverlayDesc>& overlays, bool staged = false) = 0;
 };
 
 }  // namespace TGCapture

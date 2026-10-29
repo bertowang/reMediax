@@ -55,7 +55,9 @@ enum NotifyMsgType
     EsCap_Notify_VideoMetaInfo_Changed = 1,
     EsCap_Notify_AudioMetaInfo_Changed = 10,
     EsCap_Notify_SystemFreeze = 20,
-    EsCap_Notify_LocalFile_EOF = 21,   // 文件源（loop = false）播放结束：content = 音频源 id
+    // 文件源（loop = false）播放结束。content 区分是哪个源：
+    //   音频源 id（AudioSourceKind::File）/ "video:main"（CreateLocalFileCapture 的主画面）/ "overlay:<id>"（视频叠加层）
+    EsCap_Notify_LocalFile_EOF = 21,
     // 断流恢复：与 TGErr_VideoCaptureStalled / TGErr_AudioCaptureStalled 配对，
     // 收到它表示该路又有数据了（data = 本次断流持续的毫秒数）
     EsCap_Notify_VideoCapture_Recovered = 30,
@@ -67,6 +69,8 @@ enum NotifyMsgType
     // 运行期音频源增删（AddAudioSource / RemoveAudioSource 成功后发出）：content = 音频源 id，data = 混流通道号
     EsCap_Notify_AudioSource_Added = 41,
     EsCap_Notify_AudioSource_Removed = 42,
+    // 叠加层场景已提交（CommitOverlays 有改动时发出，推流画面已切到新场景）：data = 提交后的叠加层数
+    EsCap_Notify_Overlay_Committed = 43,
 };
 
 // ------------------------------------------------------------------ 错误码
@@ -104,7 +108,7 @@ enum TGCaptureError : int32_t
     TGErr_InvalidArgument = -20,   // 入参非法：空指针、尺寸 ≤ 0、stride < width、采样率 / 声道数 ≤ 0、
                                    // 推流地址为空、源对象类型不匹配
     TGErr_NotSupported = -21,      // 当前平台 / 当前模式不支持：Linux 原生采集、非 Win/iOS 的外部硬件帧
-    TGErr_NotImplemented = -22,    // 接口占位，尚未实现（本地文件采集）
+    TGErr_NotImplemented = -22,    // 接口占位，尚未实现
     TGErr_Internal = -23,          // 内部资源创建失败（混流通道、静帧加载、水印纹理等）
 
     // ---- 运行期（Start 之后，只经 OnErrorCallback）----
@@ -360,6 +364,30 @@ struct AudioSourceLevel
     float rmsDb = -100.0f;
 };
 
+// ------------------------------------------------------------------ 视频叠加层
+enum class OverlayKind : int32_t
+{
+    Image = 0,       // 静态图片（png，带透明通道则按透明度混合）
+    VideoFile = 1,   // 本地视频文件（mp4 / mov / flv 里的 H.264），按实时节奏播放；画中画
+};
+
+// 叠加层：画在主画面（含暂停图）之上、水印之下，仅对 CPU 帧生效（GPU 硬件帧直通时跳过）。
+// 位置 / 大小用相对画布的比例描述，按每帧的实际尺寸换算成像素 —— 运行期切分辨率后自动跟随
+struct OverlayDesc
+{
+    std::string id;             // 唯一标识（字母数字 . _ -），必填
+    OverlayKind kind = OverlayKind::Image;
+    std::string path;
+    bool loop = true;           // VideoFile：播完从头再来；false = 播完停在最后一帧，发 EsCap_Notify_LocalFile_EOF
+    float x = 0.0f;             // 左上角，画布宽 / 高的比例，-1 ~ 1（允许部分移出画面）
+    float y = 0.0f;
+    float width = 0.25f;        // 画布宽的比例，(0, 2]
+    float height = 0.0f;        // 画布高的比例，[0, 2]；0 = 按素材宽高比由 width 推出
+    float opacity = 1.0f;       // 0 ~ 1
+    int32_t zOrder = 0;         // 大的在上；相同时按 id 字典序
+    bool visible = true;        // false = 保留该层但不画（视频层照常播放）
+};
+
 // ------------------------------------------------------------------ 预览
 enum class PreviewPixelFormat : int32_t
 {
@@ -367,7 +395,8 @@ enum class PreviewPixelFormat : int32_t
     Hardware = 1,   // hwHandle 有效：iOS CVPixelBufferRef / Windows ID3D11Texture2D*（仅 GPU 性能模式）
 };
 
-// 预览帧：与推流画面同源（含暂停图 / 水印 / 已提交的叠加层），未经编码前的缩放与变换。
+// 预览帧：与推流画面同源（含暂停图 / 水印 / 叠加层），未经编码前的缩放与变换。
+// 叠加层按**暂存场景**绘制：有未提交的修改时，预览先看到、推流画面要等 CommitOverlays 才变（见 StageOverlay）。
 // 指针只在回调期间有效；宿主需要保留就自行拷贝
 struct PreviewFrame
 {

@@ -4,6 +4,24 @@
 
 ## Unreleased
 
+### 本地视频文件源与视频叠加层（B7/B8）
+- `CreateLocalFileCapture(index, path, loop)` 落地：`capture/FileVideoSource`，纯 ffmpeg、三端共用。按文件时间戳以墙钟节奏出帧，
+  原生尺寸采集、编码器缩放；`loop = true` 无缝循环（下一遍的时间基 = 上一遍时长），`loop = false` 播完发
+  `EsCap_Notify_LocalFile_EOF`（content = `"video:main"`），之后按帧率重复最后一帧（不触发断流看护）。
+  落后墙钟 200ms 以上重新对齐、不追赶；文件不可用时当场返回 nullptr（不等到 Prepare）。文件里的音轨不自动加入。
+- `yuvj*`（全幅，手机录像常见）按 yuv* + 全幅标志建 sws 上下文并压到限幅输出：
+  直接传 yuvj* 时 sws 内部改写格式，`sws_getCachedContext` 每帧都判定参数不同而重建上下文（并每帧打 deprecated 告警）。
+- 视频叠加层（图片 / 视频文件画中画），staged / commit 两阶段：
+  `StageOverlay` / `StageRemoveOverlay` 只改暂存场景（预览画面立即可见），`CommitOverlays` 原子切换推流画面
+  （同一帧内要么全旧要么全新），`DiscardOverlayChanges` 丢弃暂存改动，`GetOverlays(list, staged)` 查询。
+  提交有改动时发 `EsCap_Notify_Overlay_Committed = 43`（data = 层数）。
+- `OverlayDesc`：位置 / 大小为画布比例（x / y ∈ [-1, 1]，w ∈ (0, 2]，h = 0 按素材宽高比），`opacity`、`zOrder`、`visible`、`loop`；
+  运行期切分辨率后按每帧实际尺寸自动跟随。图层顺序：主画面 → 暂停图 → 叠加层（按 zOrder）→ 水印。
+- 只改几何 / 透明度 / 层级 / 可见性时复用已加载内容：视频层不会从头播。视频层 EOF 的 content = `"overlay:<id>"`。
+- 合成器：out0（推流）画已提交场景，out1（预览）画暂存场景；两者相同时共享像素，不同才深拷贝一份单独合成。
+  缩放结果按 id@宽x高 缓存（libyuv），空闲 64 帧后清理。视频层各是一个 `vsrc.ovl.<n>` 节点，接合成器的动态输入口。
+- 新增 `tests/test_overlay.cpp`（10 个用例）与 `tests/test_media.h`（测试用 PNG / H.264 素材生成与解码）。
+
 ### 文件音频源（B7）
 - `AudioSourceKind::File`：`capture/FileAudioSource`，纯 ffmpeg 实现、三端共用。解封装 + 解码（AAC）+ 重采样到编码格式，
   每 10ms 一块按墙钟节拍送进混音器（时间戳按已送样本数推进，混音器测得漂移为 0；被挂起落后 200ms 以上重新对齐，不追赶）。

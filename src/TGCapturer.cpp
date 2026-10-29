@@ -1,6 +1,7 @@
 ﻿#include "TGCapturer.h"
 
 #include "capture/FileAudioSource.h"
+#include "capture/FileVideoSource.h"
 
 #include <algorithm>
 #include <chrono>
@@ -259,8 +260,28 @@ IVideoSource* TGCapturer::CreateWindowCapture(void* handle, VideoCapMode mode, V
 
 IVideoSource* TGCapturer::CreateLocalFileCapture(int index, const std::string& filePath, bool loopPlay)
 {
-    TG_LOGW("TGCapturer: 本地文件采集暂未实现（开播链路不涉及）");
-    return nullptr;
+    // 文件问题当场报出（返回 nullptr + 日志），不等到 Prepare 才以 OpenVideoSource 失败的形式冒出来
+    capture::FileVideoSource::Info info;
+    std::string why;
+    if (filePath.empty()) {
+        why = "路径为空";
+    } else if (capture::FileVideoSource::Probe(filePath, &info, &why) == TGErr_OK) {
+        why.clear();
+    }
+    if (!why.empty()) {
+        TG_LOGE("TGCapturer: 本地文件采集 index=%d %s 不可用：%s", index, filePath.c_str(), why.c_str());
+        return nullptr;
+    }
+    auto source = std::make_shared<capture::FileVideoSource>(filePath, loopPlay);
+    // 播完（loopPlay = false）通知宿主；回调在源线程上，经总线事件转给宿主（锁外）
+    source->SetEofCallback([this] { FireNotify(EsCap_Notify_LocalFile_EOF, "video:main", 0); });
+    if (BindVideoSource(source.get()) != TGErr_OK) {
+        return nullptr;
+    }
+    m_ownedVideoSources.push_back(source);
+    TG_LOGI("TGCapturer: 本地文件采集 index=%d %s（%dx%d %.2ffps 时长 %.2fs）loop=%d", index, filePath.c_str(),
+            info.width, info.height, info.fps, info.durationUs / 1e6, loopPlay ? 1 : 0);
+    return source.get();
 }
 
 int TGCapturer::AddAudioSource(IAudioSource* source)
@@ -1199,6 +1220,10 @@ void TGCapturer::ReleaseAll()
     // 析构路径：必须等任何在途的 Stop 收尾完，否则这里开始销毁成员时
     // 那个线程还在 PublishSync 里回调宿主
     WaitStopSettled(lock);
+    // 叠加层：清空两张表并发布空场景，视频层的源随之停止、摘下总线（源线程的回调捕获了 this）
+    m_overlayStaged.clear();
+    m_overlayProgram.clear();
+    PublishOverlaysLocked();
     // 先把音频源节点从总线上摘下并解除与源的回调绑定，再释放源（源可能比节点先销毁）
     std::vector<std::shared_ptr<nodes::AudioSourceNode>> audioNodes;
     {
@@ -1581,6 +1606,248 @@ int TGCapturer::PushAudioSourceFrame(const std::string& id, const uint8_t* data,
         return TGErr_InvalidState;
     }
     node->Push(MakePcmFrame(data, size, sampleRate, channels, ptsUs));
+    return TGErr_OK;
+}
+
+// ------------------------------------------------------------------ 叠加层（暂存 / 提交）
+bool TGCapturer::OverlayContentMatches(const OverlayContent& c, const OverlayDesc& d)
+{
+    return c.kind == d.kind && c.path == d.path && (c.kind == OverlayKind::Image || c.loop == d.loop);
+}
+
+int TGCapturer::LoadOverlayContent(const OverlayDesc& desc, std::shared_ptr<OverlayContent>& out)
+{
+    auto content = std::make_shared<OverlayContent>();
+    content->id = desc.id;
+    content->kind = desc.kind;
+    content->path = desc.path;
+    content->loop = desc.loop;
+    std::string why;
+    if (desc.kind == OverlayKind::Image) {
+        auto image = std::make_shared<core::Nv12AImage>();
+        if (!core::LoadImageNv12A(desc.path, *image, &why)) {
+            TG_LOGE("TGCapturer: 叠加层 %s 图片 %s 不可用：%s", desc.id.c_str(), desc.path.c_str(), why.c_str());
+            return TGErr_InvalidArgument;
+        }
+        content->srcWidth = image->width;
+        content->srcHeight = image->height;
+        content->image = std::move(image);
+    } else {
+        capture::FileVideoSource::Info info;
+        if (const int ret = capture::FileVideoSource::Probe(desc.path, &info, &why); ret != TGErr_OK) {
+            TG_LOGE("TGCapturer: 叠加层 %s 视频 %s 不可用：%s", desc.id.c_str(), desc.path.c_str(), why.c_str());
+            return ret;
+        }
+        auto source = std::make_shared<capture::FileVideoSource>(desc.path, desc.loop);
+        // 播完（loop = false）通知宿主；回调在源线程上，经总线事件转给宿主（锁外）
+        source->SetEofCallback([this, id = desc.id] { FireNotify(EsCap_Notify_LocalFile_EOF, "overlay:" + id, 0); });
+        content->srcWidth = info.width;
+        content->srcHeight = info.height;
+        content->video = std::move(source);
+    }
+    out = std::move(content);
+    return TGErr_OK;
+}
+
+int TGCapturer::AttachOverlayContentLocked(const std::shared_ptr<OverlayContent>& content)
+{
+    if (content->video) {
+        const float fps = m_videoParams.fps > 0 ? m_videoParams.fps : 30.0f;
+        if (const int ret = content->video->Open(0, 0, fps); ret != TGErr_OK) {
+            return ret;
+        }
+        content->port = m_nextOverlayPort++;
+        const std::string name = "vsrc.ovl." + std::to_string(content->port);
+        auto node = std::make_shared<nodes::VideoSourceNode>(name);
+        node->SetSource(content->video.get());
+        auto tx = m_bus.Begin();
+        tx.Register(name, node).Link(name, 0, "video_compositor", content->port);
+        if (!tx.Commit()) {
+            TG_LOGE("TGCapturer: 叠加层 %s 接入总线失败：%s", content->id.c_str(), tx.Error().c_str());
+            node->SetSource(nullptr);
+            content->video->Close();
+            return TGErr_Internal;
+        }
+        content->node = node;
+        // preview 组在运行（预览 / 推流中）就立即开始播放；否则随 preview 组启动
+        if (m_compositor->Lifecycle() == core::NodeLifecycle::Running) {
+            node->StartNode();
+        }
+    }
+    m_overlayContents.push_back(content);
+    return TGErr_OK;
+}
+
+core::OverlayScenePtr TGCapturer::BuildOverlayScene(const OverlayMap& map)
+{
+    auto scene = std::make_shared<core::OverlayScene>();
+    for (const auto& [id, entry] : map) {
+        if (!entry.desc.visible || !entry.content) {
+            continue;
+        }
+        core::OverlayLayer layer;
+        layer.desc = entry.desc;
+        layer.srcWidth = entry.content->srcWidth;
+        layer.srcHeight = entry.content->srcHeight;
+        layer.image = entry.content->image;
+        layer.inputPort = entry.content->port;
+        scene->layers.push_back(std::move(layer));
+    }
+    // map 已按 id 排好，稳定排序后 zOrder 相同的按 id
+    std::stable_sort(scene->layers.begin(), scene->layers.end(),
+                     [](const core::OverlayLayer& a, const core::OverlayLayer& b) {
+                         return a.desc.zOrder < b.desc.zOrder;
+                     });
+    scene->version = ++m_overlayVersion;
+    return scene;
+}
+
+bool TGCapturer::SameOverlayMaps(const OverlayMap& a, const OverlayMap& b)
+{
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (auto ia = a.begin(), ib = b.begin(); ia != a.end(); ++ia, ++ib) {
+        if (ia->first != ib->first || ia->second.content != ib->second.content ||
+            !core::SameOverlayDesc(ia->second.desc, ib->second.desc)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void TGCapturer::PublishOverlaysLocked()
+{
+    auto program = BuildOverlayScene(m_overlayProgram);
+    // 暂存区与已提交的一致：预览直接共享推流画面（合成器只画一遍）
+    auto preview = SameOverlayMaps(m_overlayStaged, m_overlayProgram) ? program : BuildOverlayScene(m_overlayStaged);
+    m_compositor->SetOverlayScenes(std::move(program), std::move(preview));
+
+    // 两边都不再引用的内容：先换场景（上面）再停源 —— 合成器此后不会再找它的输入口
+    auto referenced = [this](const std::shared_ptr<OverlayContent>& c) {
+        for (const OverlayMap* map : {&m_overlayStaged, &m_overlayProgram}) {
+            for (const auto& [_, entry] : *map) {
+                if (entry.content == c) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    std::vector<std::shared_ptr<OverlayContent>> dropped;
+    for (auto it = m_overlayContents.begin(); it != m_overlayContents.end();) {
+        if (referenced(*it)) {
+            ++it;
+        } else {
+            dropped.push_back(std::move(*it));
+            it = m_overlayContents.erase(it);
+        }
+    }
+    for (const auto& c : dropped) {
+        if (c->node) {
+            // StopNode：关闸 + join 源线程 + 等在飞的 Emit 退出，之后摘下总线、关文件
+            c->node->StopNode();
+            m_bus.Unregister(c->node->Name());
+            c->node->CloseNode();
+            c->node->SetSource(nullptr);
+        }
+        TG_LOGI("TGCapturer: 释放叠加层内容 %s（%s）", c->id.c_str(), c->path.c_str());
+    }
+}
+
+int TGCapturer::StageOverlay(const OverlayDesc& desc)
+{
+    std::string why;
+    if (!core::ValidateOverlayDesc(desc, &why)) {
+        TG_LOGE("TGCapturer: StageOverlay 参数非法 id=%s：%s", desc.id.c_str(), why.c_str());
+        return TGErr_InvalidArgument;
+    }
+    {
+        // 同一层只改几何 / 透明度 / 层级 / 可见性：沿用暂存区或已提交场景里的内容（视频不从头播）
+        std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+        WaitStopSettled(lock);
+        std::shared_ptr<OverlayContent> reuse;
+        for (const OverlayMap* map : {&m_overlayStaged, &m_overlayProgram}) {
+            const auto it = map->find(desc.id);
+            if (!reuse && it != map->end() && it->second.content && OverlayContentMatches(*it->second.content, desc)) {
+                reuse = it->second.content;
+            }
+        }
+        if (reuse) {
+            m_overlayStaged[desc.id] = OverlayEntry{desc, std::move(reuse)};
+            PublishOverlaysLocked();
+            return TGErr_OK;
+        }
+    }
+    // 新内容：读文件 / 解码图片在锁外做
+    std::shared_ptr<OverlayContent> content;
+    if (const int ret = LoadOverlayContent(desc, content); ret != TGErr_OK) {
+        return ret;
+    }
+    std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+    WaitStopSettled(lock);
+    if (const int ret = AttachOverlayContentLocked(content); ret != TGErr_OK) {
+        return ret;
+    }
+    m_overlayStaged[desc.id] = OverlayEntry{desc, content};
+    PublishOverlaysLocked();
+    TG_LOGI("TGCapturer: 暂存叠加层 id=%s kind=%d %s %dx%d port=%zu", desc.id.c_str(), static_cast<int>(desc.kind),
+            desc.path.c_str(), content->srcWidth, content->srcHeight, content->port);
+    return TGErr_OK;
+}
+
+int TGCapturer::StageRemoveOverlay(const std::string& id)
+{
+    std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+    WaitStopSettled(lock);
+    if (m_overlayStaged.erase(id) == 0) {
+        return TGErr_InvalidArgument;
+    }
+    PublishOverlaysLocked();
+    return TGErr_OK;
+}
+
+int TGCapturer::CommitOverlays()
+{
+    size_t count = 0;
+    {
+        std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+        WaitStopSettled(lock);
+        if (SameOverlayMaps(m_overlayStaged, m_overlayProgram)) {
+            return TGErr_OK;
+        }
+        m_overlayProgram = m_overlayStaged;
+        PublishOverlaysLocked();
+        count = m_overlayProgram.size();
+        TG_LOGI("TGCapturer: 叠加层已提交（%zu 层，场景 v%llu）", count,
+                static_cast<unsigned long long>(m_overlayVersion));
+    }
+    FireNotify(EsCap_Notify_Overlay_Committed, "", static_cast<int64_t>(count));
+    return TGErr_OK;
+}
+
+int TGCapturer::DiscardOverlayChanges()
+{
+    std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+    WaitStopSettled(lock);
+    if (!SameOverlayMaps(m_overlayStaged, m_overlayProgram)) {
+        m_overlayStaged = m_overlayProgram;
+        PublishOverlaysLocked();
+    }
+    return TGErr_OK;
+}
+
+int TGCapturer::GetOverlays(std::vector<OverlayDesc>& overlays, bool staged)
+{
+    std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+    WaitStopSettled(lock);
+    const OverlayMap& map = staged ? m_overlayStaged : m_overlayProgram;
+    overlays.clear();
+    for (const auto& [_, entry] : map) {
+        overlays.push_back(entry.desc);
+    }
+    std::stable_sort(overlays.begin(), overlays.end(),
+                     [](const OverlayDesc& a, const OverlayDesc& b) { return a.zOrder < b.zOrder; });
     return TGErr_OK;
 }
 

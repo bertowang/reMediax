@@ -1,9 +1,10 @@
 // 视频链路的总线节点
 //
-//   vsrc.main         VideoSourceNode      —— 主画面源（原生采集 / 外部注入），preview 组，受控输出
-//   video_compositor  VideoCompositorNode  —— 图层合成，preview 组。输入 0 = 主画面（其余输入留给叠加层）；
-//                                             图层：主画面 → 暂停图（MuteVideo 时替换）→ 水印 → …
-//                                             out0 = 推流画面，out1 = 预览画面
+//   vsrc.main         VideoSourceNode      —— 主画面源（原生采集 / 外部注入 / 本地文件），preview 组，受控输出
+//   vsrc.ovl.<n>      VideoSourceNode      —— 视频叠加层的源（本地文件），preview 组，接合成器的输入 n（≥ 1）
+//   video_compositor  VideoCompositorNode  —— 图层合成，preview 组。输入 0 = 主画面，输入 n = 视频叠加层；
+//                                             图层：主画面 → 暂停图（MuteVideo 时替换）→ 叠加层（按 zOrder）→ 水印
+//                                             out0 = 推流画面（已提交的场景），out1 = 预览画面（暂存的场景）
 //   video_sync        VideoSyncNode        —— 编码前的背压与音画同步（视频 PTS 由音频主时钟反推），output 组
 //   preview_sink      PreviewSinkNode      —— 把预览画面交给宿主回调（Latest 连线：只送最新一帧，宿主慢了就跳帧）
 //
@@ -20,9 +21,12 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "capture/Source.h"
 #include "core/Bus.h"
+#include "core/Overlay.h"
 
 namespace TGCapture::core
 {
@@ -100,6 +104,16 @@ public:
     // 水印图层：仅对 NV12 CPU 帧生效
     void SetWatermarkLayer(std::shared_ptr<core::Watermark> watermark);
 
+    // 叠加层场景：program 画在推流画面上，preview 画在预览画面上（两者相同时预览直接共享推流画面的像素）。
+    // 两个指针一起原子替换，下一帧起生效。视频叠加层的帧从对应输入端口进来，只保留最新一帧
+    void SetOverlayScenes(core::OverlayScenePtr program, core::OverlayScenePtr preview);
+    [[nodiscard]] core::OverlayScenePtr ProgramScene() const;
+    [[nodiscard]] core::OverlayScenePtr PreviewScene() const;
+    // 某个叠加输入口已收到的帧数（测试 / Dump 用）
+    [[nodiscard]] uint64_t OverlayFramesOf(size_t port) const;
+
+    void OnInputDetached(size_t port, const std::string& from) override;
+
     // 主画面每到一帧回调一次（产帧线程内，参数为墙钟 us）：断流看护判定"采集端还在不在产出"
     void SetMainActivityObserver(std::function<void(int64_t)> fn) { m_onMain = std::move(fn); }
 
@@ -107,11 +121,39 @@ public:
     [[nodiscard]] std::string DumpState() const override;
 
 private:
+    // 视频叠加层的输入：最新一帧
+    struct OverlayInput
+    {
+        core::FramePtr frame;
+        uint64_t frames = 0;
+    };
+    // 缩放后的叠加层像素缓存：同一素材（同一张图 / 同一帧视频）+ 同一目标尺寸只缩放一次，
+    // 推流与预览两个场景里同一层共用
+    struct ScaledLayer
+    {
+        std::shared_ptr<const void> source;   // 素材本身（持有引用，地址不会被复用）
+        int width = 0;
+        int height = 0;
+        std::vector<uint8_t> y, uv, a;
+        uint64_t lastUse = 0;
+    };
+
+    // 把场景画到 frame 上（frame 必须是可写的 NV12 CPU 帧）
+    void ComposeOverlays(core::Frame& frame, const core::OverlayScene& scene);
+    const ScaledLayer* Scaled(const core::OverlayLayer& layer, int w, int h);
+
     std::atomic_bool m_running{false};
     std::atomic_bool m_muted{false};
     mutable std::mutex m_layerMutex;   // 保护图层指针的替换（帧路径上拷一份 shared_ptr 再用）
     std::shared_ptr<core::PauseFrame> m_pause;
     std::shared_ptr<core::Watermark> m_watermark;
+    core::OverlayScenePtr m_programScene;
+    core::OverlayScenePtr m_previewScene;
+    mutable std::mutex m_inputMutex;   // 保护叠加输入的最新帧
+    std::unordered_map<size_t, OverlayInput> m_inputs;
+    std::mutex m_renderMutex;          // 保护缩放缓存（主画面可能来自原生采集与外部注入两个线程）
+    std::unordered_map<std::string, ScaledLayer> m_scaled;
+    uint64_t m_renderTick = 0;
     std::function<void(int64_t)> m_onMain;
     std::atomic<uint64_t> m_composed{0};
 };

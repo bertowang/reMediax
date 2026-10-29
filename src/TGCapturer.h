@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -93,7 +94,45 @@ public:
     int PushAudioSourceFrame(const std::string& id, const uint8_t* data, int size, int sampleRate,
                              int channels, int64_t ptsUs) override;
 
+    int StageOverlay(const OverlayDesc& desc) override;
+    int StageRemoveOverlay(const std::string& id) override;
+    int CommitOverlays() override;
+    int DiscardOverlayChanges() override;
+    int GetOverlays(std::vector<OverlayDesc>& overlays, bool staged = false) override;
+
 private:
+    // ---- 叠加层（StageOverlay / CommitOverlays）----
+    // 一层的内容：图片（预解码）或视频文件（一个 vsrc.ovl.<port> 源节点，接合成器的输入 port）。
+    // 暂存区与已提交场景里同一层只改几何 / 透明度时共用同一份内容（视频不重新播放）
+    struct OverlayContent
+    {
+        std::string id;
+        OverlayKind kind = OverlayKind::Image;
+        std::string path;
+        bool loop = true;
+        int srcWidth = 0;
+        int srcHeight = 0;
+        std::shared_ptr<const core::Nv12AImage> image;
+        std::shared_ptr<capture::VideoSourceBase> video;
+        std::shared_ptr<nodes::VideoSourceNode> node;
+        size_t port = 0;
+    };
+    struct OverlayEntry
+    {
+        OverlayDesc desc;
+        std::shared_ptr<OverlayContent> content;
+    };
+    using OverlayMap = std::map<std::string, OverlayEntry>;
+    // 内容能否沿用（同类型 / 同路径 / 同循环设置）
+    static bool OverlayContentMatches(const OverlayContent& c, const OverlayDesc& d);
+    // 加载内容（锁外：读文件 / 解码图片）。视频层只建源，不接总线
+    int LoadOverlayContent(const OverlayDesc& desc, std::shared_ptr<OverlayContent>& out);
+    // 视频层的源节点接入总线（合成器输入 port），preview 组在运行就立即开始播放。持 m_lifecycleMutex
+    int AttachOverlayContentLocked(const std::shared_ptr<OverlayContent>& content);
+    // 由两张表生成场景并交给合成器；之后释放两边都不再引用的内容（停视频源、摘下节点）。持 m_lifecycleMutex
+    void PublishOverlaysLocked();
+    core::OverlayScenePtr BuildOverlayScene(const OverlayMap& map);
+    static bool SameOverlayMaps(const OverlayMap& a, const OverlayMap& b);
     // SetVideoResolution / SetResolutionPreset 的公共实现（width / height 已校验并偶数化）
     int ApplyVideoResolution(int width, int height, int vBitrate, const std::string& presetName);
 
@@ -258,6 +297,12 @@ private:
 
     // 水印（对齐 MediaX ESVPicFilter）
     std::shared_ptr<core::Watermark> m_watermark;
+    // 叠加层：暂存区 / 已提交场景（持 m_lifecycleMutex 读写）与全部已加载的内容
+    OverlayMap m_overlayStaged;
+    OverlayMap m_overlayProgram;
+    std::vector<std::shared_ptr<OverlayContent>> m_overlayContents;
+    size_t m_nextOverlayPort = 1;
+    uint64_t m_overlayVersion = 0;
     // 外部注入视频是否沿用调用方自带的 PTS（VideoEncoderParams::videoUseExternalPts）。
     // Prepare 写、采集/注入线程读，用 atomic 避免跨线程读写同一 bool。
     std::atomic_bool m_useExternalVideoPts{false};

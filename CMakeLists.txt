@@ -77,11 +77,13 @@ set(TG_CORE_SOURCES
     src/ITGCapturer.cpp
     src/TGCapturer.cpp
     src/capture/FileAudioSource.cpp
+    src/capture/FileVideoSource.cpp
     src/codec/VideoEncoder.cpp
     src/codec/AudioEncoder.cpp
     src/codec/EncoderProbe.cpp
     src/core/AVSyncClock.cpp
     src/core/AudioMixer.cpp
+    src/core/Overlay.cpp
     src/core/PauseFrame.cpp
     src/core/VideoTransform.cpp
     src/core/Watermark.cpp
@@ -255,6 +257,7 @@ if(TG_BUILD_TESTS)
         tests/test_audio_sources.cpp
         tests/test_resolution.cpp
         tests/test_file_audio.cpp
+        tests/test_overlay.cpp
         tests/test_health.cpp
         tests/test_traffic_meter.cpp
         tests/test_error_codes.cpp

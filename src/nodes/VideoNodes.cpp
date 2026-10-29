@@ -1,6 +1,11 @@
 #include "nodes/VideoNodes.h"
 
+#include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <iterator>
+
+#include <libyuv.h>
 
 #include "core/AVSyncClock.h"
 #include "core/Clock.h"
@@ -91,6 +96,40 @@ void VideoCompositorNode::SetWatermarkLayer(std::shared_ptr<core::Watermark> wat
     m_watermark = std::move(watermark);
 }
 
+void VideoCompositorNode::SetOverlayScenes(core::OverlayScenePtr program, core::OverlayScenePtr preview)
+{
+    std::lock_guard<std::mutex> lock(m_layerMutex);
+    m_programScene = std::move(program);
+    m_previewScene = std::move(preview);
+}
+
+core::OverlayScenePtr VideoCompositorNode::ProgramScene() const
+{
+    std::lock_guard<std::mutex> lock(m_layerMutex);
+    return m_programScene;
+}
+
+core::OverlayScenePtr VideoCompositorNode::PreviewScene() const
+{
+    std::lock_guard<std::mutex> lock(m_layerMutex);
+    return m_previewScene;
+}
+
+uint64_t VideoCompositorNode::OverlayFramesOf(size_t port) const
+{
+    std::lock_guard<std::mutex> lock(m_inputMutex);
+    const auto it = m_inputs.find(port);
+    return it == m_inputs.end() ? 0 : it->second.frames;
+}
+
+void VideoCompositorNode::OnInputDetached(size_t port, const std::string& /*from*/)
+{
+    if (port != kMainInput) {
+        std::lock_guard<std::mutex> lock(m_inputMutex);
+        m_inputs.erase(port);
+    }
+}
+
 bool VideoCompositorNode::NodeStart()
 {
     m_running.store(true);
@@ -100,7 +139,112 @@ bool VideoCompositorNode::NodeStart()
 void VideoCompositorNode::NodeStop()
 {
     m_running.store(false);
+    // 叠加输入的最新帧作废：下次开始时视频层等新帧到了再画，不会先闪一下上一轮的残帧
+    std::lock_guard<std::mutex> lock(m_inputMutex);
+    for (auto& [_, in] : m_inputs) {
+        in.frame.reset();
+    }
 }
+
+const VideoCompositorNode::ScaledLayer* VideoCompositorNode::Scaled(const core::OverlayLayer& layer, int w, int h)
+{
+    // 素材：图片层是预解码的图；视频层是该输入口的最新一帧（还没收到帧就不画）
+    std::shared_ptr<const void> source;
+    core::Nv12AView src;
+    if (layer.desc.kind == OverlayKind::Image) {
+        if (!layer.image || layer.image->width < 2) {
+            return nullptr;
+        }
+        const auto& img = *layer.image;
+        source = layer.image;
+        src = {img.y.data(), img.width, img.uv.data(), img.width, img.a.empty() ? nullptr : img.a.data(), img.width,
+               img.width, img.height};
+    } else {
+        core::FramePtr f;
+        {
+            std::lock_guard<std::mutex> lock(m_inputMutex);
+            const auto it = m_inputs.find(layer.inputPort);
+            if (it != m_inputs.end()) {
+                f = it->second.frame;
+            }
+        }
+        if (!f || !f->planes[0] || !f->planes[1] || f->pixFmt != AV_PIX_FMT_NV12 || f->width < 2 || f->height < 2) {
+            return nullptr;
+        }
+        source = f;
+        src = {f->planes[0].get(), f->strides[0] > 0 ? f->strides[0] : f->width, f->planes[1].get(),
+               f->strides[1] > 0 ? f->strides[1] : f->width, nullptr, 0, f->width & ~1, f->height & ~1};
+    }
+    auto& cache = m_scaled[layer.desc.id + "@" + std::to_string(w) + "x" + std::to_string(h)];
+    cache.lastUse = m_renderTick;
+    if (cache.source == source && cache.width == w && cache.height == h) {
+        return &cache;
+    }
+    cache.source = source;
+    cache.width = w;
+    cache.height = h;
+    cache.y.resize(static_cast<size_t>(w) * h);
+    cache.uv.resize(static_cast<size_t>(w) * h / 2);
+    libyuv::NV12Scale(src.y, src.yStride, src.uv, src.uvStride, src.width, src.height, cache.y.data(), w,
+                      cache.uv.data(), w, w, h, libyuv::kFilterBilinear);
+    if (src.a) {
+        cache.a.resize(static_cast<size_t>(w) * h);
+        libyuv::ScalePlane(src.a, src.aStride, src.width, src.height, cache.a.data(), w, w, h,
+                           libyuv::kFilterBilinear);
+    } else {
+        cache.a.clear();
+    }
+    return &cache;
+}
+
+void VideoCompositorNode::ComposeOverlays(core::Frame& frame, const core::OverlayScene& scene)
+{
+    for (const auto& layer : scene.layers) {
+        const core::PixelRect r =
+            core::ResolveOverlayRect(layer.desc, layer.srcWidth, layer.srcHeight, frame.width, frame.height);
+        if (r.w < 2 || r.h < 2 || r.w > 8192 || r.h > 8192) {
+            continue;
+        }
+        const ScaledLayer* s = Scaled(layer, r.w, r.h);
+        if (!s) {
+            continue;
+        }
+        const core::Nv12AView view{s->y.data(), s->width, s->uv.data(), s->width,
+                                   s->a.empty() ? nullptr : s->a.data(), s->width, s->width, s->height};
+        core::BlendNv12A(frame, r.x, r.y, view, static_cast<int>(std::lround(layer.desc.opacity * 255.0f)));
+    }
+}
+
+namespace
+{
+// 深拷贝一帧 NV12（预览场景与推流场景不同时，预览要画在自己的一份像素上）
+core::FramePtr CloneNv12(const core::Frame& src)
+{
+    const int w = src.width;
+    const int h = src.height;
+    const size_t ySize = static_cast<size_t>(w) * h;
+    auto buffer = std::shared_ptr<uint8_t>(new uint8_t[ySize + ySize / 2], std::default_delete<uint8_t[]>());
+    const int sY = src.strides[0] > 0 ? src.strides[0] : w;
+    const int sUV = src.strides[1] > 0 ? src.strides[1] : w;
+    for (int row = 0; row < h; ++row) {
+        std::memcpy(buffer.get() + static_cast<size_t>(row) * w, src.planes[0].get() + static_cast<size_t>(row) * sY,
+                    static_cast<size_t>(w));
+    }
+    for (int row = 0; row < h / 2; ++row) {
+        std::memcpy(buffer.get() + ySize + static_cast<size_t>(row) * w,
+                    src.planes[1].get() + static_cast<size_t>(row) * sUV, static_cast<size_t>(w));
+    }
+    auto out = std::make_shared<core::Frame>(src);
+    for (auto& p : out->planes) {
+        p.reset();
+    }
+    out->planes[0] = buffer;
+    out->strides[0] = w;
+    out->planes[1] = std::shared_ptr<uint8_t>(buffer, buffer.get() + ySize);
+    out->strides[1] = w;
+    return out;
+}
+}  // namespace
 
 bool VideoCompositorNode::SubmitInput(size_t port, core::FramePtr frame)
 {
@@ -108,7 +252,12 @@ bool VideoCompositorNode::SubmitInput(size_t port, core::FramePtr frame)
         return false;
     }
     if (port != kMainInput) {
-        return false;   // 叠加层输入（后续版本）
+        // 视频叠加层：只记下最新一帧，主画面到达时再画（叠加层的帧率不影响输出帧率）
+        std::lock_guard<std::mutex> lock(m_inputMutex);
+        auto& in = m_inputs[port];
+        in.frame = std::move(frame);
+        ++in.frames;
+        return true;
     }
     // 看护判定的是"采集端还在不在产出"，而不是"这一帧最终有没有被编码"：
     // 下面的 Mute 丢帧、硬件帧无法改写等分支都会提前返回，但这些都不是采集故障，打点必须在它们之前
@@ -118,10 +267,14 @@ bool VideoCompositorNode::SubmitInput(size_t port, core::FramePtr frame)
 
     std::shared_ptr<core::PauseFrame> pause;
     std::shared_ptr<core::Watermark> watermark;
+    core::OverlayScenePtr program;
+    core::OverlayScenePtr preview;
     {
         std::lock_guard<std::mutex> lock(m_layerMutex);
         pause = m_pause;
         watermark = m_watermark;
+        program = m_programScene;
+        preview = m_previewScene;
     }
 
     // ---- 暂停图层 ----
@@ -138,20 +291,53 @@ bool VideoCompositorNode::SubmitInput(size_t port, core::FramePtr frame)
         }
     }
 
-    // ---- 水印图层：仅对 CPU 帧生效；硬件直通帧跳过并限频提示 ----
+    const bool cpuNv12 = frame->planes[0] && frame->planes[1] && frame->pixFmt == AV_PIX_FMT_NV12;
+    const bool hasProgram = program && !program->layers.empty();
+    const bool hasPreview = preview && !preview->layers.empty();
+    const bool wantPreview = HasDownstream(kPreviewOutput);
+    // 预览场景与推流场景不同（有未提交的修改）：预览画在自己的一份像素上
+    core::FramePtr previewFrame;
+    if (wantPreview && cpuNv12 && preview != program && (hasPreview || hasProgram)) {
+        previewFrame = CloneNv12(*frame);
+    }
+
+    // ---- 叠加层：仅对 CPU 帧生效 ----
+    if (cpuNv12 && (hasProgram || (previewFrame && hasPreview))) {
+        std::lock_guard<std::mutex> lock(m_renderMutex);
+        ++m_renderTick;
+        if (hasProgram) {
+            ComposeOverlays(*frame, *program);
+        }
+        if (previewFrame && hasPreview) {
+            ComposeOverlays(*previewFrame, *preview);
+        }
+        // 缓存里 2s 没用过的（层已移除 / 尺寸已变）丢掉
+        if (m_renderTick % 64 == 0) {
+            for (auto it = m_scaled.begin(); it != m_scaled.end();) {
+                it = m_renderTick - it->second.lastUse > 64 ? m_scaled.erase(it) : std::next(it);
+            }
+        }
+    } else if (!cpuNv12 && frame->hwHandle && (hasProgram || hasPreview)) {
+        TG_LOGW_THROTTLED(3000000, "TGCapturer: 硬件帧路径暂不支持叠加层，本帧叠加层已跳过");
+    }
+
+    // ---- 水印图层（最上层）：仅对 CPU 帧生效；硬件直通帧跳过并限频提示 ----
     if (watermark && !watermark->Empty()) {
-        if (frame->planes[0] && frame->pixFmt == AV_PIX_FMT_NV12) {
+        if (cpuNv12) {
             watermark->BlendOnto(*frame);
+            if (previewFrame) {
+                watermark->BlendOnto(*previewFrame);
+            }
         } else if (frame->hwHandle) {
             TG_LOGW_THROTTLED(3000000, "TGCapturer: 硬件帧路径暂不支持水印，本帧水印已跳过");
         }
     }
 
     m_composed.fetch_add(1, std::memory_order_relaxed);
-    // 预览与推流共享像素（下游不得修改像素）。预览给一份浅拷贝的帧头：
+    // 预览与推流共享像素时（场景相同），下游不得修改像素。预览给一份浅拷贝的帧头：
     // 推流链路会改写 ptsUs 等元数据，而预览在另一个线程上读，共用帧头会产生数据竞争
-    if (HasDownstream(kPreviewOutput)) {
-        Emit(kPreviewOutput, std::make_shared<core::Frame>(*frame));
+    if (wantPreview) {
+        Emit(kPreviewOutput, previewFrame ? std::move(previewFrame) : std::make_shared<core::Frame>(*frame));
     }
     return Emit(kProgramOutput, std::move(frame));
 }
@@ -160,14 +346,23 @@ std::string VideoCompositorNode::DumpState() const
 {
     bool pauseValid = false;
     bool watermark = false;
+    size_t programLayers = 0;
+    uint64_t programVersion = 0;
+    bool previewDiffers = false;
     {
         std::lock_guard<std::mutex> lock(m_layerMutex);
         pauseValid = m_pause && m_pause->Valid();
         watermark = m_watermark && !m_watermark->Empty();
+        if (m_programScene) {
+            programLayers = m_programScene->layers.size();
+            programVersion = m_programScene->version;
+        }
+        previewDiffers = m_previewScene != m_programScene;
     }
-    char buf[128];
-    std::snprintf(buf, sizeof(buf), "layers=[main%s%s] muted=%d composed=%llu",
-                  pauseValid ? ",pause" : "", watermark ? ",watermark" : "", m_muted.load() ? 1 : 0,
+    char buf[192];
+    std::snprintf(buf, sizeof(buf), "layers=[main%s,overlays=%zu(v%llu%s)%s] muted=%d composed=%llu",
+                  pauseValid ? ",pause" : "", programLayers, static_cast<unsigned long long>(programVersion),
+                  previewDiffers ? ",staged" : "", watermark ? ",watermark" : "", m_muted.load() ? 1 : 0,
                   static_cast<unsigned long long>(m_composed.load()));
     return buf;
 }
