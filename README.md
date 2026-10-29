@@ -47,6 +47,7 @@ ffplay out.flv
 | 封装 | `flv`（rtmp/rtmps/文件）、`mpegts`（srt/文件）；协议 file / http(s) / rtmp(s) / tls / srt |
 | 性能模式 | `Cpu`（默认，内存帧 + CPU 缩放）、`Gpu`（全链路 GPU：显存直拷硬编） |
 | 兼容层 | `compat/ESMediaXCapturer.h`：`ESMediaX::ESCapturer::IESMediaXCapturer` 换一行 include 即可 |
+| 时间水印 | 本地实时时间（日期 + 秒）画在推流与预览画面上；默认内置点阵字体零依赖，`TG_WITH_TEXT=ON` 用 FreeType 支持中文（见 4.9） |
 | 生命周期 | 状态机 + 回调；`Prepare`/`Start`/`Stop` 并发安全；支持同一实例反复重开（见 4.7） |
 | 日志 | 自带 `core/Logger.h`（零第三方依赖），level 分级、限频、接管 ffmpeg 日志、sink 转发宿主（见 4.6） |
 
@@ -537,6 +538,46 @@ demo：`--rotate <0|90|180|270>` / `--flip <h|v|both>` / `--crop <w,h>`。
 **当前不支持**：DPI 缩放（高 DPI 屏仍是逻辑像素/物理像素混用）、HDR / 广色域、
 旋转角写入码流（`Frame::rotation` 未写进 SPS VUI 或 displaymatrix）。
 
+### 4.9 时间水印（本地实时时间，含日期与秒）
+
+模块：**`src/core/TextOverlay.{h,cpp}`**；接口 `ITGCapturer::SetTimestampOverlay(TimestampOverlayParams)`，任意状态可调、下一帧生效。
+
+* **画在哪**：合成器（`VideoCompositorNode`）的最上层，水印之上；推流画面与预览画面都有。
+  与水印一样画在采集画面上，编码前的裁剪 / 翻转 / 旋转（4.8）会一并作用于文字；GPU 模式（硬件纹理帧直通）跳过，限频打 Warn。
+* **时间取哪一刻**：每帧的**采集时刻**（单调时钟）换算成本机时区的墙钟 —— 编码排队 / 网络抖动不会让时间跳动。
+* **位置 / 字号**：相对画布的比例（`position` 0 ~ 5 同水印，或 `-1` + `x`/`y`；`fontSize` = 字高 / 画面高），运行期切分辨率后自动跟随。
+* **开销**：文字每秒才变一次，渲染结果按"文本 + 画布尺寸"缓存，每帧只做一次 NV12 alpha 混合（文字框大小的区域）。
+
+**不需要重编 ffmpeg**：没有用 ffmpeg 的 `drawtext` 滤镜（它要 libavfilter 滤镜图 + `--enable-libfreetype`，还得在滤镜图里来回转帧），
+而是内核自己把文字渲染成 NV12 + alpha，走与水印 / 叠加层相同的混合路径。字形来源由编译开关二选一：
+
+| 构建 | 字形 | 依赖 | `IsSupported(UnicodeText)` |
+| - | - | - | - |
+| 默认（`TG_WITH_TEXT=OFF`） | 内置点阵字体（X11 misc-fixed 10x20，公有领域），按字号放大后 box 缩放；只有 ASCII，其它字符画成 `?` | 无 | false |
+| `-DTG_WITH_TEXT=ON` | FreeType 渲染 TrueType / OpenType（`fontPath` 或系统默认字体：Win 微软雅黑 / 黑体，macOS 黑体，Android Noto CJK，Linux Noto CJK / 文泉驿），抗锯齿、支持中文 | TGCapture3rd 的 `freetype` 组件（FfmpegCompileShell `build --with-text`） | true |
+
+`TG_WITH_TEXT=ON` 时字体打不开（且没指定 `fontPath`）会回落到内置点阵；指定了 `fontPath` 但打不开返回 `TGErr_InvalidArgument`；
+默认构建里指定 `fontPath` 返回 `TGErr_NotSupported`。
+
+| 字段 | 默认 | 说明 |
+| - | - | - |
+| `enabled` | false | false = 关闭 |
+| `format` | `%Y-%m-%d %H:%M:%S` | strftime 风格：`%Y %y %m %d %H %I %M %S %p %j %a %F %T %%`，其它字符原样输出（UTF-8） |
+| `position` / `x` / `y` / `margin` | 0 / 0 / 0 / 0.02 | 0左上 1右上 2左下 3右下 4顶中 5底中；-1 用 `x`/`y`（比例）；`margin` 为距边距离（画面高的比例） |
+| `fontSize` | 0.04 | 字高 = 画面高 × fontSize，不小于 10 像素 |
+| `textColor` / `backgroundColor` | `0xFFFFFFFF` / `0x80000000` | ARGB；背景 A = 0 不画底框 |
+| `outline` | true | 描边（自动取与文字反差大的黑 / 白） |
+| `fontPath` | 空 | 字体文件；仅 `TG_WITH_TEXT=ON` 有效 |
+
+```cpp
+TGCapture::TimestampOverlayParams ts;
+ts.enabled = true;
+ts.position = 3;                     // 右下
+capturer->SetTimestampOverlay(ts);   // 关闭：ts.enabled = false 再调一次
+```
+
+demo（命令行）：`--timestamp` 开启，`--timestamp-format/-pos/-size/-color/-bg/-font` 可选（见 10.2）。
+
 ---
 
 ## 5. 音画同步
@@ -804,6 +845,9 @@ python scripts/build.py --platform android --abi arm64-v8a --ndk $ANDROID_NDK_HO
 python scripts/build.py --platform ios                                # 含 demo/ios App（未签名）
 # 开关：--clean / --build-type Debug|Release / --no-demo / --3rd <依赖目录> / --ide
 # iOS 签名：--team <Team ID> / --bundle-id <id>（写进 Xcode 工程，见 10.3.2）
+# 文字（时间水印中文 / TrueType，见 4.9）：--with-text（= -DTG_WITH_TEXT=ON，构建目录带 -text 后缀）
+#   依赖目录要有 freetype：FfmpegCompileShell build --with-text（或 --libs freetype 补编）
+python scripts/build.py --platform windows --with-text --3rd D:/work/TGCapture3rd-text
 ```
 
 ### 9.2 IDE（VS2022 / Android Studio / Xcode）
@@ -942,6 +986,10 @@ cd build\windows-x64\Release
 | `--log-dir <dir>` | 日志落盘目录（默认不落盘） |
 | `--no-print-log` | 关闭 stdout 日志输出（配合 `--log-dir` 只看文件） |
 | `--log-bench <n>` | 只跑日志吞吐基准（打 n 条）后退出，见 §4.6.1 |
+| `--timestamp` | 开启时间水印（本地实时时间，含日期与秒；不加则不显示，见 §4.9） |
+| `--timestamp-format <f>` / `--timestamp-pos <0..5>` / `--timestamp-size <f>` | 格式（默认 `%Y-%m-%d %H:%M:%S`）/ 位置（默认 0 左上）/ 字高比例（默认 0.04） |
+| `--timestamp-color <AARRGGBB>` / `--timestamp-bg <AARRGGBB>` | 文字颜色（默认 FFFFFFFF）/ 底框颜色（默认 80000000，`00000000` 无底框） |
+| `--timestamp-font <path>` | TrueType 字体（中文；仅 `--with-text` 构建，不给用系统默认字体） |
 
 取窗口句柄（注意 demo 按 16 进制解析）：
 
@@ -1062,6 +1110,19 @@ python3 scripts/build.py --platform linux --3rd ~/TGCapture3rd-linux
 | `--no-audio` / `--audio2-no-loop` | — | 开关 |
 | `--ffmpeg <path>` | ffmpeg (PATH) | 使用的 ffmpeg CLI |
 | `--log-level <n>` | 1 | 0=Debug 1=Info 2=Warn 3=Error |
+| `--timestamp` | 关 | 开启时间水印（本地实时时间，含日期与秒，见 §4.9） |
+| `--timestamp-format/-pos/-size/-color/-bg/-font` | `%Y-%m-%d %H:%M:%S` / 0 / 0.04 / FFFFFFFF / 80000000 / 系统默认 | 同 Windows demo；`-font` 仅 `--with-text` 构建 |
+
+时间水印两种构建的对照（macOS 实测，同一素材）：
+
+```bash
+# 默认构建（内置点阵，仅 ASCII，零额外依赖）
+./build/macos-arm64/tg_capture_demo --video-file src.mp4 --out bitmap.flv --seconds 4 --timestamp --timestamp-pos 3
+# --with-text 构建（FreeType，中文 + 抗锯齿；依赖目录需有 freetype）
+./build/macos-arm64-text/tg_capture_demo --video-file src.mp4 --out ft.flv --seconds 3 --timestamp \
+    --timestamp-format "%Y年%m月%d日 %H:%M:%S" --timestamp-size 0.06 --timestamp-bg 00000000
+ffmpeg -ss 2 -i ft.flv -frames:v 1 ft.png     # 抽帧核对：时间逐秒递增、与本机时钟一致
+```
 
 `--audio*-speed` 用于**压测音源节奏异常**（内核应持续吸收 drift）：
 - PTS 固定按采样数累加（`1024/44100 ≈ 23.22ms`/块），单调推进

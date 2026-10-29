@@ -22,6 +22,7 @@
 #include "core/Clock.h"
 #include "core/Health.h"
 #include "core/PauseFrame.h"
+#include "core/TextOverlay.h"
 #include "core/Watermark.h"
 #include "mux/Muxer.h"
 #include "nodes/AudioNodes.h"
@@ -75,6 +76,7 @@ public:
     bool MuteVideo(bool mute) override;
     int SetPauseInfo(const PauseParams& params) override;
     int SetupWatermarkInfo(const WatermarkParams& params) override;
+    int SetTimestampOverlay(const TimestampOverlayParams& params) override;
     int SetAVTimeout(int64_t audioTimeoutMs, int64_t videoTimeoutMs) override;
     int SetVideoResolution(int width, int height, int vBitrate = 0) override;
     int SetResolutionPreset(const std::string& name, bool portrait = false) override;
@@ -297,6 +299,7 @@ private:
 
     // 水印（对齐 MediaX ESVPicFilter）
     std::shared_ptr<core::Watermark> m_watermark;
+    std::shared_ptr<core::TimestampOverlay> m_timestamp;
     // 叠加层：暂存区 / 已提交场景（持 m_lifecycleMutex 读写）与全部已加载的内容
     OverlayMap m_overlayStaged;
     OverlayMap m_overlayProgram;

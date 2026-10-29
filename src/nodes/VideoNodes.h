@@ -3,7 +3,7 @@
 //   vsrc.main         VideoSourceNode      —— 主画面源（原生采集 / 外部注入 / 本地文件），preview 组，受控输出
 //   vsrc.ovl.<n>      VideoSourceNode      —— 视频叠加层的源（本地文件），preview 组，接合成器的输入 n（≥ 1）
 //   video_compositor  VideoCompositorNode  —— 图层合成，preview 组。输入 0 = 主画面，输入 n = 视频叠加层；
-//                                             图层：主画面 → 暂停图（MuteVideo 时替换）→ 叠加层（按 zOrder）→ 水印
+//                                             图层：主画面 → 暂停图（MuteVideo 时替换）→ 叠加层（按 zOrder）→ 水印 → 时间水印
 //                                             out0 = 推流画面（已提交的场景），out1 = 预览画面（暂存的场景）
 //   video_sync        VideoSyncNode        —— 编码前的背压与音画同步（视频 PTS 由音频主时钟反推），output 组
 //   preview_sink      PreviewSinkNode      —— 把预览画面交给宿主回调（Latest 连线：只送最新一帧，宿主慢了就跳帧）
@@ -32,6 +32,7 @@ namespace TGCapture::core
 {
 class PauseFrame;
 class Watermark;
+class TimestampOverlay;
 class VideoPtsGenerator;
 class VideoOnlyTimeline;
 class AudioClock;
@@ -103,6 +104,8 @@ public:
     [[nodiscard]] bool IsMuted() const noexcept { return m_muted.load(); }
     // 水印图层：仅对 NV12 CPU 帧生效
     void SetWatermarkLayer(std::shared_ptr<core::Watermark> watermark);
+    // 时间水印（最上层，水印之上）：仅对 NV12 CPU 帧生效。时间取帧的采集时刻换算成的墙钟
+    void SetTimestampLayer(std::shared_ptr<core::TimestampOverlay> timestamp);
 
     // 叠加层场景：program 画在推流画面上，preview 画在预览画面上（两者相同时预览直接共享推流画面的像素）。
     // 两个指针一起原子替换，下一帧起生效。视频叠加层的帧从对应输入端口进来，只保留最新一帧
@@ -147,6 +150,7 @@ private:
     mutable std::mutex m_layerMutex;   // 保护图层指针的替换（帧路径上拷一份 shared_ptr 再用）
     std::shared_ptr<core::PauseFrame> m_pause;
     std::shared_ptr<core::Watermark> m_watermark;
+    std::shared_ptr<core::TimestampOverlay> m_timestamp;
     core::OverlayScenePtr m_programScene;
     core::OverlayScenePtr m_previewScene;
     mutable std::mutex m_inputMutex;   // 保护叠加输入的最新帧

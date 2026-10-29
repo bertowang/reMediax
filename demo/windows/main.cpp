@@ -80,6 +80,9 @@ struct Options
     std::string logDir;       // 非空则日志落盘到该目录
     bool printLog = true;     // 是否输出到 stdout
     int logBench = 0;         // >0 时只跑日志吞吐基准然后退出
+    // 时间水印（本地实时时间，含日期与秒）：--timestamp 开启，其余参数可选
+    bool timestamp = false;
+    TGCapture::TimestampOverlayParams timestampParams;
 };
 
 // 测试用视频源：生成 NV12 测试图案，用于隔离"采集侧"与"编码/封装侧"问题
@@ -173,7 +176,17 @@ void PrintUsage()
            "  --log-level <n>  0=Debug 1=Info 2=Warn 3=Error（默认 0）\n"
            "  --log-dir <dir>  日志落盘目录（默认不落盘）\n"
            "  --no-print-log   关闭 stdout 日志输出（配合 --log-dir 只看文件）\n"
-           "  --log-bench <n>  只跑日志吞吐基准（打 n 条）后退出\n");
+           "  --log-bench <n>  只跑日志吞吐基准（打 n 条）后退出\n"
+           "  时间水印（本地实时时间，含日期与秒；推流与预览画面都有，GPU 模式下不生效）:\n"
+           "  --timestamp             开启（不加则不显示）\n"
+           "  --timestamp-format <f>  strftime 风格，默认 \"%%Y-%%m-%%d %%H:%%M:%%S\"\n"
+           "                          支持 %%Y %%y %%m %%d %%H %%I %%M %%S %%p %%j %%a %%F %%T %%%%\n"
+           "  --timestamp-pos <n>     0左上 1右上 2左下 3右下 4顶中 5底中，默认 0\n"
+           "  --timestamp-size <f>    字高 = 画面高 × f，默认 0.04\n"
+           "  --timestamp-color <hex> 文字颜色 AARRGGBB，默认 FFFFFFFF\n"
+           "  --timestamp-bg <hex>    底框颜色 AARRGGBB，默认 80000000（半透明黑），00000000 = 无底框\n"
+           "  --timestamp-font <path> TrueType 字体（中文需要；仅 -DTG_WITH_TEXT=ON 的构建支持，\n"
+           "                          不给则用系统默认字体 微软雅黑 等；默认构建为内置点阵字体，只有 ASCII）\n");
 }
 
 Options ParseArgs(int argc, char** argv)
@@ -223,6 +236,10 @@ Options ParseArgs(int argc, char** argv)
             opt.failFirst = true;
             continue;
         }
+        if (key == "--timestamp") {
+            opt.timestamp = true;
+            continue;
+        }
         if (key == "--log-bench") {
             opt.logBench = std::stoi(argv[++i]);
             continue;
@@ -269,6 +286,18 @@ Options ParseArgs(int argc, char** argv)
             opt.logLevel = std::stoi(value);
         } else if (key == "--log-dir") {
             opt.logDir = value;
+        } else if (key == "--timestamp-format") {
+            opt.timestampParams.format = value;
+        } else if (key == "--timestamp-pos") {
+            opt.timestampParams.position = std::stoi(value);
+        } else if (key == "--timestamp-size") {
+            opt.timestampParams.fontSize = std::stof(value);
+        } else if (key == "--timestamp-color") {
+            opt.timestampParams.textColor = static_cast<uint32_t>(std::stoul(value, nullptr, 16));
+        } else if (key == "--timestamp-bg") {
+            opt.timestampParams.backgroundColor = static_cast<uint32_t>(std::stoul(value, nullptr, 16));
+        } else if (key == "--timestamp-font") {
+            opt.timestampParams.fontPath = value;
         } else if (key == "--no-print-log") {
             opt.printLog = false;
         } else if (key == "--crop") {
@@ -413,6 +442,20 @@ int main(int argc, char** argv)
                         : "flv";
     mParams.muxerOutput = opt.output;
     capturer->SetupMuxer(mParams);
+
+    if (opt.timestamp) {
+        TGCapture::TimestampOverlayParams ts = opt.timestampParams;
+        ts.enabled = true;
+        const int ret = capturer->SetTimestampOverlay(ts);
+        printf("[demo] 时间水印 format=\"%s\" pos=%d size=%.3f 字形=%s ret=%d\n",
+               ts.format.c_str(), ts.position, ts.fontSize,
+               capturer->IsSupported(TGCapture::CaptureFeature::UnicodeText) ? "FreeType(TG_WITH_TEXT)"
+                                                                             : "内置点阵(仅 ASCII)",
+               ret);
+        if (vParams.perfMode == TGCapture::PerformanceMode::Gpu) {
+            printf("[demo] 注意：GPU 模式下采集帧不出显存，时间水印不生效（与水印一致）\n");
+        }
+    }
 
     std::atomic_bool started{false};
     capturer->SetOnPreparedCallback([&started](TGCapture::ITGCapturer* c) {

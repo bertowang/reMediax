@@ -66,6 +66,7 @@ TGCapturer::TGCapturer(GameID gameId) : m_gameId(gameId)
     m_previewSink = std::make_shared<nodes::PreviewSinkNode>();
     m_pauseFrame = std::make_shared<core::PauseFrame>();
     m_watermark = std::make_shared<core::Watermark>();
+    m_timestamp = std::make_shared<core::TimestampOverlay>();
 
     m_videoEncoder->SetSyncClock(m_sync);
     m_audioEncoder->SetSyncClock(m_sync);
@@ -101,9 +102,10 @@ TGCapturer::TGCapturer(GameID gameId) : m_gameId(gameId)
     if (!linked) {
         TG_LOGE("TGCapturer: 总线拓扑建立失败");
     }
-    // 暂停图 / 水印作为合成器的图层；主画面到达即为视频采集"活着"
+    // 暂停图 / 水印 / 时间水印作为合成器的图层；主画面到达即为视频采集"活着"
     m_compositor->SetPauseLayer(m_pauseFrame);
     m_compositor->SetWatermarkLayer(m_watermark);
+    m_compositor->SetTimestampLayer(m_timestamp);
     m_compositor->SetMainActivityObserver([this](int64_t nowUs) { m_videoWatch.OnActivity(nowUs); });
     m_audioMixer->SetOutputObserver([this](int64_t nowUs) { m_audioWatch.OnActivity(nowUs); });
     m_audioMixer->SetHeartbeat([this] { LogHeartbeat(); });
@@ -125,6 +127,13 @@ TGCapturer::~TGCapturer()
 // ------------------------------------------------------------------ 采集源
 bool TGCapturer::IsSupported(CaptureFeature feature) const
 {
+    // 文字能力与平台无关，只取决于构建开关（内置点阵 / TG_WITH_TEXT 的 FreeType）
+    if (feature == CaptureFeature::TimestampOverlay) {
+        return true;
+    }
+    if (feature == CaptureFeature::UnicodeText) {
+        return core::HasFreeTypeBackend();
+    }
 #if defined(_WIN32)
     (void)feature;
     return true;    // 屏幕 / 窗口 / 麦克风 / 扬声器 全部支持
@@ -1908,6 +1917,21 @@ int TGCapturer::SetupWatermarkInfo(const WatermarkParams& params)
         TG_LOGE("TGCapturer: SetupWatermarkInfo 失败 index=%u ret=%d", params.index, ret);
     }
     return ret;
+}
+
+int TGCapturer::SetTimestampOverlay(const TimestampOverlayParams& params)
+{
+    // 不进生命周期锁：图层对象自带锁，下一帧起生效；推流 / 预览中随时可改
+    std::string why;
+    const int ret = m_timestamp->Configure(params, &why);
+    if (ret != TGErr_OK) {
+        TG_LOGE("TGCapturer: SetTimestampOverlay 失败 ret=%d: %s", ret, why.c_str());
+        return ret;
+    }
+    if (!params.enabled) {
+        TG_LOGI("TGCapturer: 时间水印关闭");
+    }
+    return TGErr_OK;
 }
 
 int TGCapturer::SetAVTimeout(int64_t audioTimeoutMs, int64_t videoTimeoutMs)

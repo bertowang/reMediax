@@ -4,6 +4,18 @@
 
 ## Unreleased
 
+### 时间水印：本地实时时间（日期 + 秒）
+- 新接口 `ITGCapturer::SetTimestampOverlay(TimestampOverlayParams)`：任意状态可调、下一帧生效；格式（strftime 风格子集）、
+  位置（0 ~ 5 / 比例坐标）、字高比例、文字 / 底框颜色、描边、字体文件。画在合成器最上层（水印之上），推流与预览都有；
+  时间取帧的采集时刻换算成本机墙钟；渲染结果每秒缓存一次，每帧只做一次 alpha 混合。GPU 硬件帧跳过并限频告警。
+- 不需要重编 ffmpeg（不用 `drawtext` / libavfilter）。字形两种后端，编译开关 `TG_WITH_TEXT`（`scripts/build.py --with-text`）选择：
+  默认内置点阵字体（X11 misc-fixed 10x20，公有领域；仅 ASCII，零依赖）；`ON` 时链 TGCapture3rd 的 `freetype` 组件，
+  TrueType / 系统默认字体渲染，支持中文。`CaptureFeature::TimestampOverlay` / `UnicodeText` 可查询。
+  `TG_WITH_TEXT=ON` 而依赖目录没有 freetype 时，配置阶段直接给出补编命令与具体缺失原因
+  （依赖目录的 `TGCapture3rdConfig.cmake` 需由新版 FfmpegCompileShell 生成：旧产物补一次 `python build.py export -o <产物根目录>`）。
+- 命令行 demo（Windows / Linux·macOS）：`--timestamp` 开启，`--timestamp-format/-pos/-size/-color/-bg/-font` 可选。
+- 新增 `src/core/TextOverlay.*`、`src/core/BitmapFont10x20.inc`、`tests/test_text_overlay.cpp`（12 例）。
+
 ### Windows 图形界面工具 `tg_capture_gui` 跟进新能力
 - 视频源新增「本地视频文件」（`CreateLocalFileCapture`，可循环、可带文件音轨）。
 - 预览：「开启预览」独立于开播，预览与直播共用一个实例（两者都停了才 `Destroy`）；`PreviewView` 在内核预览线程把 NV12 转 BGRA 并等比缩放，

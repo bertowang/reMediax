@@ -148,6 +148,8 @@ enum class CaptureFeature
     Window = 1,      // 指定窗口采集
     Microphone = 2,  // 麦克风
     Speaker = 3,     // 扬声器 / 系统声音
+    TimestampOverlay = 4,   // 时间水印（SetTimestampOverlay）：全平台支持（内置点阵字体，仅 ASCII）
+    UnicodeText = 5,        // 文字可用任意 Unicode 字符（中文等）与 TrueType 字体：编译时 TG_WITH_TEXT=ON（FreeType）才支持
 };
 
 // 性能模式：Cpu = 传统 CPU 链路（采集→内存→软编/硬编）；
@@ -336,6 +338,31 @@ struct WatermarkParams
     int32_t offset_x = 0;
     int32_t offset_y = 0;
     std::string url;
+};
+
+// ------------------------------------------------------------------ 时间水印
+// 把本地实时时间（本机时区，含日期与秒）画在画面上：位于所有图层（含水印）之上，推流画面与预览画面都有。
+// 时间取每帧的采集时刻（换算成墙钟），不是编码时刻 —— 编码排队 / 网络抖动不会让时间跳动。
+// 位置 / 字号用相对画布的比例描述，按每帧的实际尺寸换算 —— 运行期切分辨率后自动跟随。
+// 与水印一样画在采集画面上，编码前的裁剪 / 翻转 / 旋转会一并作用于文字；GPU 硬件帧直通时跳过。
+//
+// 字形来源由编译开关决定（见 CaptureFeature::UnicodeText）：
+//   默认           内置点阵字体（X11 misc-fixed 10x20），只有 ASCII，非 ASCII 字符画成 '?'；零额外依赖
+//   TG_WITH_TEXT   FreeType 渲染 TrueType / OpenType 字体（fontPath 或系统默认字体），支持中文、抗锯齿
+struct TimestampOverlayParams
+{
+    bool enabled = false;
+    // strftime 风格：%Y %y %m %d %H %I %M %S %p %j %a %F(=%Y-%m-%d) %T(=%H:%M:%S) %%，其余字符原样输出（UTF-8）
+    std::string format = "%Y-%m-%d %H:%M:%S";
+    int32_t position = 0;           // 0左上 1右上 2左下 3右下 4顶中 5底中；-1 = 用 x / y
+    float x = 0.0f;                 // position = -1 时文字框左上角，画布宽 / 高的比例 [0, 1)
+    float y = 0.0f;
+    float margin = 0.02f;           // 相对位置时距画布边缘的距离，画布高的比例 [0, 0.5]
+    float fontSize = 0.04f;         // 文字高度，画布高的比例 (0, 0.5]；换算后不小于 10 像素
+    uint32_t textColor = 0xFFFFFFFF;        // ARGB（A = 不透明度）
+    uint32_t backgroundColor = 0x80000000;  // ARGB；A = 0 不画底框
+    bool outline = true;            // 文字描边（颜色自动取与文字反差大的黑 / 白），无底框时在亮画面上也看得清
+    std::string fontPath;           // 字体文件（.ttf / .ttc / .otf）；空 = 系统默认字体。仅 TG_WITH_TEXT 构建有效
 };
 
 // ------------------------------------------------------------------ 运行期音频源

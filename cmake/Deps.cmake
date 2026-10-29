@@ -1,7 +1,7 @@
 # 第三方依赖 TGCapture3rd（FfmpegCompileShell 的产出目录），按标准 CMake 包引入：
 #
-#   find_package(TGCapture3rd CONFIG COMPONENTS ffmpeg libyuv)
-#   → TGCapture3rd::avformat / avcodec / swscale / swresample / avutil / libyuv 等导入目标
+#   find_package(TGCapture3rd CONFIG COMPONENTS ffmpeg libyuv [freetype])
+#   → TGCapture3rd::avformat / avcodec / swscale / swresample / avutil / libyuv [/ freetype] 等导入目标
 #
 # 包配置 TGCapture3rdConfig.cmake 由 FfmpegCompileShell 在每次 build 结束时写到产物根目录；
 # 旧产物没有的话补一份：python build.py export -o <产物根目录>。
@@ -12,6 +12,10 @@
 # 包的查找顺序（CMake 标准规则）：
 #   -DTGCapture3rd_DIR=<根> / -DTGCapture3rd_ROOT=<根> / -DCMAKE_PREFIX_PATH=<根>
 #   > TG_3RD_ROOT（作为 HINTS；由根 CMakeLists.txt 解析：--3rd > 环境变量 > 同级目录）
+#
+# 两种依赖场景（与 FfmpegCompileShell 的两种构建一一对应）：
+#   TG_WITH_TEXT=OFF  ffmpeg + libyuv                （python build.py build ...）
+#   TG_WITH_TEXT=ON   ffmpeg + libyuv + freetype     （python build.py build ... --with-text）
 
 # 平台 / ABI 明确交给包配置，与本工程的 TG_PLATFORM / TG_ABI 保持一致；
 # Windows 上包配置还会核对编译器的目标架构（-A），不一致时在配置阶段就报错，而不是等到 LNK1112
@@ -30,14 +34,36 @@ if(EXISTS "${TG_3RD_ROOT}" AND NOT EXISTS "${TG_3RD_ROOT}/TGCapture3rdConfig.cma
         "  在 FfmpegCompileShell 下执行一次：python build.py export -o \"${TG_3RD_ROOT}\"")
 endif()
 
+set(_tg_3rd_components ffmpeg libyuv)
+if(TG_WITH_TEXT)
+    list(APPEND _tg_3rd_components freetype)
+endif()
+
 # NO_CMAKE_FIND_ROOT_PATH：Android / OHOS 工具链把包查找限定在 sysroot 里（CMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY），
 # 而 TGCapture3rd 在宿主机上
-find_package(TGCapture3rd 1 CONFIG REQUIRED
-    COMPONENTS ffmpeg libyuv
+find_package(TGCapture3rd 1 CONFIG
+    COMPONENTS ${_tg_3rd_components}
     HINTS "${TG_3RD_ROOT}"
     NO_CMAKE_FIND_ROOT_PATH)
+if(NOT TGCapture3rd_FOUND AND TG_WITH_TEXT)
+    # 单独查一次 freetype（QUIET，不带必需组件）：find_package 失败时不会带回任何变量，
+    # 而这一次会成功返回，于是能拿到"为什么没有 freetype"的具体原因与依赖目录
+    find_package(TGCapture3rd 1 CONFIG QUIET COMPONENTS freetype HINTS "${TG_3RD_ROOT}" NO_CMAKE_FIND_ROOT_PATH)
+    if(NOT TGCapture3rd_freetype_FOUND)
+        # 最常见的情况：开了文字但依赖目录是"不带字符集库"的构建，给出可直接执行的补救命令
+        message(FATAL_ERROR
+            "TG_WITH_TEXT=ON 需要 TGCapture3rd 的 freetype 组件：${TGCapture3rd_freetype_REASON}\n"
+            "  方式一（要中文 / TrueType）：用 FfmpegCompileShell 补编 freetype（ffmpeg 不受影响，可只补这一个库）：\n"
+            "      python build.py build --platform ${TG_PLATFORM} --libs freetype -o \"${TGCapture3rd_ROOT}\"\n"
+            "      # 或整场景重编：python build.py build --platform ${TG_PLATFORM} --with-text -o <新目录>\n"
+            "  方式二（只要 ASCII 时间）：去掉 -DTG_WITH_TEXT=ON，用内置点阵字体，不需要任何额外依赖")
+    endif()
+endif()
+if(NOT TGCapture3rd_FOUND)
+    message(FATAL_ERROR "未找到可用的 TGCapture3rd（HINTS ${TG_3RD_ROOT}）：${TGCapture3rd_NOT_FOUND_MESSAGE}")
+endif()
 
-# 内核直接用到的只有 ffmpeg 与 libyuv（采集帧的格式转换 / 缩放）；
+# 内核直接用到的只有 ffmpeg 与 libyuv（采集帧的格式转换 / 缩放），TG_WITH_TEXT 时再加 freetype；
 # openssl / srt / fdk-aac / openh264 / zlib 由 ffmpeg 的导入目标按需传递（Windows 下已并入 ffmpeg DLL）
 function(tg_link_thirdparty target)
     target_link_libraries(${target} PUBLIC
@@ -47,4 +73,8 @@ function(tg_link_thirdparty target)
         TGCapture3rd::swresample
         TGCapture3rd::avutil
         TGCapture3rd::libyuv)
+    if(TG_WITH_TEXT)
+        target_link_libraries(${target} PUBLIC TGCapture3rd::freetype)
+        target_compile_definitions(${target} PRIVATE TG_WITH_TEXT=1)
+    endif()
 endfunction()

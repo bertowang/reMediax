@@ -11,6 +11,7 @@
 #include "core/Clock.h"
 #include "core/Logger.h"
 #include "core/PauseFrame.h"
+#include "core/TextOverlay.h"
 #include "core/Watermark.h"
 
 namespace TGCapture::nodes
@@ -94,6 +95,12 @@ void VideoCompositorNode::SetWatermarkLayer(std::shared_ptr<core::Watermark> wat
 {
     std::lock_guard<std::mutex> lock(m_layerMutex);
     m_watermark = std::move(watermark);
+}
+
+void VideoCompositorNode::SetTimestampLayer(std::shared_ptr<core::TimestampOverlay> timestamp)
+{
+    std::lock_guard<std::mutex> lock(m_layerMutex);
+    m_timestamp = std::move(timestamp);
 }
 
 void VideoCompositorNode::SetOverlayScenes(core::OverlayScenePtr program, core::OverlayScenePtr preview)
@@ -267,12 +274,14 @@ bool VideoCompositorNode::SubmitInput(size_t port, core::FramePtr frame)
 
     std::shared_ptr<core::PauseFrame> pause;
     std::shared_ptr<core::Watermark> watermark;
+    std::shared_ptr<core::TimestampOverlay> timestamp;
     core::OverlayScenePtr program;
     core::OverlayScenePtr preview;
     {
         std::lock_guard<std::mutex> lock(m_layerMutex);
         pause = m_pause;
         watermark = m_watermark;
+        timestamp = m_timestamp;
         program = m_programScene;
         preview = m_previewScene;
     }
@@ -333,6 +342,22 @@ bool VideoCompositorNode::SubmitInput(size_t port, core::FramePtr frame)
         }
     }
 
+    // ---- 时间水印（最上层）：时间取本帧的采集时刻（单调时钟）换算成墙钟，与编码排队无关 ----
+    if (timestamp && timestamp->Enabled()) {
+        if (cpuNv12) {
+            const int64_t nowMono = core::MonotonicClock::NowUs();
+            const int64_t age = frame->captureUs != AV_NOPTS_VALUE ? nowMono - frame->captureUs : 0;
+            // 外灌帧的时间戳可能不在内核时钟域：偏差超过 5s 就按"现在"算
+            const int64_t wallUs = core::WallClockNowUs() - (age >= 0 && age < 5000000 ? age : 0);
+            timestamp->BlendOnto(*frame, wallUs);
+            if (previewFrame) {
+                timestamp->BlendOnto(*previewFrame, wallUs);
+            }
+        } else if (frame->hwHandle) {
+            TG_LOGW_THROTTLED(3000000, "TGCapturer: 硬件帧路径暂不支持时间水印，本帧已跳过");
+        }
+    }
+
     m_composed.fetch_add(1, std::memory_order_relaxed);
     // 预览与推流共享像素时（场景相同），下游不得修改像素。预览给一份浅拷贝的帧头：
     // 推流链路会改写 ptsUs 等元数据，而预览在另一个线程上读，共用帧头会产生数据竞争
@@ -346,6 +371,7 @@ std::string VideoCompositorNode::DumpState() const
 {
     bool pauseValid = false;
     bool watermark = false;
+    bool timestamp = false;
     size_t programLayers = 0;
     uint64_t programVersion = 0;
     bool previewDiffers = false;
@@ -353,17 +379,18 @@ std::string VideoCompositorNode::DumpState() const
         std::lock_guard<std::mutex> lock(m_layerMutex);
         pauseValid = m_pause && m_pause->Valid();
         watermark = m_watermark && !m_watermark->Empty();
+        timestamp = m_timestamp && m_timestamp->Enabled();
         if (m_programScene) {
             programLayers = m_programScene->layers.size();
             programVersion = m_programScene->version;
         }
         previewDiffers = m_previewScene != m_programScene;
     }
-    char buf[192];
-    std::snprintf(buf, sizeof(buf), "layers=[main%s,overlays=%zu(v%llu%s)%s] muted=%d composed=%llu",
+    char buf[208];
+    std::snprintf(buf, sizeof(buf), "layers=[main%s,overlays=%zu(v%llu%s)%s%s] muted=%d composed=%llu",
                   pauseValid ? ",pause" : "", programLayers, static_cast<unsigned long long>(programVersion),
-                  previewDiffers ? ",staged" : "", watermark ? ",watermark" : "", m_muted.load() ? 1 : 0,
-                  static_cast<unsigned long long>(m_composed.load()));
+                  previewDiffers ? ",staged" : "", watermark ? ",watermark" : "", timestamp ? ",timestamp" : "",
+                  m_muted.load() ? 1 : 0, static_cast<unsigned long long>(m_composed.load()));
     return buf;
 }
 

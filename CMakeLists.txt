@@ -32,6 +32,11 @@ set(TG_ABI "x64" CACHE STRING "ABI: x64 | arm64-v8a | armeabi-v7a | x86_64 | arm
 set(TG_3RD_ROOT "" CACHE PATH "TGCapture3rd 根目录（FfmpegCompileShell 的产出目录）")
 option(TG_BUILD_DEMO "编译测试 demo" ON)
 option(TG_BUILD_TESTS "编译单元测试 tg_tests" ON)
+# 文字渲染后端（时间水印等）：
+#   OFF（默认）内置点阵字体，仅 ASCII，不引入任何额外依赖；
+#   ON         用 FreeType 渲染 TrueType 字体（支持中文 / 抗锯齿），需要 TGCapture3rd 里有 freetype 组件
+#              （FfmpegCompileShell: python build.py build ... --with-text）。
+option(TG_WITH_TEXT "文字渲染用 FreeType（需 TGCapture3rd 的 freetype 组件）" OFF)
 # 内存/线程检查（仅 clang/gcc）：address | thread | undefined，留空不开启。
 # 作用于 tgcapture 及所有 demo / 测试目标，便于在 macOS 本机做 L1 回归。
 set(TG_SANITIZE "" CACHE STRING "Sanitizer: address | thread | undefined（留空关闭）")
@@ -69,7 +74,7 @@ if(NOT TG_3RD_ROOT)
         endif()
     endif()
 endif()
-message(STATUS "TGCapture: platform=${TG_PLATFORM} abi=${TG_ABI}")
+message(STATUS "TGCapture: platform=${TG_PLATFORM} abi=${TG_ABI} text=${TG_WITH_TEXT}")
 message(STATUS "TGCapture: 3rd=${TG_3RD_ROOT}  (来源: ${TG_3RD_SOURCE})")
 
 # ---------------------------------------------------------------- 源码
@@ -85,6 +90,7 @@ set(TG_CORE_SOURCES
     src/core/AudioMixer.cpp
     src/core/Overlay.cpp
     src/core/PauseFrame.cpp
+    src/core/TextOverlay.cpp
     src/core/VideoTransform.cpp
     src/core/Watermark.cpp
     src/mux/Muxer.cpp
@@ -258,6 +264,7 @@ if(TG_BUILD_TESTS)
         tests/test_resolution.cpp
         tests/test_file_audio.cpp
         tests/test_overlay.cpp
+        tests/test_text_overlay.cpp
         tests/test_health.cpp
         tests/test_traffic_meter.cpp
         tests/test_error_codes.cpp

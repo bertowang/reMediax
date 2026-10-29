@@ -33,6 +33,8 @@ using AudioEncoderParams = TGCapture::AudioEncoderParams;
 using MuxerParams = TGCapture::MuxerParams;
 using PauseParams = TGCapture::PauseParams;
 using WatermarkParams = TGCapture::WatermarkParams;
+using TimestampOverlayParams = TGCapture::TimestampOverlayParams;
+using CaptureFeature = TGCapture::CaptureFeature;
 
 // 门面
 using IESMediaXCapturer = TGCapture::ITGCapturer;

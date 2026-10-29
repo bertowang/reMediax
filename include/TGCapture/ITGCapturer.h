@@ -139,6 +139,11 @@ public:
     virtual bool MuteVideo(bool mute) = 0;
     virtual int SetPauseInfo(const PauseParams& params) = 0;
     virtual int SetupWatermarkInfo(const WatermarkParams& params) = 0;
+    // 时间水印（见 TimestampOverlayParams）：任意状态可调，下一帧生效；enabled = false 关闭。
+    // 失败：TGErr_InvalidArgument（格式串为空 / 含不支持的占位符 / 非法 UTF-8，位置 / 字号越界，字体文件打不开）
+    //       TGErr_NotSupported（指定了 fontPath，但本构建未编入 FreeType —— TG_WITH_TEXT=OFF）
+    // 失败时保持原设置不变
+    virtual int SetTimestampOverlay(const TimestampOverlayParams& params) = 0;
     // 断流判定阈值：某一路超过对应时长没有新数据，上报 TGErr_AudioCaptureStalled /
     // TGErr_VideoCaptureStalled，恢复时发对应的 Notify。≤0 = 关闭该路看护。
     // 非法入参返回 TGErr_InvalidArgument。可在运行期调用，立即生效。

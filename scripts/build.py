@@ -7,6 +7,8 @@
     python scripts/build.py --platform ios
     python scripts/build.py --platform macos [--sanitize address|thread|undefined] [-t Debug]
 
+    # 文字渲染用 FreeType（时间水印支持中文 / TrueType）；依赖目录需由 FfmpegCompileShell --with-text 编出
+    python scripts/build.py --platform windows --with-text
     # 只生成 IDE 工程并打开（VS2022 / Android Studio / Xcode），不编译
     python scripts/build.py --platform windows --ide
     python scripts/build.py --platform android --ide
@@ -109,6 +111,10 @@ def main() -> int:
     parser.add_argument("--clean", action="store_true", help="清理后重新构建")
     parser.add_argument("--no-demo", action="store_true", help="不编译 demo")
     parser.add_argument("--no-tests", action="store_true", help="不编译单元测试 tg_tests")
+    parser.add_argument("--with-text", action="store_true",
+                        help="文字渲染用 FreeType（-DTG_WITH_TEXT=ON；时间水印支持中文 / TrueType 字体）。"
+                             "需要 TGCapture3rd 里有 freetype（FfmpegCompileShell build --with-text）。"
+                             "构建目录带 -text 后缀，与不带文字库的构建分开")
     parser.add_argument("--sanitize", default=None, choices=["address", "thread", "undefined"],
                         help="开启 sanitizer（仅 clang/gcc；构建目录会带上后缀以免与普通构建混用）")
     parser.add_argument("--ndk", default=None,
@@ -131,6 +137,8 @@ def main() -> int:
     if args.sanitize and args.platform == "windows":
         parser.error("--sanitize 只支持 clang/gcc 平台")
     suffix = {"address": "-asan", "thread": "-tsan", "undefined": "-ubsan"}.get(args.sanitize, "")
+    if args.with_text:
+        suffix = "-text" + suffix
     build_dir = DEFAULT_BUILD_DIR / f"{args.platform}{'-sim' if args.sim else ''}-{abi}{suffix}"
     if args.platform in ("ios", "macos") and (args.ide or args.generator == "Xcode"):
         # Xcode 工程与命令行构建（Makefiles）分目录：同一目录换生成器 CMake 会直接报错
@@ -155,6 +163,7 @@ def main() -> int:
         f"-DTG_BUILD_DEMO={'ON' if with_demo else 'OFF'}",
         f"-DTG_BUILD_TESTS={'OFF' if args.no_tests else 'ON'}",
         f"-DTG_SANITIZE={args.sanitize or ''}",
+        f"-DTG_WITH_TEXT={'ON' if args.with_text else 'OFF'}",
     ]
     if args.third:
         # 显式指定才透传；不给时由 CMakeLists.txt 按 环境变量 > 同级目录 解析

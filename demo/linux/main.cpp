@@ -114,6 +114,9 @@ struct Options
     bool        videoFileLoop = true;
     // 开播前先开预览（preview.snap 需要）
     bool        preview = false;
+    // 时间水印（本地实时时间，含日期与秒）：--timestamp 开启，其余参数可选
+    bool        timestamp = false;
+    TimestampOverlayParams timestampParams;
 
     // 工具
     std::string ffmpegBin = "ffmpeg";
@@ -158,6 +161,16 @@ void PrintUsage()
            "    --script <file>         每行 \"<秒> <动作> [参数…]\"，# 开头为注释\n"
            "    --do \"<秒> <动作> …\"    单条动作，可多次；与 --script 合并后按时刻排序\n"
            "    --preview               开播前先开预览（preview.snap 需要）\n"
+           "  时间水印（本地实时时间，含日期与秒；推流与预览画面都有）:\n"
+           "    --timestamp             开启（不加则不显示）\n"
+           "    --timestamp-format <f>  strftime 风格，默认 \"%%Y-%%m-%%d %%H:%%M:%%S\"\n"
+           "                            支持 %%Y %%y %%m %%d %%H %%I %%M %%S %%p %%j %%a %%F %%T %%%%\n"
+           "    --timestamp-pos <n>     0左上 1右上 2左下 3右下 4顶中 5底中，默认 0\n"
+           "    --timestamp-size <f>    字高 = 画面高 × f，默认 0.04\n"
+           "    --timestamp-color <hex> 文字颜色 AARRGGBB，默认 FFFFFFFF\n"
+           "    --timestamp-bg <hex>    底框颜色 AARRGGBB，默认 80000000（半透明黑），00000000 = 无底框\n"
+           "    --timestamp-font <path> TrueType 字体（中文需要；仅 -DTG_WITH_TEXT=ON 的构建支持，\n"
+           "                            不给则用系统默认字体；默认构建为内置点阵字体，只有 ASCII）\n"
            "  动作（参数 key=value，布尔取 0/1）:\n"
            "    res <档位|宽x高> [portrait]           运行期切换编码分辨率\n"
            "    audio.add <mic|speaker|pcm|file> [id|-] [path] [vol=] [loop=]\n"
@@ -240,6 +253,13 @@ Options ParseArgs(int argc, char** argv)
         else if (a == "--video-file")  { if (auto* v = next(i, "--video-file"))  opt.videoFile = v; }
         else if (a == "--video-file-no-loop") { opt.videoFileLoop = false; }
         else if (a == "--preview")     { opt.preview = true; }
+        else if (a == "--timestamp")   { opt.timestamp = true; }
+        else if (a == "--timestamp-format") { if (auto* v = next(i, "--timestamp-format")) opt.timestampParams.format = v; }
+        else if (a == "--timestamp-pos")    { if (auto* v = next(i, "--timestamp-pos"))    opt.timestampParams.position = std::atoi(v); }
+        else if (a == "--timestamp-size")   { if (auto* v = next(i, "--timestamp-size"))   opt.timestampParams.fontSize = static_cast<float>(std::atof(v)); }
+        else if (a == "--timestamp-color")  { if (auto* v = next(i, "--timestamp-color"))  opt.timestampParams.textColor = static_cast<uint32_t>(std::strtoul(v, nullptr, 16)); }
+        else if (a == "--timestamp-bg")     { if (auto* v = next(i, "--timestamp-bg"))     opt.timestampParams.backgroundColor = static_cast<uint32_t>(std::strtoul(v, nullptr, 16)); }
+        else if (a == "--timestamp-font")   { if (auto* v = next(i, "--timestamp-font"))   opt.timestampParams.fontPath = v; }
         else if (a == "--sample-rate") { if (auto* v = next(i, "--sample-rate")) opt.sampleRate = std::atoi(v); }
         else if (a == "--channels")    { if (auto* v = next(i, "--channels"))    opt.channels = std::atoi(v); }
         else if (a == "--ffmpeg")      { if (auto* v = next(i, "--ffmpeg"))      opt.ffmpegBin = v; }
@@ -852,6 +872,20 @@ int main(int argc, char** argv)
         ITGCapturer::Destroy(capturer);
         ITGCapturerMgr::UnInit();
         return 1;
+    }
+    if (opt.timestamp) {
+        TimestampOverlayParams ts = opt.timestampParams;
+        ts.enabled = true;
+        const int ret = capturer->SetTimestampOverlay(ts);
+        printf("[demo] 时间水印 format=\"%s\" pos=%d size=%.3f 字形=%s ret=%d\n",
+               ts.format.c_str(), ts.position, ts.fontSize,
+               capturer->IsSupported(CaptureFeature::UnicodeText) ? "FreeType(TG_WITH_TEXT)" : "内置点阵(仅 ASCII)",
+               ret);
+        if (ret != 0) {
+            ITGCapturer::Destroy(capturer);
+            ITGCapturerMgr::UnInit();
+            return 1;
+        }
     }
     if (opt.preview) {
         const int ret = capturer->StartPreview();
