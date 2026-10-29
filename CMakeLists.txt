@@ -86,6 +86,7 @@ set(TG_CORE_SOURCES
     src/core/Watermark.cpp
     src/mux/Muxer.cpp
     src/nodes/AudioNodes.cpp
+    src/nodes/VideoNodes.cpp
 )
 
 set(TG_PLATFORM_SOURCES "")
@@ -248,6 +249,7 @@ if(TG_BUILD_TESTS)
         tests/test_queue.cpp
         tests/test_bus.cpp
         tests/test_bus_topology.cpp
+        tests/test_video_nodes.cpp
         tests/test_health.cpp
         tests/test_traffic_meter.cpp
         tests/test_error_codes.cpp

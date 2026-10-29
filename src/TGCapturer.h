@@ -24,6 +24,7 @@
 #include "core/Watermark.h"
 #include "mux/Muxer.h"
 #include "nodes/AudioNodes.h"
+#include "nodes/VideoNodes.h"
 
 namespace TGCapture
 {
@@ -107,7 +108,8 @@ private:
     // 等待在途的 Stop（含锁外收尾）结束。返回 false 表示调用方自己就是停机线程，不应再停。
     bool WaitStopSettled(std::unique_lock<std::mutex>& lock);
 
-    void OnVideoFrame(core::FramePtr frame);
+    // 绑定主画面源：门面记录 + vsrc.main 节点接管其产帧回调
+    void BindVideoSource(capture::VideoSourceBase* source);
     // 外部注入的音频（PushExternalAudioFrame）也进混流器
     void OnAudioFrame(AudioCapSourceType type, core::FramePtr frame);
     // 经总线发布（异步：由事件分发线程投递，永不阻塞调用线程）
@@ -177,27 +179,14 @@ private:
     std::shared_ptr<core::AudioClock> m_audioClock;
     std::shared_ptr<core::VideoPtsGenerator> m_videoPtsGen;
     std::shared_ptr<core::VideoOnlyTimeline> m_videoOnlyTimeline;
-    int64_t m_videoIntervalUs = 33333;
-    // 采集线程 / 外灌线程 ++，宿主线程在 StopLocked 里读 —— 必须原子（同 m_bpDropped）
-    std::atomic<uint64_t> m_syncDropped{0};
-    // 编码前背压丢帧（编码器积压 >= kMaxEncoderPending）：之前不计数，E 场景丢 117 帧统计里不可见
-    std::atomic<uint64_t> m_bpDropped{0};
-    // 音频主时钟首帧等待：音频未就绪时视频不发帧（避免就绪后 PTS 回退被整段丢弃）
-    // 对齐 MediaX：fallback 判定每帧独立进行，不保留"已降级"状态；
-    // 只保留一个 **节流**日志闸门避免刷屏，不影响后续"音频恢复 → 自动切回主时钟"。
-    int64_t m_audioWaitStartUs = 0;
-    // 最后一个已提交编码的视频帧（内部时间轴）：主时钟 ↔ wall-clock 切换时据此接续，
-    // 保证两条时间轴首尾相接、PTS 不回退。只在视频采集线程读写，Prepare 时复位
-    int64_t m_lastVideoPtsUs = -1;
-    int64_t m_lastVideoCaptureUs = -1;
 
     // 总线：必须声明在所有节点之前 —— 成员按声明逆序析构，总线最后销毁，
     // 节点线程退出过程中发布的事件才不会落在已销毁的对象上
     core::Bus m_bus;
 
     // 内核（总线节点）。数据流：
-    //   asrc.* → audio_mixer → audio_encoder ─┐
-    //   采集 ─────────────────→ video_encoder ─┴→ muxer
+    //   asrc.* → audio_mixer → audio_encoder ──────────────────────┐
+    //   vsrc.main → video_compositor → video_sync → video_encoder ─┴→ muxer
     std::shared_ptr<codec::VideoEncoder> m_videoEncoder;
     std::shared_ptr<codec::AudioEncoder> m_audioEncoder;
     std::shared_ptr<Muxer> m_muxer;
@@ -205,8 +194,10 @@ private:
     // 音频链路：混音节点（按采样点加和 + 每路 PI/BURST 时钟校正，自带混音时钟线程）与各路源节点
     std::shared_ptr<nodes::AudioMixerNode> m_audioMixer;
     std::vector<std::shared_ptr<nodes::AudioSourceNode>> m_audioSourceNodes;   // 原生源（AddAudioSource）
-    // 热路径入口缓存：每帧不再按字符串名查表
-    core::BusNodePtr m_videoIn;
+    // 视频链路：主画面源 → 图层合成（暂停图 / 水印）→ 编码前同步（背压 + 音画同步）
+    std::shared_ptr<nodes::VideoSourceNode> m_vsrcMain;
+    std::shared_ptr<nodes::VideoCompositorNode> m_compositor;
+    std::shared_ptr<nodes::VideoSyncNode> m_videoSync;
 
     // 宿主回调：设置与调用可能在不同线程，用互斥保护。调用时先拷贝出来再在锁外执行
     std::mutex m_callbackMutex;
@@ -215,10 +206,6 @@ private:
     OnStartCallback m_onStart;
     OnStopCallback m_onStop;
     OnNotifyCallback m_onNotify;
-
-    // 运行期
-    std::atomic_bool m_videoMuted{false};
-    std::atomic_bool m_firstFrameSent{false};
 
     // 暂停静帧（对齐 MediaX ESGeneratePicture::SetPausePic）
     std::shared_ptr<core::PauseFrame> m_pauseFrame;

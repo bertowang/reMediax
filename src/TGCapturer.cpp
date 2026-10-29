@@ -52,31 +52,48 @@ TGCapturer::TGCapturer(GameID gameId) : m_gameId(gameId)
     m_audioEncoder = std::make_shared<codec::AudioEncoder>();
     m_muxer = std::make_shared<Muxer>();
     m_audioMixer = std::make_shared<nodes::AudioMixerNode>();
+    m_vsrcMain = std::make_shared<nodes::VideoSourceNode>("vsrc.main");
+    m_compositor = std::make_shared<nodes::VideoCompositorNode>();
+    m_videoSync = std::make_shared<nodes::VideoSyncNode>();
     m_pauseFrame = std::make_shared<core::PauseFrame>();
     m_watermark = std::make_shared<core::Watermark>();
 
     m_videoEncoder->SetSyncClock(m_sync);
     m_audioEncoder->SetSyncClock(m_sync);
 
-    // 共享服务经总线上下文注入（不是节点）：混音节点按输出推进音频主时钟
+    // 共享服务经总线上下文注入（不是节点）：混音节点按输出推进音频主时钟，
+    // video_sync 据音频主时钟反推视频 PTS
     m_bus.Context().Provide(m_audioClock);
     m_bus.Context().Provide(m_sync);
+    m_bus.Context().Provide(m_videoPtsGen);
+    m_bus.Context().Provide(m_videoOnlyTimeline);
 
-    // 总线拓扑：asrc.* → audio_mixer → audio_encoder → muxer；采集 → video_encoder → muxer
+    // 总线拓扑：
+    //   asrc.* → audio_mixer → audio_encoder → muxer
+    //   vsrc.main → video_compositor →(out0) video_sync → video_encoder → muxer
     // 数据、命令、事件都走这一条总线（见 core/Bus.h）。音频源节点在 AddAudioSource / 首次外灌时接入
     const bool linked = m_bus.Begin()
                             .Register("video_encoder", m_videoEncoder)
                             .Register("audio_encoder", m_audioEncoder)
                             .Register("muxer", m_muxer)
                             .Register("audio_mixer", m_audioMixer)
+                            .Register("vsrc.main", m_vsrcMain)
+                            .Register("video_compositor", m_compositor)
+                            .Register("video_sync", m_videoSync)
                             .Link("video_encoder", "muxer")
                             .Link("audio_encoder", "muxer")
                             .Link("audio_mixer", "audio_encoder")
+                            .Link("vsrc.main", 0, "video_compositor", nodes::VideoCompositorNode::kMainInput)
+                            .Link("video_compositor", nodes::VideoCompositorNode::kProgramOutput, "video_sync", 0)
+                            .Link("video_sync", "video_encoder")
                             .Commit();
     if (!linked) {
         TG_LOGE("TGCapturer: 总线拓扑建立失败");
     }
-    m_videoIn = m_bus.Get("video_encoder");
+    // 暂停图 / 水印作为合成器的图层；主画面到达即为视频采集"活着"
+    m_compositor->SetPauseLayer(m_pauseFrame);
+    m_compositor->SetWatermarkLayer(m_watermark);
+    m_compositor->SetMainActivityObserver([this](int64_t nowUs) { m_videoWatch.OnActivity(nowUs); });
     m_audioMixer->SetOutputObserver([this](int64_t nowUs) { m_audioWatch.OnActivity(nowUs); });
     m_audioMixer->SetHeartbeat([this] { LogHeartbeat(); });
 
@@ -184,7 +201,7 @@ IVideoSource* TGCapturer::CreateScreenCapture(int index, VideoCapMode mode, Vide
 
 #if TG_HAS_NATIVE_CAPTURE
     m_ownedVideoSources.push_back(source);
-    m_videoSource = source.get();
+    BindVideoSource(source.get());
     return source.get();
 #else
     TG_LOGW("TGCapturer: 当前平台无屏幕采集实现（外部注入请用 PushExternalVideoFrame）");
@@ -201,7 +218,7 @@ IVideoSource* TGCapturer::CreateWindowCapture(void* handle, VideoCapMode mode, V
 #if defined(_WIN32)
     auto source = std::make_shared<platform::WinScreenCapture>(static_cast<HWND>(handle), mode, strategy);
     m_ownedVideoSources.push_back(source);
-    m_videoSource = source.get();
+    BindVideoSource(source.get());
     return source.get();
 #else
     (void)handle;
@@ -318,7 +335,7 @@ void TGCapturer::LogHeartbeat()
             static_cast<unsigned long long>(vs.skipped),
             static_cast<unsigned long long>(vs.jumpWarns),
             static_cast<unsigned long long>(vs.staleResets),
-            static_cast<unsigned long long>(m_bpDropped.load()),
+            static_cast<unsigned long long>(m_videoSync->BackpressureDropped()),
             m_bus.TotalPending(),
             static_cast<unsigned long long>(m_bus.Events().Dropped()),
             static_cast<unsigned long long>(ms.outputFrames),
@@ -339,9 +356,14 @@ int TGCapturer::AddVideoSource(IVideoSource* source)
         TG_LOGE("TGCapturer: AddVideoSource 的对象不是本 SDK 创建的视频源");
         return TGErr_InvalidArgument;
     }
-    m_videoSource = base;
-    base->SetEmitCallback([this](core::FramePtr frame) { OnVideoFrame(std::move(frame)); });
+    BindVideoSource(base);
     return 0;
+}
+
+void TGCapturer::BindVideoSource(capture::VideoSourceBase* source)
+{
+    m_videoSource = source;
+    m_vsrcMain->SetSource(source);
 }
 
 // ------------------------------------------------------------------ 参数
@@ -587,14 +609,15 @@ int TGCapturer::PrepareLocked(PrepareError& err)
     m_audioClock->Reset();
     m_audioClock->SetCompensationUs(m_videoParams.audioCompensationUs);
     m_videoOnlyTimeline->Reset();
-    m_videoIntervalUs = m_videoParams.fps > 0 ? static_cast<int64_t>(1000000.0 / m_videoParams.fps) : 33333;
-    m_syncDropped.store(0);
-    m_bpDropped.store(0);
-    m_audioWaitStartUs = 0;
-    m_lastVideoPtsUs = -1;
-    m_lastVideoCaptureUs = -1;
-    // 首帧标志必须复位，否则第二轮不再触发 EsCap_Notify_Fisrt_Frame_OK
-    m_firstFrameSent.store(false);
+    const int64_t videoIntervalUs =
+        m_videoParams.fps > 0 ? static_cast<int64_t>(1000000.0 / m_videoParams.fps) : 33333;
+    nodes::VideoSyncNode::Config vsyncCfg;
+    vsyncCfg.audioEnabled = m_audioEnabled;
+    vsyncCfg.frameIntervalUs = videoIntervalUs;
+    m_videoSync->SetConfig(vsyncCfg);
+    m_videoSync->SetAudioTimeoutMs(m_audioTimeoutMs.load());
+    // 计数、首帧标志（否则第二轮不再触发 EsCap_Notify_Fisrt_Frame_OK）、时间轴接续点
+    m_videoSync->Reset();
     m_lastRuntimeError.store(0);
     // 断流看护的阈值在这里取用，Reset 留到 Start（Prepare 到 Start 之间的空档不算断流）
     m_videoWatch.Configure(m_videoTimeoutMs.load() * 1000);
@@ -603,7 +626,7 @@ int TGCapturer::PrepareLocked(PrepareError& err)
     // ForceAlign 区间之外（forceSyncFactor × 帧间隔 × 1.5）。
     // 否则会在 RangeAdapt 正常追赶期间（66~200ms @30fps）白白砍帧率，
     // 而时间轴并不受影响（PTS 由 Next() 独立推进），等于纯损失。
-    const int64_t autoMaxLagUs = syncParams.forceSyncFactor * m_videoIntervalUs * 3 / 2;
+    const int64_t autoMaxLagUs = syncParams.forceSyncFactor * videoIntervalUs * 3 / 2;
     m_videoEncoder->SetMaxLagUs(m_videoParams.videoMaxLagUs > 0 ? m_videoParams.videoMaxLagUs
                                                                : autoMaxLagUs);
 
@@ -756,11 +779,8 @@ int TGCapturer::StartLocked(PrepareError& err)
         m_state.store(State::Prepared);   // 退回可重试的状态，宿主可以 Stop 后重开
         return static_cast<int>(TGErr_StartFailed);
     }
-    if (m_videoSource) {
-        m_videoSource->StartCapture();
-    }
-    // capture 组（音频源 + 混音器）：下游先于上游，混音时钟线程先起、源再开始产帧。
-    // 纯视频模式下这些节点未激活，被跳过
+    // capture 组（vsrc.main / 合成器 / 音频源 / 混音器）：下游先于上游 —— 合成器、混音时钟线程先起，
+    // 源再开始产帧（视频源节点在这里 StartCapture）。纯视频模式下音频节点未激活，被跳过
     m_bus.StartGroup(core::NodeGroup::Capture);
 
     m_state.store(State::Running);
@@ -823,26 +843,17 @@ void TGCapturer::TeardownLocked()
     }
 
     // 按数据流向逆序停止：先停采集，再 drain 编码器，最后收尾封装。
-    // StopCapture 现在是真正的回调栅栏（关闸 + join + 等在飞回调），返回后
-    // 下面拆编码器 / 混流器时不会再有采集线程闯进来。
-    if (m_videoSource) {
-        m_videoSource->StopCapture();
-    }
-    // capture 组（音频源 → 混音器）：上游先于下游。源节点是受控输出（关闸 + 停源 + 等在飞回调），
+    // capture 组（源 → 合成器 / 混音器）：上游先于下游。源节点是受控输出（关闸 + 停源 + 等在飞回调；
+    // 视频源节点在这里 StopCapture —— 它是真正的回调栅栏，返回后拆编码器 / 混流器时不会再有采集线程闯进来），
     // 混音器停线程并复位音频主时钟。不按 m_audioEnabled 过滤：Prepare 中途失败时它可能还是上一轮的值，
-    // 而已经 Open 过的音频源无论如何都得停。对没启动的源是无副作用的空操作。
+    // 而已经 Open 过的源无论如何都得停。对没启动的源是无副作用的空操作。
     m_bus.StopGroup(core::NodeGroup::Capture);
-    // output 组由总线按拓扑顺序收尾：Stop 上游先于下游（编码器 drain 完积压再停封装器），
+    // output 组（video_sync / 编码器 / 封装器）由总线按拓扑顺序收尾：Stop 上游先于下游（编码器 drain 完积压再停封装器），
     // Close 下游先于上游（封装器先写尾，再关编码器）。对未启动 / 未打开的节点是空操作
     m_bus.StopGroup(core::NodeGroup::Output);
     m_bus.CloseGroup(core::NodeGroup::Output);
-    // 采集源的设备资源（摄像头/麦克风句柄、COM 对象、D3D 纹理、GDI 位图）最后放。
+    // 采集源的设备资源（摄像头/麦克风句柄、COM 对象、D3D 纹理、GDI 位图）最后放（vsrc.main 的 NodeClose）。
     // 此时采集线程已 join、在飞回调已退出，Close 不会与产帧并发。
-    // 这一步以前完全缺失：设备只在采集源析构时才释放，而采集源是宿主持有的，
-    // 于是"Stop 之后设备仍被占用"，宿主换一路源重开就会撞上"设备被占用"。
-    if (m_videoSource) {
-        m_videoSource->Close();
-    }
     m_bus.CloseGroup(core::NodeGroup::Capture);
     RemoveExternalAudioNodes();
     m_sync->Reset();
@@ -863,8 +874,8 @@ void TGCapturer::StopLocked()
                 static_cast<unsigned long long>(st.skipped),
                 static_cast<unsigned long long>(st.jumpWarns),
                 static_cast<unsigned long long>(st.staleResets),
-                static_cast<unsigned long long>(m_syncDropped.load()),
-                static_cast<unsigned long long>(m_bpDropped.load()));
+                static_cast<unsigned long long>(m_videoSync->SyncDropped()),
+                static_cast<unsigned long long>(m_videoSync->BackpressureDropped()));
     }
     m_state.store(State::Idle);
     TG_LOGI("TGCapturer: 已停止");
@@ -952,9 +963,10 @@ void TGCapturer::ReleaseAll()
     }
     m_audioSourceNodes.clear();
     RemoveExternalAudioNodes();
+    // 视频源同理：先解除 vsrc.main 与源的回调绑定，再释放源
+    BindVideoSource(nullptr);
     m_ownedVideoSources.clear();
     m_ownedAudioSources.clear();
-    m_videoSource = nullptr;
     m_audioSource = nullptr;
     m_audioSources.clear();
     if (m_audioClock) {
@@ -964,165 +976,6 @@ void TGCapturer::ReleaseAll()
 }
 
 // ------------------------------------------------------------------ 帧流转
-void TGCapturer::OnVideoFrame(core::FramePtr frame)
-{
-    if (!frame || m_state.load() != State::Running) {
-        return;
-    }
-    // 看护判定的是"采集端还在不在产出"，而不是"这一帧最终有没有被编码"：
-    // 下面的 Mute 丢帧、硬件帧无法改写、音频主时钟未就绪而丢弃等分支都会提前 return，
-    // 但这些都不是采集故障，打点必须在它们之前，否则会误报断流。
-    m_videoWatch.OnActivity(core::MonotonicClock::NowUs());
-
-    if (m_videoMuted.load()) {
-        // 对齐 MediaX：MuteVideo 期间若设置了 pause 图片，用它替换像素但保留 PTS 继续推进；
-        // 没设置图片就"冻结最后一帧"—— 当前 frame 本身即是最新一帧，拿去编码等效于冻结。
-        // 没有 pauseFrame 且没有有效像素时才真丢弃（硬件直通路径下无法替换）。
-        if (m_pauseFrame && m_pauseFrame->Valid() && frame->planes[0]) {
-            if (!m_pauseFrame->ApplyTo(*frame)) {
-                return;
-            }
-        } else if (!frame->planes[0]) {
-            return;   // 硬件帧 + 无 pause 图片：无法替换，只能丢
-        }
-        // 没有 pauseFrame：原封不动把本帧交给下游（视觉上即"冻结"）。
-    }
-
-    // 水印：仅对 CPU 帧生效；硬件直通帧跳过并限频提示（后续如需 GPU 水印可扩展 D3D11/Metal 分支）
-    if (m_watermark && !m_watermark->Empty()) {
-        if (frame->planes[0] && frame->pixFmt == AV_PIX_FMT_NV12) {
-            m_watermark->BlendOnto(*frame);
-        } else if (frame->hwHandle) {
-            TG_LOGW_THROTTLED(3000000, "TGCapturer: 硬件帧路径暂不支持水印，本帧水印已跳过");
-        }
-    }
-
-    // 背压：编码器积压过多则丢帧，保证直播实时性
-    constexpr size_t kMaxEncoderPending = 8;
-    const size_t encoderPending = m_videoIn->Pending();
-    if (encoderPending >= kMaxEncoderPending) {
-        const auto n = m_bpDropped.fetch_add(1) + 1;
-        TG_LOGW_THROTTLED(2000000, "TGCapturer: 编码器积压 %zu，丢帧（编码跟不上采集，bpDrop=%llu）",
-                          encoderPending, static_cast<unsigned long long>(n));
-        return;
-    }
-
-    // 调用方自带时间轴：直接用它给的 PTS，不再走内核的同步与时间轴生成
-    if (frame->ptsLocked && frame->ptsUs >= 0) {
-        const int frameW = frame->width;
-        const int frameH = frame->height;
-        const int64_t framePts = frame->ptsUs;
-        if (!m_videoIn->Submit(std::move(frame))) {
-            return;
-        }
-        if (!m_firstFrameSent.exchange(true)) {
-            TG_LOGI("TGCapturer: 首帧视频 %dx%d pts=%lld（外部时间轴）", frameW, frameH,
-                    static_cast<long long>(framePts));
-            FireNotify(EsCap_Notify_Fisrt_Frame_OK, "first frame", 0);
-        }
-        return;
-    }
-
-    // ---- 音画同步：视频 PTS 由音频时钟反推（不用采集 wall clock）----
-    // 对齐 MediaX：每帧独立判定，不保留"已降级"状态 ——
-    // 音频恢复后下一帧 m_audioClock->IsFresh() 自然为 true，直接切回主时钟；
-    // 两条时间轴切换时都从最后一个已输出帧接续（见 m_lastVideoPtsUs），保证 PTS 不回退。
-    //
-    // 关键：判活用 IsFresh(audioTimeoutMs) 而不是 Valid()。Valid() 是单向开关
-    // （第一次 Advance/Reserve 后永远 true），音频长时间断流时 ReferencePtsUs()
-    // 会一直返回最后一次推进的旧 PTS —— VideoPtsGenerator 的停滞判定虽然能
-    // clamp 到 audio+maxLead，但那个 audio 已经是几秒钟前的值，视频 PTS 会相对
-    // 墙钟永久落后一个 drift。IsFresh 按"最近 N ms 内有过真实推进"判活，断流后
-    // 会自然走到下面的 wall-clock fallback 分支。
-    //
-    // 有音频时"视频等音频"：主时钟尚未产出第一拍就先不发帧（最多等 audioTimeoutMs）。
-    // 等不到才走采集时间轴 —— 这是 wall-clock fallback 分支，不污染音频时钟域。
-    int64_t audioRef = core::kInvalidPtsUs;
-    bool useAudioClock = false;
-    if (m_audioEnabled && m_audioClock && m_audioClock->IsFresh(m_audioTimeoutMs)) {
-        useAudioClock = true;
-        audioRef = m_audioClock->ReferencePtsUs();
-        // 音频刚从异常恢复：重置等待起点；VideoPtsGenerator 接续 fallback 期间已输出的 PTS
-        // （它的内部 PTS 还停在断流前，直接用会产出回退 PTS，被编码器整段丢弃）
-        if (m_audioWaitStartUs != 0) {
-            TG_LOGI("TGCapturer: 音频主时钟恢复，切回主时钟（曾等待/断流 %lldms，接续 pts=%lld）",
-                    static_cast<long long>((core::MonotonicClock::NowUs() - m_audioWaitStartUs) / 1000),
-                    static_cast<long long>(m_lastVideoPtsUs));
-            m_audioWaitStartUs = 0;
-            m_videoPtsGen->Rebase(m_lastVideoPtsUs);
-            m_videoOnlyTimeline->Reset();
-        }
-    } else if (m_audioEnabled) {
-        const int64_t nowUs = core::MonotonicClock::NowUs();
-        if (m_audioWaitStartUs == 0) {
-            m_audioWaitStartUs = nowUs;
-            // 区分"首帧前等待" vs "运行中断流"的日志，便于定位
-            if (m_audioClock && m_audioClock->Valid()) {
-                TG_LOGW("TGCapturer: 音频主时钟断流（超过 %lldms 未推进），进入 wall-clock fallback，接续 pts=%lld",
-                        static_cast<long long>(m_audioTimeoutMs), static_cast<long long>(m_lastVideoPtsUs));
-            } else {
-                TG_LOGI("TGCapturer: 等待音频主时钟首帧（最多 %lldms）",
-                        static_cast<long long>(m_audioTimeoutMs));
-            }
-            // 运行中断流：wall-clock 时间轴从最后一个已输出帧接续（pts + 采集时刻差），
-            // 而不是从 0 重起 —— 从 0 起会比已输出的 PTS 小，整段被编码器按"PTS 回退"丢掉
-            if (m_lastVideoPtsUs >= 0 && m_lastVideoCaptureUs >= 0) {
-                m_videoOnlyTimeline->Rebase(m_lastVideoPtsUs, m_lastVideoCaptureUs);
-            } else {
-                m_videoOnlyTimeline->Reset();
-            }
-        }
-        // 首帧前（Valid()==false）要尊重 audioTimeoutMs 的等待窗口；
-        // 运行中断流（Valid()==true 但 IsFresh()==false）直接 fallback，不再等。
-        const bool firstFrameWait = m_audioClock && !m_audioClock->Valid();
-        if (firstFrameWait && (nowUs - m_audioWaitStartUs < m_audioTimeoutMs * 1000)) {
-            return;   // 正常等待，不计入丢帧统计
-        }
-        TG_LOGW_THROTTLED(5000000, "TGCapturer: 音频未就绪/断流，本帧走采集时间轴");
-        // 注意：不再调 m_sync->Reset()。
-        // 当前帧用 wall-clock PTS，但 m_sync 里的旧 audio ref 已被 VideoEncoder 的落后丢帧判决所依赖；
-        // 恢复音频主时钟后，上面 IsFresh 分支会接管，m_sync 由 UpdateAudioClock 刷新即可。
-    }
-
-    if (useAudioClock) {
-        const int64_t pts = m_videoPtsGen->Next(audioRef, m_videoIntervalUs, true, m_audioClock->IdleUs());
-        if (pts == core::kInvalidPtsUs) {
-            // 音频停滞已到超前上限 / 视频突发超前音频：本帧不编码
-            const uint64_t dropped = m_syncDropped.fetch_add(1) + 1;
-            TG_LOGW_THROTTLED(2000000, "TGCapturer: 视频超前音频（突发到达或音频停滞），丢帧（syncDrop=%llu）",
-                              static_cast<unsigned long long>(dropped));
-            return;
-        }
-        frame->ptsUs = pts;
-        if (m_sync) {
-            m_sync->UpdateAudioClock(audioRef);   // 供 VideoEncoder 的"落后丢帧"兜底
-        }
-    } else {
-        // 无音频 / 音频超时：走采集时间轴（首帧归零，单调递增）
-        const int64_t pts = m_videoOnlyTimeline->Next(frame->captureUs);
-        frame->ptsUs = pts >= 0 ? pts : frame->captureUs;
-    }
-
-    // 注意：frame 交给总线后会被移动，之后不可再访问其成员
-    const int width = frame->width;
-    const int height = frame->height;
-    const int64_t pts = frame->ptsUs;
-    const int64_t captureUs = frame->captureUs;
-
-    if (!m_videoIn->Submit(std::move(frame))) {
-        return;
-    }
-    if (pts >= 0) {
-        m_lastVideoPtsUs = pts;
-        m_lastVideoCaptureUs = captureUs;
-    }
-
-    if (!m_firstFrameSent.exchange(true)) {
-        TG_LOGI("TGCapturer: 首帧视频 %dx%d pts=%lld", width, height, static_cast<long long>(pts));
-        FireNotify(EsCap_Notify_Fisrt_Frame_OK, "first frame", 0);
-    }
-}
-
 // 外部注入的音频：每种 AudioCapSourceType 一个 asrc.ext.<type> 节点，首帧到达时接入混音器
 void TGCapturer::OnAudioFrame(AudioCapSourceType type, core::FramePtr frame)
 {
@@ -1219,7 +1072,8 @@ int TGCapturer::PushExternalVideoFrame(const uint8_t* data, int width, int heigh
     }
     // 调用方自带时间轴时锁定 PTS，内核不再用音频主时钟改写（见 videoUseExternalPts）
     frame->ptsLocked = m_useExternalVideoPts && ptsUs >= 0;
-    OnVideoFrame(std::move(frame));
+    // 与原生采集同一入口：vsrc.main → video_compositor → video_sync → video_encoder
+    m_vsrcMain->Push(std::move(frame));
     return TGErr_OK;
 }
 
@@ -1273,14 +1127,14 @@ bool TGCapturer::MuteAudio(bool mute, AudioCapSourceType channel)
 
 bool TGCapturer::MuteVideo(bool mute)
 {
-    m_videoMuted.store(mute);
+    m_compositor->SetMuted(mute);
     return true;
 }
 
 int TGCapturer::SetPauseInfo(const PauseParams& params)
 {
     // 对齐 MediaX ESGeneratePicture::SetPausePic：picture 为空 → 清缓存走冻结最后一帧语义；
-    // 有路径 → 预解码到当前编码分辨率的 NV12，MuteVideo 期间由 OnVideoFrame 替换像素。
+    // 有路径 → 预解码到当前编码分辨率的 NV12，MuteVideo 期间由合成器的暂停图层替换像素。
     m_pauseParams = params;
     if (params.picture.empty()) {
         if (m_pauseFrame) m_pauseFrame->Clear();
@@ -1327,6 +1181,7 @@ int TGCapturer::SetAVTimeout(int64_t audioTimeoutMs, int64_t videoTimeoutMs)
     }
     m_audioTimeoutMs.store(audioTimeoutMs);
     m_videoTimeoutMs.store(videoTimeoutMs);
+    m_videoSync->SetAudioTimeoutMs(audioTimeoutMs);
     m_videoEncoder->SetMaxLagUs(videoTimeoutMs * 1000);
     // 运行期调用也立即生效
     m_videoWatch.Configure(videoTimeoutMs * 1000);
