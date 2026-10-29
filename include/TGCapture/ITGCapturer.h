@@ -195,8 +195,9 @@ public:
     // 旧接口创建的源也有 id：EnableMicrophoneCapture → "mic"，EnableSpeakerCapture → "speaker"，
     // PushExternalAudioFrame(type) → "ext.<type>"（仅推流期间存在，Stop 时移除）。
     //
-    // AddAudioSource 失败：TGErr_InvalidArgument（id 重复 / 非法，File 缺路径，volume 越界）
-    //                     TGErr_NotSupported（本平台无该类原生采集）/ TGErr_InvalidState（推流中但未启用音频）
+    // AddAudioSource 失败：TGErr_InvalidArgument（id 重复 / 非法，volume 越界；File：缺路径 / 打不开 / 没有音轨）
+    //                     TGErr_NotSupported（本平台无该类原生采集；File：音轨编码不支持，目前只支持 AAC）
+    //                     TGErr_InvalidState（推流中但未启用音频）
     // 成功后发 EsCap_Notify_AudioSource_Added；outId 返回实际 id
     virtual int AddAudioSource(const AudioSourceDesc& desc, std::string* outId = nullptr) = 0;
     // 失败：TGErr_InvalidArgument（id 不存在）。成功后发 EsCap_Notify_AudioSource_Removed

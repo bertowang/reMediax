@@ -4,6 +4,18 @@
 
 ## Unreleased
 
+### 文件音频源（B7）
+- `AudioSourceKind::File`：`capture/FileAudioSource`，纯 ffmpeg 实现、三端共用。解封装 + 解码（AAC）+ 重采样到编码格式，
+  每 10ms 一块按墙钟节拍送进混音器（时间戳按已送样本数推进，混音器测得漂移为 0；被挂起落后 200ms 以上重新对齐，不追赶）。
+- `loop = true` 无缝循环（seek 回开头接着解码，不插静音）；`loop = false` 播完发 `EsCap_Notify_LocalFile_EOF`
+  （content = id），之后该路输出静音，不触发断流看护。
+- `AddAudioSource` 先同步探测文件：不存在 / 无音轨 → `InvalidArgument`，解码器缺失 → `NotSupported`；默认 id 为 `file` / `file.2`。
+  任意状态可加删，推流中加入淡入 20ms，音量 / 电平 / 移除与其它源一致。
+- 新增 `TypeOfLocalFileAudio = 30`（AudioCapSourceType）。
+- 支持的容器取决于 ffmpeg 白名单：mov（mp4 / m4a / mov）、flv；当前开播 profile 未编 mpegts 解封装器，ts 文件不支持。
+- Android：`addFileAudioSource` 可用，`NOTIFY_LOCAL_FILE_EOF`；demo 自动化 `tg_cmd audiofile:<路径>`，回归脚本 `--audio-file`。
+- 命令行 demo：`--audio-file <秒>:<路径>`、`--audio-file-volume`、`--audio-file-no-loop`。
+
 ### 分辨率档位与运行期切换（B6）
 - 档位表 `src/core/ResolutionPresets.h`：360p / 480p / 540p / 720p / 720p60 / 1080p / 1080p60（宽高 / 帧率 / 建议码率）。
   `ITGCapturerMgr::ApplyResolutionPreset(name, params, portrait)` 填 `VideoEncoderParams`，`GetResolutionPresets()` 列名字。

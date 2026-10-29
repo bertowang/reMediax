@@ -59,6 +59,13 @@ class LiveSession(
 
     fun muteVideo(mute: Boolean) = submit { capturer?.muteVideo(mute) }
 
+    /** 运行期加文件音频源（循环），id 固定为 "file"。 */
+    fun addFileAudio(path: String) = submit {
+        val c = capturer ?: return@submit
+        val id = c.addFileAudioSource("file", path, true, 1.0f)
+        log("addFileAudio $path id=$id")
+    }
+
     /** 运行期切分辨率：spec = 档位名（720p / 360p …）或 "宽x高"。 */
     fun switchResolution(spec: String) = submit {
         val c = capturer ?: return@submit

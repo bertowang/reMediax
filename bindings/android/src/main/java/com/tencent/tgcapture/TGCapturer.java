@@ -57,6 +57,8 @@ public final class TGCapturer {
     public static final int NOTIFY_ENCODER_FALLBACK = 40;
     /** 运行期音频源增删：content = 音频源 id，data = 混流通道号 */
     public static final int NOTIFY_AUDIO_SOURCE_ADDED = 41;
+    /** 文件音频源（不循环）播放结束：content = 音频源 id */
+    public static final int NOTIFY_LOCAL_FILE_EOF = 21;
     public static final int NOTIFY_AUDIO_SOURCE_REMOVED = 42;
 
     // AudioSourceKind（addAudioSource）
@@ -302,7 +304,10 @@ public final class TGCapturer {
         return nativeAddAudioSource(handle(), kind, id, volume, null, true);
     }
 
-    /** 文件音轨（mp4 / mov / flv / ts，AAC）。 */
+    /**
+     * 文件音轨（mp4 / m4a / mov / flv 里的 AAC），内核解码、按实时节奏混入。失败返回 null（文件不存在 / 无音轨 / 编码不支持）。
+     * loop = false 播完回调 onNotify(NOTIFY_LOCAL_FILE_EOF, id)，之后该路输出静音，可再 removeAudioSource。
+     */
     public String addFileAudioSource(String id, String filePath, boolean loop, float volume) {
         return nativeAddAudioSource(handle(), AUDIO_SOURCE_FILE, id, volume, filePath, loop);
     }

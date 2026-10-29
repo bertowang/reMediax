@@ -89,6 +89,11 @@ struct Options
     int         logLevel = 1;
     // 运行期切分辨率（可多次）：--switch-res <秒>:<档位名 | 宽x高>
     std::vector<std::pair<double, std::string>> switchRes;
+    // 运行期加文件音频源：--audio-file <秒>:<路径>（内核解码文件音轨，AudioSourceKind::File）
+    double      audioFileAt = -1;
+    std::string audioFile;
+    float       audioFileVolume = 1.0f;
+    bool        audioFileLoop = true;
 
     // 工具
     std::string ffmpegBin = "ffmpeg";
@@ -119,6 +124,9 @@ void PrintUsage()
            "    --out <url>             out.flv / out.ts / rtmp:// / srt://，默认 out.flv\n"
            "    --seconds <n>           运行秒数，0 = 直到视频结束，默认 10\n"
            "    --w --h --fps --bitrate 编码参数，默认 1280 720 30 3000000\n"
+           "    --audio-file <s>:<path> 第 s 秒运行期加文件音频源（mp4/m4a/flv 的 AAC 音轨）\n"
+           "    --audio-file-volume <f> 文件音频源音量，默认 1.0\n"
+           "    --audio-file-no-loop    文件音频源放完即停（默认循环）\n"
            "    --switch-res <s>:<r>    第 s 秒运行期切换编码分辨率，r = 档位名(720p…) 或 宽x高，可多次\n"
            "    --sample-rate <n>       音频采样率，默认 44100\n"
            "    --channels <n>          音频通道数，默认 2\n"
@@ -168,6 +176,18 @@ Options ParseArgs(int argc, char** argv)
         else if (a == "--h")       { if (auto* v = next(i, "--h"))       opt.height = std::atoi(v); }
         else if (a == "--fps")     { if (auto* v = next(i, "--fps"))     opt.fps = static_cast<float>(std::atof(v)); }
         else if (a == "--bitrate") { if (auto* v = next(i, "--bitrate")) opt.bitrate = std::atoi(v); }
+        else if (a == "--audio-file") {
+            if (auto* v = next(i, "--audio-file")) {
+                const std::string arg = v;
+                const auto colon = arg.find(':');
+                if (colon != std::string::npos) {
+                    opt.audioFileAt = std::atof(arg.substr(0, colon).c_str());
+                    opt.audioFile = arg.substr(colon + 1);
+                }
+            }
+        }
+        else if (a == "--audio-file-volume") { if (auto* v = next(i, "--audio-file-volume")) opt.audioFileVolume = static_cast<float>(std::atof(v)); }
+        else if (a == "--audio-file-no-loop") { opt.audioFileLoop = false; }
         else if (a == "--switch-res") {
             if (auto* v = next(i, "--switch-res")) {
                 const std::string arg = v;
@@ -612,6 +632,7 @@ int main(int argc, char** argv)
     };
 
     size_t nextSwitch = 0;
+    bool audioFileAdded = false;
     while (!errored.load()) {
         if (s_stop.load()) { printf("[demo] 收到退出信号，刷 trailer\n"); break; }
         const int64_t now = ElapsedUs(t0);
@@ -625,6 +646,17 @@ int main(int argc, char** argv)
                                 : capturer->SetResolutionPreset(r);
             printf("[demo] t=%.3fs 切换分辨率 %s ret=%d\n", now / 1e6, r.c_str(), ret);
             ++nextSwitch;
+        }
+        if (!audioFileAdded && !opt.audioFile.empty() && now >= static_cast<int64_t>(opt.audioFileAt * 1e6)) {
+            AudioSourceDesc d;
+            d.kind = AudioSourceKind::File;
+            d.id = "file";
+            d.filePath = opt.audioFile;
+            d.volume = opt.audioFileVolume;
+            d.loop = opt.audioFileLoop;
+            const int ret = capturer->AddAudioSource(d);
+            printf("[demo] t=%.3fs 加文件音频源 %s ret=%d\n", now / 1e6, opt.audioFile.c_str(), ret);
+            audioFileAdded = true;
         }
 
         // 心跳：30s/次，每路给出"本窗口帧数"和"累计帧数"，瞬时速率 = Δ/30

@@ -1,5 +1,7 @@
 ﻿#include "TGCapturer.h"
 
+#include "capture/FileAudioSource.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -1397,8 +1399,17 @@ int TGCapturer::AddAudioSource(const AudioSourceDesc& desc, std::string* outId)
         TG_LOGE("TGCapturer: 音频源 id 非法：%s（只允许字母数字 . _ -，且不能是 master）", desc.id.c_str());
         return TGErr_InvalidArgument;
     }
-    if (desc.kind == AudioSourceKind::File && desc.filePath.empty()) {
-        return TGErr_InvalidArgument;
+    if (desc.kind == AudioSourceKind::File) {
+        if (desc.filePath.empty()) {
+            return TGErr_InvalidArgument;
+        }
+        // 文件问题同步报给调用方（不等到 Prepare 才"按静音处理"）：不存在 / 无音轨 → InvalidArgument，
+        // 编解码不支持 → NotSupported。探测在锁外做（读文件头可能要几十 ms）
+        std::string why;
+        if (const int probe = capture::FileAudioSource::Probe(desc.filePath, &why); probe != TGErr_OK) {
+            TG_LOGE("TGCapturer: 文件音频源 %s 不可用：%s", desc.filePath.c_str(), why.c_str());
+            return probe;
+        }
     }
 
     std::string id;
@@ -1437,9 +1448,14 @@ int TGCapturer::AddAudioSource(const AudioSourceDesc& desc, std::string* outId)
                 }
                 break;
             }
-            case AudioSourceKind::File:
-                TG_LOGE("TGCapturer: 文件音频源尚未实现");
-                return TGErr_NotSupported;
+            case AudioSourceKind::File: {
+                auto source = std::make_shared<capture::FileAudioSource>(desc.filePath, desc.loop);
+                const std::string want = !desc.id.empty() ? desc.id : AudioIdOf(UniqueAudioNodeName("asrc.file"));
+                // 播完（loop = false）通知宿主；回调在源线程上，经总线事件转给宿主（锁外）
+                source->SetEofCallback([this, want] { FireNotify(EsCap_Notify_LocalFile_EOF, want, 0); });
+                ret = AddNativeAudioSourceLocked(source.get(), source, want, desc.volume, &id);
+                break;
+            }
         }
         if (ret != TGErr_OK) {
             return ret;

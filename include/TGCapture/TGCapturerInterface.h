@@ -33,6 +33,7 @@ enum AudioCapSourceType
     TypeOfSelfMicphone = 10,        // PC 麦克风
     TypeOfGVoiceMicphone = 11,      // PC GVoice 麦克风
     TypeOfSpeaker = 20,             // PC 扬声器
+    TypeOfLocalFileAudio = 30,      // 本地媒体文件的音轨（AudioSourceKind::File）
     TypeOfArtificialAudio = 100,    // 人造静音音频（测试）
 };
 
@@ -54,7 +55,7 @@ enum NotifyMsgType
     EsCap_Notify_VideoMetaInfo_Changed = 1,
     EsCap_Notify_AudioMetaInfo_Changed = 10,
     EsCap_Notify_SystemFreeze = 20,
-    EsCap_Notify_LocalFile_EOF = 21,
+    EsCap_Notify_LocalFile_EOF = 21,   // 文件源（loop = false）播放结束：content = 音频源 id
     // 断流恢复：与 TGErr_VideoCaptureStalled / TGErr_AudioCaptureStalled 配对，
     // 收到它表示该路又有数据了（data = 本次断流持续的毫秒数）
     EsCap_Notify_VideoCapture_Recovered = 30,
@@ -339,13 +340,14 @@ enum class AudioSourceKind : int32_t
     Microphone = 0,   // 系统麦克风（WASAPI / AudioRecord / AVAudioSession）
     Speaker = 1,      // 系统内录（Windows WASAPI loopback / Android AudioPlaybackCapture，需 MediaProjection）
     External = 2,     // 宿主推 PCM（PushAudioSourceFrame）
-    File = 3,         // 本地媒体文件的音轨（mp4 / mov / flv / ts，AAC），可循环
+    File = 3,         // 本地媒体文件的音轨（mp4 / mov / m4a / flv 里的 AAC），内核解码、按实时节奏混入；
+                      // loop = false 播完发 EsCap_Notify_LocalFile_EOF（content = id），之后该路输出静音
 };
 
 struct AudioSourceDesc
 {
     AudioSourceKind kind = AudioSourceKind::External;
-    std::string id;             // 唯一标识（字母数字 . _ -）；空 = 内核生成：mic / speaker / ext.N / file.N
+    std::string id;             // 唯一标识（字母数字 . _ -）；空 = 内核生成：mic / speaker / pcm / file（重名加 .2 .3 …）
     float volume = 1.0f;        // 线性增益 0 ~ 4
     std::string filePath;       // File
     bool loop = true;           // File：播完从头再来

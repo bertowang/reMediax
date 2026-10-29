@@ -76,6 +76,7 @@ message(STATUS "TGCapture: 3rd=${TG_3RD_ROOT}  (来源: ${TG_3RD_SOURCE})")
 set(TG_CORE_SOURCES
     src/ITGCapturer.cpp
     src/TGCapturer.cpp
+    src/capture/FileAudioSource.cpp
     src/codec/VideoEncoder.cpp
     src/codec/AudioEncoder.cpp
     src/codec/EncoderProbe.cpp
@@ -253,6 +254,7 @@ if(TG_BUILD_TESTS)
         tests/test_lifecycle.cpp
         tests/test_audio_sources.cpp
         tests/test_resolution.cpp
+        tests/test_file_audio.cpp
         tests/test_health.cpp
         tests/test_traffic_meter.cpp
         tests/test_error_codes.cpp

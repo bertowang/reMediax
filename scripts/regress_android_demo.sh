@@ -11,6 +11,7 @@
 #   --res 540|720|1080 分辨率档位（横屏），默认 720
 #   --codec <name>     视频编码器，默认 h264_mediacodec（模拟器不支持时内核会回退 libopenh264）
 #   --mic              同时开麦克风（原生采集源，自动 pm grant RECORD_AUDIO）
+#   --audio-file F     开播到一半时运行期加文件音频源（本机文件，自动 push 到 demo 的外部目录；循环）
 #   --switch-res R     开播到一半时运行期切分辨率（R = 档位名如 360p，或 宽x高），校验录像前后两段分辨率
 #   --no-build         不重新编译 / 安装 demo
 #   --keep             保留拉回的录像（默认也保留，路径打印在最后）
@@ -28,6 +29,7 @@ codec="h264_mediacodec"
 build=1
 mic=false
 switch_res=""
+audio_file=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -38,6 +40,7 @@ while [[ $# -gt 0 ]]; do
         --no-build) build=0 ;;
         --mic)     mic=true ;;
         --switch-res) switch_res="$2"; shift ;;
+        --audio-file) audio_file="$2"; shift ;;
         --keep)    ;;
         -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
         *) echo "未知参数: $1" >&2; exit 2 ;;
@@ -120,14 +123,28 @@ if ! wait_state LIVE 20; then
     adb logcat -d -s TGDemo:I | tail -30
     die "20s 内没有进入 LIVE"
 fi
-if [[ -n "$switch_res" ]]; then
+dev_audio_file=""
+if [[ -n "$audio_file" ]]; then
+    [[ -f "$audio_file" ]] || die "找不到 $audio_file"
+    dev_audio_file="/sdcard/Android/data/$pkg/files/regress_$(basename "$audio_file")"
+    adb push "$audio_file" "$dev_audio_file" >/dev/null 2>&1 || die "adb push $audio_file 失败"
+fi
+
+if [[ -n "$switch_res" || -n "$audio_file" ]]; then
     half=$(( seconds / 2 ))
     rest=$(( seconds - half ))
     sleep "$half"
-    log "运行期切分辨率 -> $switch_res"
-    adb shell am start -n "$pkg/.MainActivity" --es tg_cmd "res:$switch_res" >/dev/null 2>&1
+    if [[ -n "$switch_res" ]]; then
+        log "运行期切分辨率 -> $switch_res"
+        adb shell am start -n "$pkg/.MainActivity" --es tg_cmd "res:$switch_res" >/dev/null 2>&1
+    fi
+    if [[ -n "$audio_file" ]]; then
+        log "运行期加文件音频源 $dev_audio_file"
+        adb shell am start -n "$pkg/.MainActivity" --es tg_cmd "audiofile:$dev_audio_file" >/dev/null 2>&1
+    fi
     sleep "$rest"
-    adb logcat -d -s TGDemo:I TGCapture:I 2>/dev/null | grep -E "switchResolution|运行期切换|VideoMetaChanged|参数集更新" | sed 's/^/  /' || true
+    adb logcat -d -s TGDemo:I TGCapture:I 2>/dev/null \
+        | grep -E "switchResolution|运行期切换|VideoMetaChanged|参数集更新|addFileAudio|FileAudioSource|AudioSource" | sed 's/^/  /' || true
 else
     sleep "$seconds"
 fi
