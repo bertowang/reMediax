@@ -148,9 +148,10 @@ bool VideoCompositorNode::SubmitInput(size_t port, core::FramePtr frame)
     }
 
     m_composed.fetch_add(1, std::memory_order_relaxed);
-    // 预览与推流共享同一帧（下游不得修改帧内容）；预览先发，推流链路可能会移动帧
+    // 预览与推流共享像素（下游不得修改像素）。预览给一份浅拷贝的帧头：
+    // 推流链路会改写 ptsUs 等元数据，而预览在另一个线程上读，共用帧头会产生数据竞争
     if (HasDownstream(kPreviewOutput)) {
-        Emit(kPreviewOutput, frame);
+        Emit(kPreviewOutput, std::make_shared<core::Frame>(*frame));
     }
     return Emit(kProgramOutput, std::move(frame));
 }
@@ -345,6 +346,54 @@ std::string VideoSyncNode::DumpState() const
     std::snprintf(buf, sizeof(buf), "syncDrop=%llu bpDrop=%llu",
                   static_cast<unsigned long long>(m_syncDropped.load()),
                   static_cast<unsigned long long>(m_bpDropped.load()));
+    return buf;
+}
+
+// ================================================================== PreviewSinkNode
+void PreviewSinkNode::SetCallback(Callback cb)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_callback = std::move(cb);
+}
+
+bool PreviewSinkNode::Submit(core::FramePtr frame)
+{
+    if (!frame || frame->IsControl()) {
+        return true;
+    }
+    Callback cb;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        cb = m_callback;
+    }
+    if (!cb) {
+        return true;
+    }
+    PreviewFrame pf;
+    pf.width = frame->width;
+    pf.height = frame->height;
+    pf.captureUs = frame->captureUs;
+    if (frame->planes[0] && frame->pixFmt == AV_PIX_FMT_NV12) {
+        pf.format = PreviewPixelFormat::NV12;
+        pf.y = frame->planes[0].get();
+        pf.yStride = frame->strides[0];
+        pf.uv = frame->planes[1].get();
+        pf.uvStride = frame->strides[1];
+    } else if (frame->hwHandle) {
+        pf.format = PreviewPixelFormat::Hardware;
+        pf.hwHandle = frame->hwHandle;
+    } else {
+        return true;   // 其它 CPU 格式（I420 / RGBA）暂不送预览
+    }
+    cb(pf);
+    m_delivered.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+std::string PreviewSinkNode::DumpState() const
+{
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "delivered=%llu", static_cast<unsigned long long>(m_delivered.load()));
     return buf;
 }
 

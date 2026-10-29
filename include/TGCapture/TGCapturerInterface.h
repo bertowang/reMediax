@@ -327,6 +327,28 @@ struct WatermarkParams
     std::string url;
 };
 
+// ------------------------------------------------------------------ 预览
+enum class PreviewPixelFormat : int32_t
+{
+    NV12 = 0,       // y / uv 两平面有效
+    Hardware = 1,   // hwHandle 有效：iOS CVPixelBufferRef / Windows ID3D11Texture2D*（仅 GPU 性能模式）
+};
+
+// 预览帧：与推流画面同源（含暂停图 / 水印 / 已提交的叠加层），未经编码前的缩放与变换。
+// 指针只在回调期间有效；宿主需要保留就自行拷贝
+struct PreviewFrame
+{
+    PreviewPixelFormat format = PreviewPixelFormat::NV12;
+    int width = 0;
+    int height = 0;
+    const uint8_t* y = nullptr;
+    int yStride = 0;
+    const uint8_t* uv = nullptr;
+    int uvStride = 0;
+    void* hwHandle = nullptr;
+    int64_t captureUs = 0;   // 采集时刻（单调时钟，微秒）
+};
+
 }  // namespace TGCapture
 
 #endif  // TGCAPTURE_TGCAPTURER_INTERFACE_H

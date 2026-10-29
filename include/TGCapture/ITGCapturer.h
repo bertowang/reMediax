@@ -91,12 +91,28 @@ public:
     virtual void SetPrivateData(const std::string& key, void* data) = 0;
 
     // ---------------- 生命周期 ----------------
+    // 状态：Idle ─StartPreview→ Previewing ─Prepare→ Prepared ─Start→ Running
+    //       Idle ─Prepare→ Prepared ─Start→ Running
+    //       Running ─Stop→ Previewing（预览开着）/ Idle（预览没开）
+    //       Previewing ─StopPreview→ Idle；Prepared / Running 时 StopPreview 只关预览，不影响推流
     // Prepare 失败：TGErr_InvalidState / NotConfigured / OpenVideoEncoder / OpenAudioEncoder
-    //               / OpenMuxer / OpenVideoSource
+    //               / OpenMuxer / OpenVideoSource（预览开着时失败回到 Previewing，预览不中断）
     // Start   失败：TGErr_InvalidState（未 Prepare）/ TGErr_StartFailed
     virtual int Prepare() = 0;
     virtual int Start() = 0;
+    // 停止推流。预览开着时回到预览（视频采集不中断，Android 不需要重新申请录屏授权）
     virtual void Stop() = 0;
+
+    // ---------------- 预览 ----------------
+    // 预览帧回调：在内核的预览投递线程上调用，只送最新一帧（宿主处理慢了就跳帧，不影响推流）。
+    // 回调里不得调用 StopPreview / Destroy（会等待回调自身结束）
+    using OnPreviewFrameCallback = std::function<void(const PreviewFrame& frame)>;
+    virtual void SetOnPreviewFrameCallback(OnPreviewFrameCallback cb) = 0;
+    // 开播前即可预览：打开视频采集（需先 SetupVideoEncoder 以确定采集尺寸 / 帧率，并已添加视频源）。
+    // 可在 Idle / Prepared / Running 调用。失败：TGErr_NotConfigured / TGErr_OpenVideoSource / TGErr_InvalidState
+    virtual int StartPreview() = 0;
+    virtual void StopPreview() = 0;
+    virtual bool IsPreviewing() const = 0;
 
     // ---------------- 运行期控制 ----------------
     virtual bool MuteAudio(bool mute, AudioCapSourceType channel = TypeOfANone) = 0;
@@ -122,7 +138,7 @@ public:
 
     // ---------------- 外部帧注入（Android/iOS/游戏引擎） ----------------
     // 两个接口的失败码：
-    //   TGErr_InvalidState    未 Start（或已 Stop）
+    //   TGErr_InvalidState    未 Start（或已 Stop）。视频注入在预览期间（StartPreview 之后）也可用
     //   TGErr_InvalidArgument data 为空 / size ≤ 0 / 宽高 ≤ 0 / stride < width / 采样率或声道数 ≤ 0
     //   TGErr_NotSupported    传了 pixelBuffer，但当前平台没有硬件帧通路（仅 Windows / iOS 支持）
     // 视频：pixelBuffer 在 iOS 为 CVPixelBufferRef，Android 为 nullptr（走 Surface）

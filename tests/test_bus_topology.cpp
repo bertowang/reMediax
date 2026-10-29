@@ -636,6 +636,19 @@ TG_TEST(BusLifecycle, InactiveNodesAreSkippedOnStart)
     TG_EXPECT(g.aenc->Lifecycle() == NodeLifecycle::Created);
 }
 
+TG_TEST(BusLifecycle, StartGroupSkipsRunningNodes)
+{
+    // 预览期间已经起来的节点，开播再起一次组时不能重复启动（否则采集线程起两遍）
+    LifeGraph g;
+    TG_EXPECT(g.bus.StartGroup(NodeGroup::Output).ok);
+    const std::string once = g.j.Joined();
+    TG_EXPECT(g.bus.StartGroup(NodeGroup::Output).ok);
+    TG_EXPECT_EQ(g.j.Joined(), once);
+    g.bus.StopGroup(NodeGroup::Output);
+    TG_EXPECT(g.bus.StartGroup(NodeGroup::Output).ok);   // 停止后可以再起
+    TG_EXPECT(g.venc->Lifecycle() == NodeLifecycle::Running);
+}
+
 TG_TEST(BusLifecycle, StartFailureRollsBackStartedNodes)
 {
     LifeGraph g;

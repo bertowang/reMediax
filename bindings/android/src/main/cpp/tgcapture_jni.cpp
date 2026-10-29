@@ -8,6 +8,7 @@
 //   3. 被 attach 上来的线程用 pthread key 的析构自动 Detach：线程退出时仍处于 attach 状态
 //      会被 ART 直接 abort（"thread exited while still attached"）。
 #include <android/log.h>
+#include <android/native_window_jni.h>
 #include <jni.h>
 #include <pthread.h>
 
@@ -20,6 +21,8 @@
 #include "TGCapture/ITGCapturer.h"
 #include "core/Logger.h"
 #include "platform/android/AndroidJni.h"
+
+#include <libyuv.h>
 
 extern "C"
 {
@@ -136,6 +139,52 @@ struct Session
     // 立即释放（已创建的源可能还在用），全部随 Session 销毁一起释放
     std::vector<jobject> projections;
 
+    // 预览画面输出目标（宿主的 SurfaceView / TextureView）。预览回调在内核的预览投递线程上执行，
+    // 与 setPreviewSurface 用 previewMutex 互斥
+    std::mutex previewMutex;
+    ANativeWindow* previewWindow = nullptr;
+    int previewWidth = 0;
+    int previewHeight = 0;
+
+    // 预览帧（NV12）→ RGBA 写入 Surface。尺寸变化时重设缓冲区几何，由系统按 View 尺寸缩放显示
+    void RenderPreview(const PreviewFrame& f)
+    {
+        if (f.format != PreviewPixelFormat::NV12 || !f.y || !f.uv) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(previewMutex);
+        if (!previewWindow) {
+            return;
+        }
+        if (f.width != previewWidth || f.height != previewHeight) {
+            if (ANativeWindow_setBuffersGeometry(previewWindow, f.width, f.height, WINDOW_FORMAT_RGBA_8888) != 0) {
+                return;
+            }
+            previewWidth = f.width;
+            previewHeight = f.height;
+        }
+        ANativeWindow_Buffer buf{};
+        if (ANativeWindow_lock(previewWindow, &buf, nullptr) != 0) {
+            return;
+        }
+        if (buf.width >= f.width && buf.height >= f.height) {
+            // libyuv 的 ABGR = 内存字节序 R G B A，即 WINDOW_FORMAT_RGBA_8888
+            libyuv::NV12ToABGR(f.y, f.yStride, f.uv, f.uvStride, static_cast<uint8_t*>(buf.bits), buf.stride * 4,
+                               f.width, f.height);
+        }
+        ANativeWindow_unlockAndPost(previewWindow);
+    }
+
+    void ReleasePreviewWindow()
+    {
+        std::lock_guard<std::mutex> lock(previewMutex);
+        if (previewWindow) {
+            ANativeWindow_release(previewWindow);
+            previewWindow = nullptr;
+        }
+        previewWidth = previewHeight = 0;
+    }
+
     // 取 listener 的 local ref（锁内拷出，锁外回调：Java 回调里允许再调本对象的接口）
     jobject AcquireListener(JNIEnv* env)
     {
@@ -240,6 +289,7 @@ jlong NativeCreate(JNIEnv*, jclass)
             env->DeleteLocalRef(jcontent);
         });
     });
+    s->capturer->SetOnPreviewFrameCallback([s](const PreviewFrame& f) { s->RenderPreview(f); });
     return reinterpret_cast<jlong>(s);
 }
 
@@ -252,6 +302,7 @@ void NativeDestroy(JNIEnv* env, jclass, jlong handle)
     // 先销毁内核（会 Stop 并 join 所有线程，之后不会再有回调），再释放 Java 引用
     ITGCapturer::Destroy(s->capturer);
     s->capturer = nullptr;
+    s->ReleasePreviewWindow();
     {
         std::lock_guard<std::mutex> lock(s->mutex);
         if (s->listener) {
@@ -291,6 +342,40 @@ void NativeSetMediaProjection(JNIEnv* env, jclass, jlong handle, jobject project
         s->projections.push_back(global);
     }
     s->capturer->SetPrivateData("android.MediaProjection", global);
+}
+
+void NativeSetPreviewSurface(JNIEnv* env, jclass, jlong handle, jobject surface)
+{
+    Session* s = FromHandle(handle);
+    if (!s) {
+        return;
+    }
+    s->ReleasePreviewWindow();
+    if (surface) {
+        ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
+        std::lock_guard<std::mutex> lock(s->previewMutex);
+        s->previewWindow = window;
+    }
+}
+
+jint NativeStartPreview(JNIEnv*, jclass, jlong handle)
+{
+    Session* s = FromHandle(handle);
+    return s ? s->capturer->StartPreview() : TGErr_InvalidState;
+}
+
+void NativeStopPreview(JNIEnv*, jclass, jlong handle)
+{
+    Session* s = FromHandle(handle);
+    if (s) {
+        s->capturer->StopPreview();
+    }
+}
+
+jboolean NativeIsPreviewing(JNIEnv*, jclass, jlong handle)
+{
+    Session* s = FromHandle(handle);
+    return (s && s->capturer->IsPreviewing()) ? JNI_TRUE : JNI_FALSE;
 }
 
 jboolean NativeIsSupported(JNIEnv*, jclass, jlong handle, jint feature)
@@ -476,6 +561,10 @@ bool RegisterAll(JNIEnv* env)
         TG_NATIVE("nativeStop", "(J)V", NativeStop),
         TG_NATIVE("nativeMuteAudio", "(JZ)Z", NativeMuteAudio),
         TG_NATIVE("nativeMuteVideo", "(JZ)Z", NativeMuteVideo),
+        TG_NATIVE("nativeSetPreviewSurface", "(JLandroid/view/Surface;)V", NativeSetPreviewSurface),
+        TG_NATIVE("nativeStartPreview", "(J)I", NativeStartPreview),
+        TG_NATIVE("nativeStopPreview", "(J)V", NativeStopPreview),
+        TG_NATIVE("nativeIsPreviewing", "(J)Z", NativeIsPreviewing),
         TG_NATIVE("nativeSetAVTimeout", "(JJJ)I", NativeSetAVTimeout),
         TG_NATIVE("nativeGetTrafficStats", "(J)F", NativeGetTrafficStats),
         TG_NATIVE("nativeGetStatsInfo", "(JI)Ljava/lang/String;", NativeGetStatsInfo),

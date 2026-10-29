@@ -115,12 +115,12 @@ struct Chain
     void StartAll()
     {
         TG_ASSERT(bus.StartGroup(NodeGroup::Output).ok);
-        TG_ASSERT(bus.StartGroup(NodeGroup::Capture).ok);
+        TG_ASSERT(bus.StartGroup(NodeGroup::Preview).ok);
     }
 
     void StopAll()
     {
-        bus.StopGroup(NodeGroup::Capture);
+        bus.StopGroup(NodeGroup::Preview);
         bus.StopGroup(NodeGroup::Output);
     }
 };
@@ -151,8 +151,8 @@ TG_TEST(VideoNodes, FramesFlowOnlyWhileRunning)
 TG_TEST(VideoNodes, PreviewOutputRunsWithoutOutputGroup)
 {
     Chain c(/*withPreview=*/true);
-    // 只启动 capture 组（= 开播前预览）：预览口有帧，video_sync 未启动，编码侧收不到
-    TG_ASSERT(c.bus.StartGroup(NodeGroup::Capture).ok);
+    // 只启动 preview 组（= 开播前预览）：预览口有帧，video_sync 未启动，编码侧收不到
+    TG_ASSERT(c.bus.StartGroup(NodeGroup::Preview).ok);
     c.src->Push(CpuFrame(1000));
     c.src->Push(CpuFrame(2000));
     TG_EXPECT_EQ(c.preview->Count(), 2u);

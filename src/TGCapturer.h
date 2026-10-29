@@ -65,6 +65,11 @@ public:
     int Start() override;
     void Stop() override;
 
+    void SetOnPreviewFrameCallback(OnPreviewFrameCallback cb) override;
+    int StartPreview() override;
+    void StopPreview() override;
+    bool IsPreviewing() const override;
+
     bool MuteAudio(bool mute, AudioCapSourceType channel = TypeOfANone) override;
     bool MuteVideo(bool mute) override;
     int SetPauseInfo(const PauseParams& params) override;
@@ -88,6 +93,7 @@ private:
         Starting,
         Running,
         Stopping,
+        Previewing,   // 只有预览（视频采集 + 合成在跑），没有推流
     };
 
     // Prepare / Start 的实际工作（持生命周期锁）。失败时通过 err 带出要上报的错误，
@@ -104,12 +110,20 @@ private:
     void StopLocked();
     // 按数据流逆序拆除整条链路（停线程 → 关资源）。Stop 与 Prepare 失败回滚共用同一套顺序，
     // 避免回滚路径另写一份、漏掉某个节点。对未启动/未打开的节点是无副作用的空操作。
-    void TeardownLocked();
+    // keepPreview：预览开着时保留 preview 组（视频采集 + 合成）继续运行
+    void TeardownLocked(bool keepPreview);
+    // 打开主画面源（含 Windows GPU 链路的采集侧协商）。已打开（预览期间）直接返回 0
+    int OpenVideoSourceLocked(PrepareError& err);
+    // 停止并关闭 preview 组（视频采集 + 合成），并解除预览连线
+    void ClosePreviewGroupLocked();
+    // 预览 / 推流都结束后的状态：预览开着回 Previewing，否则 Idle
+    State IdleOrPreviewing() const { return m_previewOn ? State::Previewing : State::Idle; }
     // 等待在途的 Stop（含锁外收尾）结束。返回 false 表示调用方自己就是停机线程，不应再停。
     bool WaitStopSettled(std::unique_lock<std::mutex>& lock);
 
-    // 绑定主画面源：门面记录 + vsrc.main 节点接管其产帧回调
-    void BindVideoSource(capture::VideoSourceBase* source);
+    // 绑定主画面源：门面记录 + vsrc.main 节点接管其产帧回调。视频源已打开（预览 / 推流中）时拒绝换源
+    int BindVideoSource(capture::VideoSourceBase* source);
+    int BindVideoSourceLocked(capture::VideoSourceBase* source);
     // 外部注入的音频（PushExternalAudioFrame）也进混流器
     void OnAudioFrame(AudioCapSourceType type, core::FramePtr frame);
     // 经总线发布（异步：由事件分发线程投递，永不阻塞调用线程）
@@ -198,6 +212,10 @@ private:
     std::shared_ptr<nodes::VideoSourceNode> m_vsrcMain;
     std::shared_ptr<nodes::VideoCompositorNode> m_compositor;
     std::shared_ptr<nodes::VideoSyncNode> m_videoSync;
+    std::shared_ptr<nodes::PreviewSinkNode> m_previewSink;
+    // 预览开关（持 m_lifecycleMutex 读写；IsPreviewing 无锁读用 atomic）与主画面源是否已打开
+    std::atomic_bool m_previewOn{false};
+    bool m_videoSourceOpened = false;
 
     // 宿主回调：设置与调用可能在不同线程，用互斥保护。调用时先拷贝出来再在锁外执行
     std::mutex m_callbackMutex;

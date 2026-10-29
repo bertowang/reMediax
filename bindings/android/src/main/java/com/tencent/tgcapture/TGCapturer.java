@@ -3,6 +3,7 @@ package com.tencent.tgcapture;
 import android.media.projection.MediaProjection;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.Surface;
 
 import java.nio.ByteBuffer;
 
@@ -16,9 +17,12 @@ import java.nio.ByteBuffer;
  * c.setMediaProjection(projection);                    // 录屏 / 系统内录前必须
  * c.createScreenCapture();  c.enableMicrophoneCapture();
  * c.setupVideoEncoder(v); c.setupAudioEncoder(a); c.setupMuxer(m);
+ * c.setPreviewSurface(surfaceView.getHolder().getSurface());   // 可选：开播前预览
+ * c.startPreview();                                    // 可选：Idle → Previewing（需已 setupVideoEncoder）
  * c.prepare(); c.start();                              // 会连推流地址，必须在工作线程调用
  * ...
- * c.stop(); c.release();
+ * c.stop();                                            // 预览开着则回到预览，否则回到 Idle
+ * c.stopPreview(); c.release();
  * </pre>
  *
  * <p>返回 int 的接口：0 = 成功，负数 = TGCaptureError。
@@ -167,6 +171,32 @@ public final class TGCapturer {
         nativeStop(handle());
     }
 
+    // ------------------------------------------------------------------ 预览
+    /**
+     * 预览画面输出到该 Surface（RGBA，缓冲区尺寸 = 采集尺寸，由系统缩放到 View）。传 null 解除。
+     * Surface 销毁前（surfaceDestroyed）必须先传 null。
+     */
+    public void setPreviewSurface(Surface surface) {
+        nativeSetPreviewSurface(handle(), surface);
+    }
+
+    /**
+     * 开播前预览：打开屏幕采集（需先 setMediaProjection + createScreenCapture + setupVideoEncoder）。
+     * 预览期间 prepare/start 不会重开采集；stop 后回到预览，不需要重新申请录屏授权。
+     */
+    public int startPreview() {
+        return nativeStartPreview(handle());
+    }
+
+    /** 关闭预览。只有预览时同时停止采集；推流中只关预览，推流不受影响。 */
+    public void stopPreview() {
+        nativeStopPreview(handle());
+    }
+
+    public boolean isPreviewing() {
+        return nativeIsPreviewing(handle());
+    }
+
     /** 释放内核对象（内部会先 stop）。之后本对象不可再用。 */
     public synchronized void release() {
         if (mHandle != 0) {
@@ -198,7 +228,7 @@ public final class TGCapturer {
         return nativeGetStatsInfo(handle(), type);
     }
 
-    /** 外部注入 NV12 帧（data 必须是 DirectByteBuffer）。start 之后调用。 */
+    /** 外部注入 NV12 帧（data 必须是 DirectByteBuffer）。start 之后（或预览期间）调用。 */
     public int pushVideoFrameNv12(ByteBuffer data, int width, int height, int stride, long ptsUs) {
         return nativePushVideoFrame(handle(), data, width, height, stride, ptsUs);
     }
@@ -233,6 +263,14 @@ public final class TGCapturer {
     private static native void nativeSetListener(long handle, TGCaptureListener listener);
 
     private static native void nativeSetMediaProjection(long handle, MediaProjection projection);
+
+    private static native void nativeSetPreviewSurface(long handle, Surface surface);
+
+    private static native int nativeStartPreview(long handle);
+
+    private static native void nativeStopPreview(long handle);
+
+    private static native boolean nativeIsPreviewing(long handle);
 
     private static native boolean nativeIsSupported(long handle, int feature);
 

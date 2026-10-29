@@ -250,6 +250,7 @@ if(TG_BUILD_TESTS)
         tests/test_bus.cpp
         tests/test_bus_topology.cpp
         tests/test_video_nodes.cpp
+        tests/test_lifecycle.cpp
         tests/test_health.cpp
         tests/test_traffic_meter.cpp
         tests/test_error_codes.cpp

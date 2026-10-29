@@ -14,7 +14,7 @@ set(TG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory("${TG_REPO_ROOT}" tgcapture-core)
 
 add_library(tgcapture_jni SHARED tgcapture_jni.cpp)
-target_link_libraries(tgcapture_jni PRIVATE tgcapture log)
+target_link_libraries(tgcapture_jni PRIVATE tgcapture log android)
 target_compile_options(tgcapture_jni PRIVATE -Wall -Wextra)
 # 胶水自身的符号也隐藏：.so 对外只导出 JNI_OnLoad（JNIEXPORT 显式标了 default 可见性）
 set_target_properties(tgcapture_jni PROPERTIES

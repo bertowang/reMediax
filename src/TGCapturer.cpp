@@ -55,6 +55,7 @@ TGCapturer::TGCapturer(GameID gameId) : m_gameId(gameId)
     m_vsrcMain = std::make_shared<nodes::VideoSourceNode>("vsrc.main");
     m_compositor = std::make_shared<nodes::VideoCompositorNode>();
     m_videoSync = std::make_shared<nodes::VideoSyncNode>();
+    m_previewSink = std::make_shared<nodes::PreviewSinkNode>();
     m_pauseFrame = std::make_shared<core::PauseFrame>();
     m_watermark = std::make_shared<core::Watermark>();
 
@@ -71,6 +72,7 @@ TGCapturer::TGCapturer(GameID gameId) : m_gameId(gameId)
     // 总线拓扑：
     //   asrc.* → audio_mixer → audio_encoder → muxer
     //   vsrc.main → video_compositor →(out0) video_sync → video_encoder → muxer
+    //                                →(out1) preview_sink（StartPreview 时接上，Latest 连线）
     // 数据、命令、事件都走这一条总线（见 core/Bus.h）。音频源节点在 AddAudioSource / 首次外灌时接入
     const bool linked = m_bus.Begin()
                             .Register("video_encoder", m_videoEncoder)
@@ -80,6 +82,7 @@ TGCapturer::TGCapturer(GameID gameId) : m_gameId(gameId)
                             .Register("vsrc.main", m_vsrcMain)
                             .Register("video_compositor", m_compositor)
                             .Register("video_sync", m_videoSync)
+                            .Register("preview_sink", m_previewSink)
                             .Link("video_encoder", "muxer")
                             .Link("audio_encoder", "muxer")
                             .Link("audio_mixer", "audio_encoder")
@@ -104,6 +107,7 @@ TGCapturer::TGCapturer(GameID gameId) : m_gameId(gameId)
 TGCapturer::~TGCapturer()
 {
     Stop();
+    StopPreview();
     ReleaseAll();
     // 先停事件分发再销毁成员：订阅者捕获了 this。
     // 若本析构就发生在某个宿主回调里（分发线程内），Shutdown 会分离线程而不是 join 自己
@@ -200,8 +204,10 @@ IVideoSource* TGCapturer::CreateScreenCapture(int index, VideoCapMode mode, Vide
 #endif
 
 #if TG_HAS_NATIVE_CAPTURE
+    if (BindVideoSource(source.get()) != TGErr_OK) {
+        return nullptr;
+    }
     m_ownedVideoSources.push_back(source);
-    BindVideoSource(source.get());
     return source.get();
 #else
     TG_LOGW("TGCapturer: 当前平台无屏幕采集实现（外部注入请用 PushExternalVideoFrame）");
@@ -217,8 +223,10 @@ IVideoSource* TGCapturer::CreateWindowCapture(void* handle, VideoCapMode mode, V
     }
 #if defined(_WIN32)
     auto source = std::make_shared<platform::WinScreenCapture>(static_cast<HWND>(handle), mode, strategy);
+    if (BindVideoSource(source.get()) != TGErr_OK) {
+        return nullptr;
+    }
     m_ownedVideoSources.push_back(source);
-    BindVideoSource(source.get());
     return source.get();
 #else
     (void)handle;
@@ -356,14 +364,25 @@ int TGCapturer::AddVideoSource(IVideoSource* source)
         TG_LOGE("TGCapturer: AddVideoSource 的对象不是本 SDK 创建的视频源");
         return TGErr_InvalidArgument;
     }
-    BindVideoSource(base);
-    return 0;
+    return BindVideoSource(base);
 }
 
-void TGCapturer::BindVideoSource(capture::VideoSourceBase* source)
+int TGCapturer::BindVideoSource(capture::VideoSourceBase* source)
 {
+    std::lock_guard<std::mutex> lock(m_lifecycleMutex);
+    return BindVideoSourceLocked(source);
+}
+
+int TGCapturer::BindVideoSourceLocked(capture::VideoSourceBase* source)
+{
+    if (m_videoSourceOpened && source != m_videoSource) {
+        // 采集线程正在回调旧源时换绑会与之并发；运行期换画面请用叠加层
+        TG_LOGE("TGCapturer: 视频源已打开（预览 / 推流中），不能更换主画面源");
+        return TGErr_InvalidState;
+    }
     m_videoSource = source;
     m_vsrcMain->SetSource(source);
+    return TGErr_OK;
 }
 
 // ------------------------------------------------------------------ 参数
@@ -484,10 +503,13 @@ int TGCapturer::Prepare()
 
 int TGCapturer::PrepareLocked(PrepareError& err)
 {
-    // 检查与置位在同一个临界区内原子完成：并发两次 Prepare 只有一个能进
-    State expected = State::Idle;
-    if (!m_state.compare_exchange_strong(expected, State::Preparing)) {
-        const int32_t cur = static_cast<int32_t>(m_state.load());
+    // 检查与置位在同一个临界区内（m_lifecycleMutex）完成：并发两次 Prepare 只有一个能进。
+    // 预览中（Previewing）也可以 Prepare：视频源已打开，不再重开
+    const State before = m_state.load();
+    if (before == State::Idle || before == State::Previewing) {
+        m_state.store(State::Preparing);
+    } else {
+        const int32_t cur = static_cast<int32_t>(before);
         TG_LOGW("TGCapturer: Prepare 状态错误 state=%d", cur);
         // 原先这条路径静默返回 -1：既不在枚举里、也不上报，宿主只能靠猜
         err = {TGErr_InvalidState, cur, "prepare called in wrong state"};
@@ -501,8 +523,8 @@ int TGCapturer::PrepareLocked(PrepareError& err)
     //      Prepare 被静默复用，新参数（分辨率/码率/采样率）被丢弃，表现为"第二次成功了但不生效"。
     auto fail = [&](TGCaptureError code, int32_t extra, const char* message) {
         err = {code, extra, message};
-        TeardownLocked();
-        m_state.store(State::Idle);
+        TeardownLocked(m_previewOn);
+        m_state.store(IdleOrPreviewing());
         return static_cast<int>(code);
     };
 
@@ -536,44 +558,13 @@ int TGCapturer::PrepareLocked(PrepareError& err)
     // 纯视频模式：不建音频编码器、封装器也不建音频流
     m_audioEnabled = m_audioParams.enabled && m_audioParams.sampleRate > 0 && m_audioParams.channels > 0;
 
-    // ---- 性能模式：GPU 链路需要采集侧与编码侧共用一个设备 ----
+    // ---- 采集源先打开（预览期间已打开则跳过）：GPU 模式要确认采集侧真的走的是硬件路径 ----
+    if (const int openRet = OpenVideoSourceLocked(err); openRet != 0) {
+        TeardownLocked(m_previewOn);
+        m_state.store(IdleOrPreviewing());
+        return openRet;
+    }
     void* externalDevice = nullptr;
-#if defined(_WIN32)
-    if (m_perfMode == PerformanceMode::Gpu) {
-        auto* win = dynamic_cast<platform::WinScreenCapture*>(m_videoSource);
-        // 必须是"屏幕"这种真有桌面复制通道的源：窗口采集走 GPU 会抓到整屏而不是目标窗口
-        if (win && win->SupportsGpuDirect()) {
-            win->SetGpuMode(true);
-            externalDevice = win->EnsureD3D11Device();
-            if (!externalDevice) {
-                TG_LOGW("TGCapturer: GPU 采集不可用，回退 CPU 链路");
-                win->SetGpuMode(false);
-                m_perfMode = PerformanceMode::Cpu;
-            }
-        } else {
-            TG_LOGW("TGCapturer: 当前采集源不支持 GPU 直连（窗口采集无桌面复制通道），回退 CPU 链路");
-            m_perfMode = PerformanceMode::Cpu;
-        }
-    }
-#endif
-    // ---- 采集源先打开：GPU 模式要确认采集侧真的走的是硬件路径 ----
-    if (m_videoSource) {
-        const int openRet =
-            m_videoSource->Open(m_videoParams.width, m_videoParams.height, m_videoParams.fps);
-        if (openRet < 0) {
-            // 外部注入源（上层自己推帧）的 Open 失败无所谓；但宿主显式创建的**原生**采集源
-            // 打不开（设备被占用 / 权限未授予 / 无桌面复制通道）就必须让 Prepare 失败 ——
-            // 原先只打一条 Warn 就继续，结果是"推流成功但永远没有画面"，是最难排查的那类故障。
-            const VideoCapSourceType type = m_videoSource->GetVideoCapSourceType();
-            if (type == TypeOfGameEngine4Slave) {
-                TG_LOGW("TGCapturer: 视频源打开失败 ret=%d（外部注入模式，由上层推帧）", openRet);
-            } else {
-                TG_LOGE("TGCapturer: 原生视频源打开失败 type=%d ret=%d", static_cast<int>(type),
-                        openRet);
-                return fail(TGErr_OpenVideoSource, openRet, "open video capture source failed");
-            }
-        }
-    }
 #if defined(_WIN32)
     if (m_perfMode == PerformanceMode::Gpu) {
         auto* win = dynamic_cast<platform::WinScreenCapture*>(m_videoSource);
@@ -595,6 +586,8 @@ int TGCapturer::PrepareLocked(PrepareError& err)
             if (win) {
                 win->SetGpuMode(false);
             }
+        } else {
+            externalDevice = win->D3D11Device();
         }
     }
 #endif
@@ -732,6 +725,53 @@ int TGCapturer::PrepareLocked(PrepareError& err)
     return 0;
 }
 
+// 主画面源只在这里打开：预览（StartPreview）与开播（Prepare）共用，已打开就直接返回。
+// 打开的源在 preview 组关闭时（StopPreview / 未开预览时的 Stop / Prepare 失败回滚）由 vsrc.main 的 NodeClose 关闭
+int TGCapturer::OpenVideoSourceLocked(PrepareError& err)
+{
+    if (m_videoSourceOpened) {
+        return 0;
+    }
+    // ---- 性能模式：GPU 链路需要采集侧与编码侧共用一个设备（设备由 Prepare 在打开后取用）----
+#if defined(_WIN32)
+    if (m_perfMode == PerformanceMode::Gpu) {
+        auto* win = dynamic_cast<platform::WinScreenCapture*>(m_videoSource);
+        // 必须是"屏幕"这种真有桌面复制通道的源：窗口采集走 GPU 会抓到整屏而不是目标窗口
+        if (win && win->SupportsGpuDirect()) {
+            win->SetGpuMode(true);
+            if (!win->EnsureD3D11Device()) {
+                TG_LOGW("TGCapturer: GPU 采集不可用，回退 CPU 链路");
+                win->SetGpuMode(false);
+                m_perfMode = PerformanceMode::Cpu;
+            }
+        } else {
+            TG_LOGW("TGCapturer: 当前采集源不支持 GPU 直连（窗口采集无桌面复制通道），回退 CPU 链路");
+            m_perfMode = PerformanceMode::Cpu;
+        }
+    }
+#endif
+    if (m_videoSource) {
+        const int openRet =
+            m_videoSource->Open(m_videoParams.width, m_videoParams.height, m_videoParams.fps);
+        if (openRet < 0) {
+            // 外部注入源（上层自己推帧）的 Open 失败无所谓；但宿主显式创建的**原生**采集源
+            // 打不开（设备被占用 / 权限未授予 / 无桌面复制通道）就必须让 Prepare 失败 ——
+            // 原先只打一条 Warn 就继续，结果是"推流成功但永远没有画面"，是最难排查的那类故障。
+            const VideoCapSourceType type = m_videoSource->GetVideoCapSourceType();
+            if (type == TypeOfGameEngine4Slave) {
+                TG_LOGW("TGCapturer: 视频源打开失败 ret=%d（外部注入模式，由上层推帧）", openRet);
+            } else {
+                TG_LOGE("TGCapturer: 原生视频源打开失败 type=%d ret=%d", static_cast<int>(type),
+                        openRet);
+                err = {TGErr_OpenVideoSource, openRet, "open video capture source failed"};
+                return TGErr_OpenVideoSource;
+            }
+        }
+    }
+    m_videoSourceOpened = true;
+    return 0;
+}
+
 int TGCapturer::Start()
 {
     PrepareError err;
@@ -779,14 +819,100 @@ int TGCapturer::StartLocked(PrepareError& err)
         m_state.store(State::Prepared);   // 退回可重试的状态，宿主可以 Stop 后重开
         return static_cast<int>(TGErr_StartFailed);
     }
-    // capture 组（vsrc.main / 合成器 / 音频源 / 混音器）：下游先于上游 —— 合成器、混音时钟线程先起，
-    // 源再开始产帧（视频源节点在这里 StartCapture）。纯视频模式下音频节点未激活，被跳过
+    // preview 组（vsrc.main / 合成器）：预览期间已在运行则跳过；否则在这里开始采集（下游先于上游）。
+    // capture 组（音频源 / 混音器）：混音时钟线程先起，源再开始产帧。纯视频模式下音频节点未激活，被跳过
+    m_bus.StartGroup(core::NodeGroup::Preview);
     m_bus.StartGroup(core::NodeGroup::Capture);
 
     m_state.store(State::Running);
     StartWatchdog();
     TG_LOGI("TGCapturer: 已启动");
     return TGErr_OK;
+}
+
+// ------------------------------------------------------------------ 预览
+void TGCapturer::SetOnPreviewFrameCallback(OnPreviewFrameCallback cb)
+{
+    m_previewSink->SetCallback(std::move(cb));
+}
+
+bool TGCapturer::IsPreviewing() const
+{
+    return m_previewOn.load();
+}
+
+int TGCapturer::StartPreview()
+{
+    PrepareError err;
+    int ret = TGErr_OK;
+    {
+        std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+        WaitStopSettled(lock);
+        if (m_previewOn) {
+            return TGErr_OK;
+        }
+        const State st = m_state.load();
+        if (st != State::Idle && st != State::Prepared && st != State::Running) {
+            err = {TGErr_InvalidState, static_cast<int32_t>(st), "start preview called in wrong state"};
+            ret = TGErr_InvalidState;
+        } else if (!m_videoParamsSet) {
+            // 采集尺寸 / 帧率取自视频编码参数
+            err = {TGErr_NotConfigured, 0, "SetupVideoEncoder before StartPreview"};
+            ret = TGErr_NotConfigured;
+        } else {
+            ret = OpenVideoSourceLocked(err);   // Prepared / Running 时已打开，直接返回
+            if (ret != TGErr_OK && st == State::Idle) {
+                ClosePreviewGroupLocked();      // 打开失败也要 Close：可能已占用了部分设备资源
+            }
+        }
+        if (ret == TGErr_OK) {
+            // 预览口用 Latest 连线：宿主回调在投递线程上执行，慢了只跳预览帧，不拖慢采集与推流
+            if (!m_bus.Link("video_compositor", nodes::VideoCompositorNode::kPreviewOutput, "preview_sink", 0,
+                            core::LinkOptions::Latest())) {
+                err = {TGErr_Internal, 0, "link preview failed"};
+                ret = TGErr_Internal;
+                if (st == State::Idle) {
+                    ClosePreviewGroupLocked();
+                }
+            }
+        }
+        if (ret == TGErr_OK) {
+            m_bus.StartGroup(core::NodeGroup::Preview);   // 已在运行（推流中）则跳过
+            m_previewOn = true;
+            if (st == State::Idle) {
+                m_state.store(State::Previewing);
+            }
+            TG_LOGI("TGCapturer: 预览已开启（state=%d）", static_cast<int>(m_state.load()));
+        }
+    }
+    if (ret != TGErr_OK) {
+        m_bus.PublishSync(core::BusEventType::Error, "capturer", err.what, err.message, err.extra);
+    }
+    return ret;
+}
+
+void TGCapturer::StopPreview()
+{
+    std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+    if (!WaitStopSettled(lock) || !m_previewOn) {
+        return;
+    }
+    // 先断预览连线（等预览投递线程上的宿主回调结束），之后不会再有预览回调
+    m_bus.Unlink("video_compositor", "preview_sink");
+    m_previewOn = false;
+    if (m_state.load() == State::Previewing) {
+        // 只有预览、没有推流：视频采集一并停掉
+        ClosePreviewGroupLocked();
+        m_state.store(State::Idle);
+    }
+    TG_LOGI("TGCapturer: 预览已关闭");
+}
+
+void TGCapturer::ClosePreviewGroupLocked()
+{
+    m_bus.StopGroup(core::NodeGroup::Preview);
+    m_bus.CloseGroup(core::NodeGroup::Preview);
+    m_videoSourceOpened = false;
 }
 
 void TGCapturer::Stop()
@@ -798,7 +924,8 @@ void TGCapturer::Stop()
         if (!WaitStopSettled(lock)) {
             return;   // 本线程就是正在停机的那个（宿主在 OnStop 里又调了 Stop）
         }
-        if (m_state.load() == State::Idle) {
+        // 没有推流（Idle / 只开了预览）：无事可停，也不发 OnStop
+        if (m_state.load() == State::Idle || m_state.load() == State::Previewing) {
             return;
         }
         StopLocked();
@@ -832,7 +959,7 @@ bool TGCapturer::WaitStopSettled(std::unique_lock<std::mutex>& lock)
     return true;
 }
 
-void TGCapturer::TeardownLocked()
+void TGCapturer::TeardownLocked(bool keepPreview)
 {
     // 先停看护：拆除过程中采集必然停止产出，否则会报出一个无意义的"断流"
     StopWatchdog();
@@ -848,12 +975,21 @@ void TGCapturer::TeardownLocked()
     // 混音器停线程并复位音频主时钟。不按 m_audioEnabled 过滤：Prepare 中途失败时它可能还是上一轮的值，
     // 而已经 Open 过的源无论如何都得停。对没启动的源是无副作用的空操作。
     m_bus.StopGroup(core::NodeGroup::Capture);
+    // preview 组（视频源 → 合成器）：预览开着就保留，采集线程继续送帧到 video_sync ——
+    // 后者属于 output 组、是受控输出，停止后不再往编码器送
+    if (!keepPreview) {
+        m_bus.StopGroup(core::NodeGroup::Preview);
+    }
     // output 组（video_sync / 编码器 / 封装器）由总线按拓扑顺序收尾：Stop 上游先于下游（编码器 drain 完积压再停封装器），
     // Close 下游先于上游（封装器先写尾，再关编码器）。对未启动 / 未打开的节点是空操作
     m_bus.StopGroup(core::NodeGroup::Output);
     m_bus.CloseGroup(core::NodeGroup::Output);
     // 采集源的设备资源（摄像头/麦克风句柄、COM 对象、D3D 纹理、GDI 位图）最后放（vsrc.main 的 NodeClose）。
     // 此时采集线程已 join、在飞回调已退出，Close 不会与产帧并发。
+    if (!keepPreview) {
+        m_bus.CloseGroup(core::NodeGroup::Preview);
+        m_videoSourceOpened = false;
+    }
     m_bus.CloseGroup(core::NodeGroup::Capture);
     RemoveExternalAudioNodes();
     m_sync->Reset();
@@ -862,7 +998,7 @@ void TGCapturer::TeardownLocked()
 void TGCapturer::StopLocked()
 {
     m_state.store(State::Stopping);
-    TeardownLocked();
+    TeardownLocked(m_previewOn);
     if (m_videoPtsGen) {
         const auto st = m_videoPtsGen->stats();
         TG_LOGI("TGCapturer: 音画同步 avDiff=%lldms clamp=%llu forceSync=%llu adapt=%llu stall=%llu skip=%llu jump=%llu staleReset=%llu syncDrop=%llu bpDrop=%llu",
@@ -877,8 +1013,8 @@ void TGCapturer::StopLocked()
                 static_cast<unsigned long long>(m_videoSync->SyncDropped()),
                 static_cast<unsigned long long>(m_videoSync->BackpressureDropped()));
     }
-    m_state.store(State::Idle);
-    TG_LOGI("TGCapturer: 已停止");
+    m_state.store(IdleOrPreviewing());
+    TG_LOGI("TGCapturer: 已停止%s", m_previewOn ? "（回到预览）" : "");
 }
 
 // ------------------------------------------------------------------ 断流看护
@@ -964,7 +1100,7 @@ void TGCapturer::ReleaseAll()
     m_audioSourceNodes.clear();
     RemoveExternalAudioNodes();
     // 视频源同理：先解除 vsrc.main 与源的回调绑定，再释放源
-    BindVideoSource(nullptr);
+    BindVideoSourceLocked(nullptr);
     m_ownedVideoSources.clear();
     m_ownedAudioSources.clear();
     m_audioSource = nullptr;
@@ -1016,7 +1152,8 @@ void TGCapturer::OnAudioFrame(AudioCapSourceType type, core::FramePtr frame)
 int TGCapturer::PushExternalVideoFrame(const uint8_t* data, int width, int height, int stride,
                                        int64_t ptsUs, void* pixelBuffer)
 {
-    if (m_state.load() != State::Running) {
+    // 推流中，或预览开着（只送预览、不编码）
+    if (m_state.load() != State::Running && !m_previewOn.load()) {
         return TGErr_InvalidState;
     }
     auto frame = std::make_shared<core::Frame>();

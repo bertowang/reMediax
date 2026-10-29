@@ -541,13 +541,17 @@ struct BusRoute
 using BusRouteTable = std::vector<std::vector<BusRoute>>;   // [输出端口] -> 出边列表
 
 // ------------------------------------------------------------------ 节点生命周期
-// 分组启停：capture 组（采集 / 混音 / 合成 / 预览）与 output 组（同步 / 编码 / 封装）可以独立启停，
-// 开播前预览 = 只起 capture 组；开播 = 再起 output 组；停播 = 只停 output 组。
+// 分组启停：三组可以独立启停 ——
+//   preview  视频采集与合成（vsrc.* / video_compositor）：开播前预览即运行，停播后若预览仍开着则继续运行
+//   capture  音频采集与混音（asrc.* / audio_mixer）：随开播启停（打开格式依赖编码参数，Prepare 才定）
+//   output   同步 / 编码 / 封装：随开播启停
+// 开播前预览 = 只起 preview 组；开播 = 再起 output + capture 组；停播回到预览 = 只停 capture + output 组。
 enum class NodeGroup : uint8_t
 {
     None,      // 不参与分组启停（由持有者自行管理）
     Capture,
     Output,
+    Preview,
 };
 
 enum class NodeLifecycle : uint8_t
@@ -565,6 +569,7 @@ inline const char* NodeGroupName(NodeGroup g) noexcept
         case NodeGroup::None: return "none";
         case NodeGroup::Capture: return "capture";
         case NodeGroup::Output: return "output";
+        case NodeGroup::Preview: return "preview";
     }
     return "?";
 }
@@ -1030,12 +1035,13 @@ public:
         return result;
     }
 
-    // 下游先于上游，跳过未激活节点。任一节点启动失败：把本次已启动的按停止顺序停掉，返回失败节点
+    // 下游先于上游，跳过未激活节点与已在运行的节点（预览期间已起的节点在开播时不重复启动）。
+    // 任一节点启动失败：把本次已启动的按停止顺序停掉，返回失败节点
     GroupResult StartGroup(NodeGroup group)
     {
         std::vector<BusNodePtr> started;
         for (const auto& node : GroupNodes(group, /*upstreamFirst=*/false)) {
-            if (!node->IsActive()) {
+            if (!node->IsActive() || node->Lifecycle() == NodeLifecycle::Running) {
                 continue;
             }
             if (!node->StartNode()) {

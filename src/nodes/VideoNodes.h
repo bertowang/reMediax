@@ -1,15 +1,16 @@
 // 视频链路的总线节点
 //
-//   vsrc.main         VideoSourceNode      —— 主画面源（原生采集 / 外部注入），capture 组，受控输出
-//   video_compositor  VideoCompositorNode  —— 图层合成，capture 组。输入 0 = 主画面（其余输入留给叠加层）；
+//   vsrc.main         VideoSourceNode      —— 主画面源（原生采集 / 外部注入），preview 组，受控输出
+//   video_compositor  VideoCompositorNode  —— 图层合成，preview 组。输入 0 = 主画面（其余输入留给叠加层）；
 //                                             图层：主画面 → 暂停图（MuteVideo 时替换）→ 水印 → …
 //                                             out0 = 推流画面，out1 = 预览画面
 //   video_sync        VideoSyncNode        —— 编码前的背压与音画同步（视频 PTS 由音频主时钟反推），output 组
+//   preview_sink      PreviewSinkNode      —— 把预览画面交给宿主回调（Latest 连线：只送最新一帧，宿主慢了就跳帧）
 //
 //   vsrc.main ──> video_compositor ──out0──> video_sync ──> video_encoder ──> muxer
-//                                  └─out1──> (preview)
+//                                  └─out1──> preview_sink（StartPreview 时接上）
 //
-// 三段都是 Direct 连线：在产帧线程里同步完成，与节点化之前的 OnVideoFrame 行为一致。
+// 推流这一路都是 Direct 连线：在产帧线程里同步完成，与节点化之前的 OnVideoFrame 行为一致。
 // video_sync 属于 output 组：只开预览不开播时它不运行，合成后的画面到它这里就停下。
 #ifndef TGCAPTURE_NODES_VIDEO_NODES_H
 #define TGCAPTURE_NODES_VIDEO_NODES_H
@@ -47,7 +48,7 @@ public:
     bool Submit(core::FramePtr) override { return false; }
     [[nodiscard]] size_t Pending() const override { return 0; }
 
-    [[nodiscard]] core::NodeGroup Group() const override { return core::NodeGroup::Capture; }
+    [[nodiscard]] core::NodeGroup Group() const override { return core::NodeGroup::Preview; }
     [[nodiscard]] bool GatedOutput() const override { return true; }
 
     // 绑定 / 换绑原生采集源（不拥有）。只能在未运行时调用；传空即解绑
@@ -82,7 +83,7 @@ public:
 
     [[nodiscard]] size_t InputPorts() const override { return core::kDynamicPorts; }
     [[nodiscard]] size_t OutputPorts() const override { return 2; }
-    [[nodiscard]] core::NodeGroup Group() const override { return core::NodeGroup::Capture; }
+    [[nodiscard]] core::NodeGroup Group() const override { return core::NodeGroup::Preview; }
 
     bool Submit(core::FramePtr frame) override { return SubmitInput(kMainInput, std::move(frame)); }
     bool SubmitInput(size_t port, core::FramePtr frame) override;
@@ -129,6 +130,8 @@ public:
     VideoSyncNode();
 
     [[nodiscard]] core::NodeGroup Group() const override { return core::NodeGroup::Output; }
+    // 受控输出：预览期间停播时采集线程仍在送帧，停止后必须保证没有线程还在往编码器里送
+    [[nodiscard]] bool GatedOutput() const override { return true; }
 
     bool Submit(core::FramePtr frame) override;
     [[nodiscard]] size_t Pending() const override { return 0; }
@@ -161,6 +164,29 @@ private:
     // 最后一个已提交编码的视频帧（内部时间轴）：主时钟 ↔ wall-clock 切换时据此接续
     int64_t m_lastVideoPtsUs = -1;
     int64_t m_lastVideoCaptureUs = -1;
+};
+
+// ------------------------------------------------------------------ preview_sink
+class PreviewSinkNode : public core::BusNode
+{
+public:
+    using Callback = std::function<void(const PreviewFrame&)>;
+
+    PreviewSinkNode() : core::BusNode("preview_sink") {}
+
+    bool Submit(core::FramePtr frame) override;
+    [[nodiscard]] size_t Pending() const override { return 0; }
+
+    // 宿主回调（在 Latest 连线的投递线程上调用；回调里不得调用 StopPreview / Destroy）
+    void SetCallback(Callback cb);
+
+    [[nodiscard]] uint64_t Delivered() const noexcept { return m_delivered.load(); }
+    [[nodiscard]] std::string DumpState() const override;
+
+private:
+    mutable std::mutex m_mutex;
+    Callback m_callback;
+    std::atomic<uint64_t> m_delivered{0};
 };
 
 }  // namespace TGCapture::nodes
