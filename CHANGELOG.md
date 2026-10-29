@@ -22,6 +22,13 @@
   缩放结果按 id@宽x高 缓存（libyuv），空闲 64 帧后清理。视频层各是一个 `vsrc.ovl.<n>` 节点，接合成器的动态输入口。
 - 新增 `tests/test_overlay.cpp`（10 个用例）与 `tests/test_media.h`（测试用 PNG / H.264 素材生成与解码）。
 
+### 命令行 demo 动作脚本（B9）
+- `--script <文件>`（每行 `<秒> <动作> [参数…]`，`#` 注释，双引号包空格）与 `--do "<秒> <动作> …"`（可多次），按时刻稳定排序执行。
+  动作：`res`、`audio.add/rm/vol/levels`、`overlay.stage/set/rm/commit/discard/list`、`mute.video/audio`、`pause.pic`、
+  `watermark add/rm`、`preview.snap`（最新预览帧写裸 NV12）、`stats`、`stop`。`--switch-res` / `--audio-file` 改为转成等价动作。
+- `--video-file <路径>`（`--video-file-no-loop`）：主画面走 `CreateLocalFileCapture`，不再经 ffmpeg 管道外灌；`--seconds 0` 时收到主画面 EOF 结束。
+- `--preview`：开播前先开预览，供 `preview.snap` 取图。打印所有 Notify；任一动作失败（参数错误或 SDK 返回非 0）则退出码为 1。
+
 ### 文件音频源（B7）
 - `AudioSourceKind::File`：`capture/FileAudioSource`，纯 ffmpeg 实现、三端共用。解封装 + 解码（AAC）+ 重采样到编码格式，
   每 10ms 一块按墙钟节拍送进混音器（时间戳按已送样本数推进，混音器测得漂移为 0；被挂起落后 200ms 以上重新对齐，不追赶）。

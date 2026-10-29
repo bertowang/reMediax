@@ -20,12 +20,24 @@
 //       --audio2-volume 0.1 \
 //       --out      out.flv \
 //       --seconds  10
+//
+// 动作脚本（运行期控制）：--script <文件> 或 --do "<秒> <动作> [参数…]"（可多次），按时刻先后执行。
+// 脚本每行一条，# 开头为注释，参数里的空格用双引号括起来；可用动作见 --help。例如：
+//   0   overlay.stage logo image /tmp/logo.png x=0.75 y=0.05 w=0.2
+//   1   preview.snap /tmp/staged.nv12      # 预览已出现 logo，推流画面还没有
+//   2   overlay.commit
+//   4   overlay.set logo x=0.05
+//   4   overlay.commit
+//   6   res 540p
+//   8   stop
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <fstream>
+#include <map>
 #include <mutex>
 #include <random>
 #include <cerrno>
@@ -87,13 +99,21 @@ struct Options
     bool        audio    = true;                              // 关掉就是纯视频
     int         seconds  = 10;                                // 0 = 直到视频 EOF
     int         logLevel = 1;
-    // 运行期切分辨率（可多次）：--switch-res <秒>:<档位名 | 宽x高>
+    // 运行期切分辨率（可多次）：--switch-res <秒>:<档位名 | 宽x高>（等价于动作 "<秒> res <r>"）
     std::vector<std::pair<double, std::string>> switchRes;
-    // 运行期加文件音频源：--audio-file <秒>:<路径>（内核解码文件音轨，AudioSourceKind::File）
+    // 运行期加文件音频源：--audio-file <秒>:<路径>（等价于动作 "<秒> audio.add file file <路径>"）
     double      audioFileAt = -1;
     std::string audioFile;
     float       audioFileVolume = 1.0f;
     bool        audioFileLoop = true;
+    // 动作脚本：--script <文件>（每行 "<秒> <动作> [参数…]"）与 --do "<秒> <动作> …"（可多次）
+    std::string              scriptPath;
+    std::vector<std::string> actions;
+    // 主画面改用内核解码本地文件（CreateLocalFileCapture），不走 ffmpeg 管道外灌
+    std::string videoFile;
+    bool        videoFileLoop = true;
+    // 开播前先开预览（preview.snap 需要）
+    bool        preview = false;
 
     // 工具
     std::string ffmpegBin = "ffmpeg";
@@ -131,6 +151,24 @@ void PrintUsage()
            "    --sample-rate <n>       音频采样率，默认 44100\n"
            "    --channels <n>          音频通道数，默认 2\n"
            "    --no-audio              纯视频\n"
+           "  主画面改用本地文件（内核解码，不走 ffmpeg 管道；--video 被忽略）:\n"
+           "    --video-file <path>     mp4 / mov / flv 里的 H.264，按原生尺寸采集、编码器缩放\n"
+           "    --video-file-no-loop    播完停在最后一帧（默认循环）；--seconds 0 时收到 EOF 即结束\n"
+           "  动作脚本:\n"
+           "    --script <file>         每行 \"<秒> <动作> [参数…]\"，# 开头为注释\n"
+           "    --do \"<秒> <动作> …\"    单条动作，可多次；与 --script 合并后按时刻排序\n"
+           "    --preview               开播前先开预览（preview.snap 需要）\n"
+           "  动作（参数 key=value，布尔取 0/1）:\n"
+           "    res <档位|宽x高> [portrait]           运行期切换编码分辨率\n"
+           "    audio.add <mic|speaker|pcm|file> [id|-] [path] [vol=] [loop=]\n"
+           "    audio.rm <id> / audio.vol <id> <v> / audio.levels\n"
+           "    overlay.stage <id> <image|video> <path> [x= y= w= h= opacity= z= loop= visible=]\n"
+           "    overlay.set <id> [x= y= w= h= opacity= z= visible=]   改已暂存叠加层的属性\n"
+           "    overlay.rm <id> / overlay.commit / overlay.discard / overlay.list [staged]\n"
+           "    mute.video <0|1> / mute.audio <0|1> / pause.pic [path]\n"
+           "    watermark add <index> <png> [pos=-1..5] [x=] [y=] / watermark rm <index>\n"
+           "    preview.snap <path>                    最新预览帧写成裸 NV12（打印宽高）\n"
+           "    stats [meta|bitrate|pkt|audio|video] / stop\n"
            "  其它:\n"
            "    --ffmpeg <path>         ffmpeg CLI，默认在 PATH 里找\n"
            "    --log-level <n>         0=Debug 1=Info 2=Warn 3=Error，默认 1\n"
@@ -197,13 +235,18 @@ Options ParseArgs(int argc, char** argv)
                 }
             }
         }
+        else if (a == "--script")      { if (auto* v = next(i, "--script"))      opt.scriptPath = v; }
+        else if (a == "--do")          { if (auto* v = next(i, "--do"))          opt.actions.emplace_back(v); }
+        else if (a == "--video-file")  { if (auto* v = next(i, "--video-file"))  opt.videoFile = v; }
+        else if (a == "--video-file-no-loop") { opt.videoFileLoop = false; }
+        else if (a == "--preview")     { opt.preview = true; }
         else if (a == "--sample-rate") { if (auto* v = next(i, "--sample-rate")) opt.sampleRate = std::atoi(v); }
         else if (a == "--channels")    { if (auto* v = next(i, "--channels"))    opt.channels = std::atoi(v); }
         else if (a == "--ffmpeg")      { if (auto* v = next(i, "--ffmpeg"))      opt.ffmpegBin = v; }
         else if (a == "--log-level")   { if (auto* v = next(i, "--log-level"))   opt.logLevel = std::atoi(v); }
         else { printf("未知参数: %s\n", a.c_str()); opt.showHelp = true; }
     }
-    if (opt.audio1.empty()) { opt.audio1 = opt.video; }
+    if (opt.audio1.empty()) { opt.audio1 = opt.videoFile.empty() ? opt.video : opt.videoFile; }
     return opt;
 }
 
@@ -399,6 +442,331 @@ void ScalePcm(int16_t* pcm, int samples, int channels, float gain)
     }
 }
 
+// ------------------------------------------------------------------ 动作脚本
+struct Action
+{
+    double                   at = 0;   // 相对开始推流的秒数
+    std::vector<std::string> argv;     // argv[0] = 动作名
+    std::string              raw;      // 原文（日志用）
+};
+
+// 按空白分词，双引号内的空白保留（不支持转义）；# 开头的词及其后内容视为注释
+bool Tokenize(const std::string& line, std::vector<std::string>& out)
+{
+    out.clear();
+    std::string cur;
+    bool inQuote = false, hasTok = false;
+    for (size_t i = 0; i < line.size(); ++i) {
+        const char c = line[i];
+        if (inQuote) {
+            if (c == '"') { inQuote = false; } else { cur += c; }
+            continue;
+        }
+        if (c == '"') { inQuote = true; hasTok = true; continue; }
+        if (c == '#' && !hasTok) { break; }
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            if (hasTok) { out.push_back(cur); cur.clear(); hasTok = false; }
+            continue;
+        }
+        cur += c;
+        hasTok = true;
+    }
+    if (inQuote) { return false; }
+    if (hasTok) { out.push_back(cur); }
+    return true;
+}
+
+bool ParseAction(const std::string& line, const std::string& where, std::vector<Action>& out)
+{
+    std::vector<std::string> tok;
+    if (!Tokenize(line, tok)) {
+        printf("[demo] %s 引号不成对: %s\n", where.c_str(), line.c_str());
+        return false;
+    }
+    if (tok.empty()) { return true; }   // 空行 / 注释
+    char* end = nullptr;
+    const double at = std::strtod(tok[0].c_str(), &end);
+    if (end == tok[0].c_str() || *end != '\0' || at < 0 || tok.size() < 2) {
+        printf("[demo] %s 格式应为 \"<秒> <动作> [参数…]\": %s\n", where.c_str(), line.c_str());
+        return false;
+    }
+    Action a;
+    a.at = at;
+    a.argv.assign(tok.begin() + 1, tok.end());
+    a.raw = line;
+    out.push_back(std::move(a));
+    return true;
+}
+
+// 汇总 --script / --do / --switch-res / --audio-file，按时刻稳定排序（同一时刻保持书写顺序）
+bool LoadActions(const Options& opt, std::vector<Action>& out)
+{
+    out.clear();
+    for (const auto& [at, r] : opt.switchRes) {
+        out.push_back({at, {"res", r}, "--switch-res " + r});
+    }
+    if (!opt.audioFile.empty() && opt.audioFileAt >= 0) {
+        char vol[32];
+        std::snprintf(vol, sizeof(vol), "vol=%g", opt.audioFileVolume);
+        out.push_back({opt.audioFileAt,
+                       {"audio.add", "file", "file", opt.audioFile, vol, opt.audioFileLoop ? "loop=1" : "loop=0"},
+                       "--audio-file " + opt.audioFile});
+    }
+    if (!opt.scriptPath.empty()) {
+        std::ifstream in(opt.scriptPath);
+        if (!in) {
+            printf("[demo] 打不开脚本 %s\n", opt.scriptPath.c_str());
+            return false;
+        }
+        std::string line;
+        for (int n = 1; std::getline(in, line); ++n) {
+            if (!ParseAction(line, opt.scriptPath + ":" + std::to_string(n), out)) { return false; }
+        }
+    }
+    for (const auto& s : opt.actions) {
+        if (!ParseAction(s, "--do", out)) { return false; }
+    }
+    std::stable_sort(out.begin(), out.end(), [](const Action& x, const Action& y) { return x.at < y.at; });
+    return true;
+}
+
+// 位置参数 + key=value 参数
+struct ActionArgs
+{
+    std::vector<std::string>           pos;
+    std::map<std::string, std::string> kv;
+
+    explicit ActionArgs(const std::vector<std::string>& argv)
+    {
+        for (size_t i = 1; i < argv.size(); ++i) {
+            const auto eq = argv[i].find('=');
+            if (eq != std::string::npos && eq > 0) {
+                kv[argv[i].substr(0, eq)] = argv[i].substr(eq + 1);
+            } else {
+                pos.push_back(argv[i]);
+            }
+        }
+    }
+    const std::string* Pos(size_t i) const { return i < pos.size() ? &pos[i] : nullptr; }
+    bool Has(const char* k) const { return kv.count(k) != 0; }
+    float F(const char* k, float def) const
+    {
+        auto it = kv.find(k);
+        return it == kv.end() ? def : static_cast<float>(std::atof(it->second.c_str()));
+    }
+    int I(const char* k, int def) const
+    {
+        auto it = kv.find(k);
+        return it == kv.end() ? def : std::atoi(it->second.c_str());
+    }
+    bool B(const char* k, bool def) const { return I(k, def ? 1 : 0) != 0; }
+};
+
+// 最新一帧预览（回调线程写、主线程读）
+struct PreviewStore
+{
+    std::mutex           mutex;
+    std::vector<uint8_t> nv12;   // 紧凑 NV12（stride = width）
+    int                  width = 0;
+    int                  height = 0;
+    uint64_t             frames = 0;
+
+    void Put(const PreviewFrame& f)
+    {
+        if (f.format != PreviewPixelFormat::NV12 || !f.y || !f.uv || f.width <= 0 || f.height <= 0) { return; }
+        std::lock_guard<std::mutex> lk(mutex);
+        width = f.width;
+        height = f.height;
+        nv12.resize(static_cast<size_t>(width) * height * 3 / 2);
+        for (int r = 0; r < height; ++r) {
+            std::memcpy(&nv12[static_cast<size_t>(r) * width], f.y + static_cast<size_t>(r) * f.yStride, width);
+        }
+        uint8_t* uv = nv12.data() + static_cast<size_t>(width) * height;
+        for (int r = 0; r < height / 2; ++r) {
+            std::memcpy(uv + static_cast<size_t>(r) * width, f.uv + static_cast<size_t>(r) * f.uvStride, width);
+        }
+        ++frames;
+    }
+};
+
+const char* OverlayKindName(OverlayKind k) { return k == OverlayKind::VideoFile ? "video" : "image"; }
+
+// 把 key=value 套到叠加层描述上（overlay.stage / overlay.set 共用）
+void ApplyOverlayArgs(const ActionArgs& a, OverlayDesc& d)
+{
+    d.x = a.F("x", d.x);
+    d.y = a.F("y", d.y);
+    d.width = a.F("w", d.width);
+    d.height = a.F("h", d.height);
+    d.opacity = a.F("opacity", d.opacity);
+    d.zOrder = a.I("z", d.zOrder);
+    d.loop = a.B("loop", d.loop);
+    d.visible = a.B("visible", d.visible);
+}
+
+void PrintOverlays(ITGCapturer* c, bool staged)
+{
+    std::vector<OverlayDesc> list;
+    const int ret = c->GetOverlays(list, staged);
+    printf("[demo]   %s 叠加层 %zu 个 ret=%d\n", staged ? "暂存" : "已提交", list.size(), ret);
+    for (const auto& d : list) {
+        printf("[demo]     %s %s %s x=%.3f y=%.3f w=%.3f h=%.3f opacity=%.2f z=%d loop=%d visible=%d\n",
+               d.id.c_str(), OverlayKindName(d.kind), d.path.c_str(), d.x, d.y, d.width, d.height, d.opacity,
+               d.zOrder, d.loop ? 1 : 0, d.visible ? 1 : 0);
+    }
+}
+
+// 执行一条动作，返回 SDK 返回值（0 = 成功）；参数不对返回 kBadArgs。stop 动作置 stopRequested
+constexpr int kBadArgs = INT32_MIN;
+int RunAction(ITGCapturer* c, const Action& act, PreviewStore& preview, bool& stopRequested)
+{
+    const std::string& name = act.argv[0];
+    const ActionArgs a(act.argv);
+    auto need = [&](size_t n) { return a.pos.size() >= n; };
+
+    if (name == "res") {
+        if (!need(1)) { return kBadArgs; }
+        int w = 0, h = 0;
+        const bool portrait = a.Pos(1) && *a.Pos(1) == "portrait";
+        return std::sscanf(a.pos[0].c_str(), "%dx%d", &w, &h) == 2 ? c->SetVideoResolution(w, h)
+                                                                    : c->SetResolutionPreset(a.pos[0], portrait);
+    }
+    if (name == "audio.add") {
+        if (!need(1)) { return kBadArgs; }
+        static const std::map<std::string, AudioSourceKind> kinds = {
+            {"mic", AudioSourceKind::Microphone}, {"speaker", AudioSourceKind::Speaker},
+            {"pcm", AudioSourceKind::External},   {"file", AudioSourceKind::File}};
+        auto it = kinds.find(a.pos[0]);
+        if (it == kinds.end()) { return kBadArgs; }
+        AudioSourceDesc d;
+        d.kind = it->second;
+        if (a.Pos(1) && *a.Pos(1) != "-") { d.id = *a.Pos(1); }
+        if (a.Pos(2)) { d.filePath = *a.Pos(2); }
+        d.volume = a.F("vol", 1.0f);
+        d.loop = a.B("loop", true);
+        std::string id;
+        const int ret = c->AddAudioSource(d, &id);
+        printf("[demo]   音频源 id=%s\n", id.c_str());
+        return ret;
+    }
+    if (name == "audio.rm") { return need(1) ? c->RemoveAudioSource(a.pos[0]) : kBadArgs; }
+    if (name == "audio.vol") {
+        return need(2) ? c->SetAudioSourceVolume(a.pos[0], static_cast<float>(std::atof(a.pos[1].c_str()))) : kBadArgs;
+    }
+    if (name == "audio.levels") {
+        std::vector<AudioSourceLevel> lv;
+        const int ret = c->GetAudioLevels(lv);
+        for (const auto& l : lv) {
+            printf("[demo]   %-10s peak=%6.1fdB rms=%6.1fdB\n", l.id.c_str(), l.peakDb, l.rmsDb);
+        }
+        return ret;
+    }
+    if (name == "overlay.stage") {
+        if (!need(3)) { return kBadArgs; }
+        OverlayDesc d;
+        d.id = a.pos[0];
+        if (a.pos[1] == "image") { d.kind = OverlayKind::Image; }
+        else if (a.pos[1] == "video") { d.kind = OverlayKind::VideoFile; }
+        else { return kBadArgs; }
+        d.path = a.pos[2];
+        ApplyOverlayArgs(a, d);
+        return c->StageOverlay(d);
+    }
+    if (name == "overlay.set") {
+        if (!need(1)) { return kBadArgs; }
+        std::vector<OverlayDesc> list;
+        c->GetOverlays(list, true);
+        auto it = std::find_if(list.begin(), list.end(), [&](const OverlayDesc& d) { return d.id == a.pos[0]; });
+        if (it == list.end()) {
+            printf("[demo]   暂存区没有叠加层 %s\n", a.pos[0].c_str());
+            return 1;
+        }
+        ApplyOverlayArgs(a, *it);
+        return c->StageOverlay(*it);
+    }
+    if (name == "overlay.rm") { return need(1) ? c->StageRemoveOverlay(a.pos[0]) : kBadArgs; }
+    if (name == "overlay.commit") { return c->CommitOverlays(); }
+    if (name == "overlay.discard") { return c->DiscardOverlayChanges(); }
+    if (name == "overlay.list") {
+        const bool staged = a.Pos(0) && *a.Pos(0) == "staged";
+        PrintOverlays(c, staged);
+        return 0;
+    }
+    if (name == "mute.video") { return need(1) ? (c->MuteVideo(a.pos[0] != "0") ? 0 : 1) : kBadArgs; }
+    if (name == "mute.audio") { return need(1) ? (c->MuteAudio(a.pos[0] != "0") ? 0 : 1) : kBadArgs; }
+    if (name == "pause.pic") {
+        PauseParams p;
+        if (a.Pos(0)) { p.picture = *a.Pos(0); }
+        return c->SetPauseInfo(p);
+    }
+    if (name == "watermark") {
+        if (!need(2)) { return kBadArgs; }
+        WatermarkParams p;
+        p.index = static_cast<uint32_t>(std::atoi(a.pos[1].c_str()));
+        if (a.pos[0] == "add") {
+            if (!need(3)) { return kBadArgs; }
+            p.type = LogoOpType::LOGO_ADD;
+            p.url = a.pos[2];
+            p.position = a.I("pos", 1);
+            p.offset_x = a.I("x", 0);
+            p.offset_y = a.I("y", 0);
+        } else if (a.pos[0] == "rm") {
+            p.type = LogoOpType::LOGO_RM;
+        } else {
+            return kBadArgs;
+        }
+        return c->SetupWatermarkInfo(p);
+    }
+    if (name == "preview.snap") {
+        if (!need(1)) { return kBadArgs; }
+        std::lock_guard<std::mutex> lk(preview.mutex);
+        if (preview.nv12.empty()) {
+            printf("[demo]   还没有预览帧（需要 --preview）\n");
+            return 1;
+        }
+        FILE* fp = std::fopen(a.pos[0].c_str(), "wb");
+        if (!fp) { return 1; }
+        const size_t n = std::fwrite(preview.nv12.data(), 1, preview.nv12.size(), fp);
+        std::fclose(fp);
+        printf("[demo]   预览帧 %dx%d nv12 → %s（ffplay -f rawvideo -pixel_format nv12 -video_size %dx%d）\n",
+               preview.width, preview.height, a.pos[0].c_str(), preview.width, preview.height);
+        return n == preview.nv12.size() ? 0 : 1;
+    }
+    if (name == "stats") {
+        static const std::map<std::string, StatsInfoType> types = {
+            {"meta", StatsInfoType::metaInfo}, {"bitrate", StatsInfoType::bitrateInfo},
+            {"pkt", StatsInfoType::pktInfo},   {"audio", StatsInfoType::audioInfo},
+            {"video", StatsInfoType::videoInfo}};
+        auto it = types.find(a.Pos(0) ? *a.Pos(0) : "bitrate");
+        if (it == types.end()) { return kBadArgs; }
+        printf("[demo]   %s\n", c->GetStatsInfo(it->second).c_str());
+        return 0;
+    }
+    if (name == "stop") {
+        stopRequested = true;
+        return 0;
+    }
+    return kBadArgs;
+}
+
+const char* NotifyName(NotifyMsgType t)
+{
+    switch (t) {
+        case EsCap_Notify_Fisrt_Frame_OK: return "FirstFrame";
+        case EsCap_Notify_VideoMetaInfo_Changed: return "VideoMetaChanged";
+        case EsCap_Notify_AudioMetaInfo_Changed: return "AudioMetaChanged";
+        case EsCap_Notify_SystemFreeze: return "SystemFreeze";
+        case EsCap_Notify_LocalFile_EOF: return "LocalFileEOF";
+        case EsCap_Notify_VideoCapture_Recovered: return "VideoRecovered";
+        case EsCap_Notify_AudioCapture_Recovered: return "AudioRecovered";
+        case EsCap_Notify_Encoder_Fallback: return "EncoderFallback";
+        case EsCap_Notify_AudioSource_Added: return "AudioSourceAdded";
+        case EsCap_Notify_AudioSource_Removed: return "AudioSourceRemoved";
+        case EsCap_Notify_Overlay_Committed: return "OverlayCommitted";
+        default: return "?";
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -417,6 +785,13 @@ int main(int argc, char** argv)
 
     ITGCapturerMgr::Init(opt.logLevel, "", true);
 
+    std::vector<Action> actions;
+    if (!LoadActions(opt, actions)) {
+        ITGCapturerMgr::UnInit();
+        return 1;
+    }
+    const bool videoFileMode = !opt.videoFile.empty();
+
     ITGCapturer* capturer = ITGCapturer::Create();
     if (!capturer) {
         printf("[demo] ITGCapturer::Create 失败\n");
@@ -426,6 +801,7 @@ int main(int argc, char** argv)
 
     std::atomic<bool> prepared{false};
     std::atomic<bool> errored{false};
+    std::atomic<bool> mainEof{false};
     capturer->SetOnPreparedCallback([&](ITGCapturer* c) {
         c->Start();
         prepared.store(true);
@@ -434,6 +810,13 @@ int main(int argc, char** argv)
         printf("[demo] error what=%d extra=%d msg=%s\n", what, extra, msg ? msg : "");
         errored.store(true);
     });
+    capturer->SetOnNotifyCallback([&](NotifyMsgType type, const std::string& content, int64_t data) {
+        printf("[demo] notify %s(%d) content=%s data=%lld\n", NotifyName(type), static_cast<int>(type),
+               content.c_str(), static_cast<long long>(data));
+        if (type == EsCap_Notify_LocalFile_EOF && content == "video:main") { mainEof.store(true); }
+    });
+    PreviewStore previewStore;
+    capturer->SetOnPreviewFrameCallback([&](const PreviewFrame& f) { previewStore.Put(f); });
 
     printf("[demo] 屏幕采集可用=%d 麦克风可用=%d（Linux 无原生实现，走外灌帧）\n",
            static_cast<int>(capturer->IsSupported(CaptureFeature::Screen)),
@@ -463,6 +846,21 @@ int main(int argc, char** argv)
         ITGCapturer::Destroy(capturer);
         ITGCapturerMgr::UnInit();
         return 1;
+    }
+    if (videoFileMode && !capturer->CreateLocalFileCapture(0, opt.videoFile, opt.videoFileLoop)) {
+        printf("[demo] 本地文件主画面不可用: %s\n", opt.videoFile.c_str());
+        ITGCapturer::Destroy(capturer);
+        ITGCapturerMgr::UnInit();
+        return 1;
+    }
+    if (opt.preview) {
+        const int ret = capturer->StartPreview();
+        printf("[demo] StartPreview ret=%d\n", ret);
+        if (ret != 0) {
+            ITGCapturer::Destroy(capturer);
+            ITGCapturerMgr::UnInit();
+            return 1;
+        }
     }
     if (capturer->Prepare() != 0) {
         printf("[demo] Prepare 失败\n");
@@ -503,13 +901,15 @@ int main(int argc, char** argv)
     char cmdbuf[1024];
     FfmpegPipe videoPipe, audio1Pipe, audio2Pipe;
 
-    std::snprintf(cmdbuf, sizeof(cmdbuf),
-                  "%s -nostdin -loglevel error %s -i %s -map 0:v:0 "
-                  "-vf \"scale=%d:%d:flags=bicubic,fps=%g,format=nv12\" "
-                  "-f rawvideo - 2>/dev/null",
-                  opt.ffmpegBin.c_str(), streamLoopArg(opt.videoLoops).c_str(),
-                  ShellQuote(opt.video).c_str(), w, h, opt.fps);
-    if (!videoPipe.Open(cmdbuf)) { ITGCapturer::Destroy(capturer); ITGCapturerMgr::UnInit(); return 1; }
+    if (!videoFileMode) {
+        std::snprintf(cmdbuf, sizeof(cmdbuf),
+                      "%s -nostdin -loglevel error %s -i %s -map 0:v:0 "
+                      "-vf \"scale=%d:%d:flags=bicubic,fps=%g,format=nv12\" "
+                      "-f rawvideo - 2>/dev/null",
+                      opt.ffmpegBin.c_str(), streamLoopArg(opt.videoLoops).c_str(),
+                      ShellQuote(opt.video).c_str(), w, h, opt.fps);
+        if (!videoPipe.Open(cmdbuf)) { ITGCapturer::Destroy(capturer); ITGCapturerMgr::UnInit(); return 1; }
+    }
 
     if (opt.audio) {
         // 循环播放的音频：首尾 10ms 淡入淡出后用 aloop 循环，避免接缝处波形突变产生咔声
@@ -537,14 +937,16 @@ int main(int argc, char** argv)
         if (!audio2Pipe.Open(audioCmd(opt.audio2, opt.audio2Loops))) { ITGCapturer::Destroy(capturer); ITGCapturerMgr::UnInit(); return 1; }
     }
 
-    printf("[demo] video=%s loops=%d\n"
+    printf("[demo] video=%s %s\n"
            "[demo] audio1=%s loops=%d speed=%.3f\n"
            "[demo] audio2=%s loops=%d speed=%.3f vol=%.2f\n"
-           "[demo] out=%s %dx%d@%.2f %dkbps / %dHz %dch\n",
-           opt.video.c_str(),  opt.videoLoops,
+           "[demo] out=%s %dx%d@%.2f %dkbps / %dHz %dch  动作 %zu 条\n",
+           videoFileMode ? opt.videoFile.c_str() : opt.video.c_str(),
+           videoFileMode ? (opt.videoFileLoop ? "(内核解码, 循环)" : "(内核解码, 不循环)")
+                         : ("loops=" + std::to_string(opt.videoLoops)).c_str(),
            opt.audio1.c_str(), opt.audio1Loops, opt.audio1Speed,
            opt.audio2.c_str(), opt.audio2Loops, opt.audio2Speed, opt.audio2Volume,
-           opt.out.c_str(), w, h, opt.fps, opt.bitrate / 1000, sr, ch);
+           opt.out.c_str(), w, h, opt.fps, opt.bitrate / 1000, sr, ch, actions.size());
 
     // -------------------------------------------------------------------- 灌帧
     const int64_t audioUs  = static_cast<int64_t>(1000000.0 * samplesPerPush / sr);  // 一块的样本时长
@@ -565,14 +967,15 @@ int main(int argc, char** argv)
     Prefetcher videoQ(videoPipe, static_cast<size_t>(frameBytes), vCap);
     Prefetcher audio1Q(audio1Pipe, static_cast<size_t>(pcmChunkBytes), aCap);
     Prefetcher audio2Q(audio2Pipe, static_cast<size_t>(pcmChunkBytes), aCap);
-    videoQ.Start();
+    if (!videoFileMode) { videoQ.Start(); }
     if (opt.audio) {
         audio1Q.Start();
         audio2Q.Start();
     }
     // 预热：等各路队列预读到一半再开始计时，避免开头就欠载（最多等 2s）
+    // 文件主画面模式下视频由内核自己解码出帧，不用等
     for (int i = 0; i < 400; ++i) {
-        const bool vOk = videoQ.Size() >= vCap / 2 || videoQ.Eof();
+        const bool vOk = videoFileMode || videoQ.Size() >= vCap / 2 || videoQ.Eof();
         const bool aOk = !opt.audio || ((audio1Q.Size() >= aCap / 2 || audio1Q.Eof()) &&
                                         (audio2Q.Size() >= aCap / 2 || audio2Q.Eof()));
         if (vOk && aOk) { break; }
@@ -631,33 +1034,26 @@ int main(int argc, char** argv)
         return false;
     };
 
-    size_t nextSwitch = 0;
-    bool audioFileAdded = false;
+    size_t nextAction = 0;
+    bool stopRequested = false;
+    int actionFailures = 0;
     while (!errored.load()) {
         if (s_stop.load()) { printf("[demo] 收到退出信号，刷 trailer\n"); break; }
         const int64_t now = ElapsedUs(t0);
         if (totalUs > 0 && now >= totalUs) { break; }
-        while (nextSwitch < opt.switchRes.size() &&
-               now >= static_cast<int64_t>(opt.switchRes[nextSwitch].first * 1e6)) {
-            const std::string& r = opt.switchRes[nextSwitch].second;
-            int w = 0, h = 0;
-            const int ret = std::sscanf(r.c_str(), "%dx%d", &w, &h) == 2
-                                ? capturer->SetVideoResolution(w, h)
-                                : capturer->SetResolutionPreset(r);
-            printf("[demo] t=%.3fs 切换分辨率 %s ret=%d\n", now / 1e6, r.c_str(), ret);
-            ++nextSwitch;
+        while (nextAction < actions.size() && now >= static_cast<int64_t>(actions[nextAction].at * 1e6)) {
+            const Action& act = actions[nextAction++];
+            const int ret = RunAction(capturer, act, previewStore, stopRequested);
+            if (ret == kBadArgs) {
+                printf("[demo] t=%.3fs 动作参数不对（见 --help）: %s\n", now / 1e6, act.raw.c_str());
+                ++actionFailures;
+            } else {
+                printf("[demo] t=%.3fs %s → ret=%d\n", now / 1e6, act.raw.c_str(), ret);
+                if (ret != 0) { ++actionFailures; }
+            }
         }
-        if (!audioFileAdded && !opt.audioFile.empty() && now >= static_cast<int64_t>(opt.audioFileAt * 1e6)) {
-            AudioSourceDesc d;
-            d.kind = AudioSourceKind::File;
-            d.id = "file";
-            d.filePath = opt.audioFile;
-            d.volume = opt.audioFileVolume;
-            d.loop = opt.audioFileLoop;
-            const int ret = capturer->AddAudioSource(d);
-            printf("[demo] t=%.3fs 加文件音频源 %s ret=%d\n", now / 1e6, opt.audioFile.c_str(), ret);
-            audioFileAdded = true;
-        }
+        if (stopRequested) { printf("[demo] 脚本 stop\n"); break; }
+        if (videoFileMode && totalUs == 0 && mainEof.load()) { printf("[demo] 主画面文件播完\n"); break; }
 
         // 心跳：30s/次，每路给出"本窗口帧数"和"累计帧数"，瞬时速率 = Δ/30
         if (now - lastBeatUs >= kDemoBeatUs) {
@@ -682,8 +1078,8 @@ int main(int argc, char** argv)
         // 视频 EOF 作为整体结束条件（音频无限循环场景下不应等 audio pipe EOF，否则永不退出）
         if (videoDone) { break; }
 
-        // ---- 视频 ----
-        const bool inVideoStall = opt.videoStallDurSec > 0 &&
+        // ---- 视频（文件主画面模式下由内核出帧，这里不推） ----
+        const bool inVideoStall = !videoFileMode && opt.videoStallDurSec > 0 &&
                                   now >= stallStartUs && now < stallEndUs;
         if (inVideoStall && !stallEnteredLogged) {
             printf("[demo][inject] t=%.3fs 进入视频卡顿窗口（dur=%ds mode=%s）\n",
@@ -702,7 +1098,7 @@ int main(int argc, char** argv)
                 ++stallDropped;
             }
         }
-        if (!inVideoStall) {
+        if (!inVideoStall && !videoFileMode) {
             // burst 模式卡顿结束后不做 resync：积压帧一次性灌入正是要注入的故障
             const bool burstRecovering = opt.videoStallBurst && stallEnteredLogged &&
                                          now - stallEndUs < 2 * kMaxLagUs + opt.videoStallDurSec * 1000000LL;
@@ -751,7 +1147,7 @@ int main(int argc, char** argv)
         pumpAudio(audio2Q, a2buf, audio2P, pushedAudio2, audio2Done, TypeOfGameAudio4Slave, opt.audio2Volume);
 
         // 睡到最近一个 due（最多 2ms），不空转
-        int64_t nextDue = videoP.Due();
+        int64_t nextDue = videoFileMode ? now + 2000 : videoP.Due();
         if (!audio1Done) { nextDue = std::min(nextDue, audio1P.Due()); }
         if (!audio2Done) { nextDue = std::min(nextDue, audio2P.Due()); }
         const int64_t waitUs = std::clamp<int64_t>(nextDue - ElapsedUs(t0), 200, 2000);
@@ -764,15 +1160,15 @@ int main(int argc, char** argv)
 
     capturer->Stop();
     printf("[demo] 输出=%s 视频帧=%d 音频1=%d 音频2=%d 拒绝=%d resync=%llu freeze丢帧=%llu "
-           "预读欠载=v%llu/a%llu/a%llu\n",
+           "预读欠载=v%llu/a%llu/a%llu 动作失败=%d\n",
            opt.out.c_str(), pushedVideo, pushedAudio1, pushedAudio2, rejected,
            static_cast<unsigned long long>(lagResyncs),
            static_cast<unsigned long long>(stallDropped),
            static_cast<unsigned long long>(videoQ.Underflows()),
            static_cast<unsigned long long>(audio1Q.Underflows()),
-           static_cast<unsigned long long>(audio2Q.Underflows()));
+           static_cast<unsigned long long>(audio2Q.Underflows()), actionFailures);
 
     ITGCapturer::Destroy(capturer);
     ITGCapturerMgr::UnInit();
-    return (pushedVideo > 0 && !errored.load()) ? 0 : 1;
+    return ((videoFileMode || pushedVideo > 0) && !errored.load() && actionFailures == 0) ? 0 : 1;
 }
