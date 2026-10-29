@@ -2,6 +2,8 @@
 -keep class com.tencent.tgcapture.TGCaptureSystemCapture { *; }
 -keep class com.tencent.tgcapture.TGCapturer { *; }
 -keep interface com.tencent.tgcapture.TGCaptureListener { *; }
+# getOverlays 在 JNI 里按字段名构造 OverlayDesc
+-keep class com.tencent.tgcapture.OverlayDesc { *; }
 -keepclasseswithmembernames class com.tencent.tgcapture.** {
     native <methods>;
 }

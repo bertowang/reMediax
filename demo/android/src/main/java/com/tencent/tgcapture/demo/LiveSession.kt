@@ -1,11 +1,19 @@
 package com.tencent.tgcapture.demo
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
 import android.media.projection.MediaProjection
 import android.os.Handler
 import android.os.Looper
+import android.view.Surface
+import com.tencent.tgcapture.OverlayDesc
 import com.tencent.tgcapture.TGCaptureListener
 import com.tencent.tgcapture.TGCapturer
+import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 
@@ -14,6 +22,9 @@ import java.util.concurrent.RejectedExecutionException
  *
  * prepare / start / stop 会阻塞（连推流地址、写文件尾），全部放在单线程 worker 上串行执行；
  * 事件统一切回主线程交给 [Events]。
+ *
+ * 叠加层演示（staged / commit）：Logo（运行时生成的半透明 png）与画中画（本地视频文件）。
+ * 增删 / 移动只改暂存场景 —— 预览立即可见，推流画面要等「提交」才原子切换；「撤销」回到已提交场景。
  */
 class LiveSession(
     private val context: Context,
@@ -25,6 +36,8 @@ class LiveSession(
         fun onLog(line: String)
         fun onLive()
         fun onFinished(err: Int)
+        /** 叠加层状态变化：暂存 / 已提交两份列表的可读摘要 */
+        fun onOverlays(summary: String) {}
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -34,6 +47,11 @@ class LiveSession(
     @Volatile
     private var finished = false
 
+    // 预览 Surface 由主线程（SurfaceHolder 回调）直接设置：surfaceDestroyed 必须同步解绑，不能排队等 worker
+    private val previewLock = Any()
+    private var previewSurface: Surface? = null
+    private var pipCorner = 0
+
     fun start() = submit {
         val c = try {
             TGCapturer.create()
@@ -42,14 +60,32 @@ class LiveSession(
             teardown(TGERR_FAILED)
             return@submit
         }
-        capturer = c
+        synchronized(previewLock) {
+            capturer = c
+            previewSurface?.let { c.setPreviewSurface(it) }
+        }
         c.setListener(listener)
-        if (!configure(c) || !check("prepare", c.prepare()) || !check("start", c.start())) {
+        if (!configure(c)) {
+            teardown(TGERR_FAILED)
+            return@submit
+        }
+        // 预览先开：Prepare 前就能看到画面（叠加层的暂存效果也在预览上看）
+        if (config.preview) check("startPreview", c.startPreview())
+        if (!check("prepare", c.prepare()) || !check("start", c.start())) {
             teardown(TGERR_FAILED)
             return@submit
         }
         signals = TestSignalSource(c, config).also { it.start() }
         post { events.onLive() }
+        publishOverlays(c)
+    }
+
+    /** 主线程调用：Surface 可用时传入，surfaceDestroyed 时传 null（同步解绑）。 */
+    fun setPreviewSurface(surface: Surface?) {
+        synchronized(previewLock) {
+            previewSurface = surface
+            capturer?.setPreviewSurface(surface)
+        }
     }
 
     /** 停播（可重复调用）。 */
@@ -76,6 +112,101 @@ class LiveSession(
             c.setResolutionPreset(spec, false)
         }
         log("switchResolution $spec rc=$rc (${ErrorText.of(rc)})")
+    }
+
+    // ------------------------------------------------------------------ 叠加层（只改暂存，提交才上推流）
+    /** Logo：右上角半透明图片；已暂存则删除。 */
+    fun toggleLogo() = submit {
+        val c = capturer ?: return@submit
+        if (c.getOverlays(true).any { it.id == LOGO_ID }) {
+            log("stageRemoveOverlay logo rc=${rcText(c.stageRemoveOverlay(LOGO_ID))}")
+        } else {
+            val png = logoFile() ?: return@submit
+            val d = OverlayDesc(LOGO_ID, OverlayDesc.KIND_IMAGE, png.absolutePath).apply {
+                x = 0.72f; y = 0.05f; width = 0.24f; zOrder = 2
+            }
+            log("stageOverlay $d rc=${rcText(c.stageOverlay(d))}")
+        }
+        publishOverlays(c)
+    }
+
+    /** 画中画：本地视频文件（设置页「画中画视频」）；已暂存则删除。 */
+    fun togglePip() = submit {
+        val c = capturer ?: return@submit
+        if (c.getOverlays(true).any { it.id == PIP_ID }) {
+            log("stageRemoveOverlay pip rc=${rcText(c.stageRemoveOverlay(PIP_ID))}")
+        } else {
+            if (!File(config.overlayVideo).isFile) {
+                log("画中画视频不存在：${config.overlayVideo}（adb push 一个 mp4 过去，或在设置页改路径）")
+                return@submit
+            }
+            pipCorner = 0
+            val d = OverlayDesc(PIP_ID, OverlayDesc.KIND_VIDEO_FILE, config.overlayVideo).apply {
+                width = PIP_WIDTH; zOrder = 1
+                x = PIP_CORNERS[0].first; y = PIP_CORNERS[0].second
+            }
+            log("stageOverlay $d rc=${rcText(c.stageOverlay(d))}")
+        }
+        publishOverlays(c)
+    }
+
+    /** 画中画换到下一个角（只改几何：内容复用，视频不会从头播）。 */
+    fun movePip() = submit {
+        val c = capturer ?: return@submit
+        val d = c.getOverlays(true).firstOrNull { it.id == PIP_ID } ?: run {
+            log("暂存区没有画中画")
+            return@submit
+        }
+        pipCorner = (pipCorner + 1) % PIP_CORNERS.size
+        d.x = PIP_CORNERS[pipCorner].first
+        d.y = PIP_CORNERS[pipCorner].second
+        log("stageOverlay(move) $d rc=${rcText(c.stageOverlay(d))}")
+        publishOverlays(c)
+    }
+
+    fun commitOverlays() = submit {
+        val c = capturer ?: return@submit
+        log("commitOverlays rc=${rcText(c.commitOverlays())}")
+        publishOverlays(c)
+    }
+
+    fun discardOverlays() = submit {
+        val c = capturer ?: return@submit
+        log("discardOverlayChanges rc=${rcText(c.discardOverlayChanges())}")
+        publishOverlays(c)
+    }
+
+    private fun publishOverlays(c: TGCapturer) {
+        val staged = c.getOverlays(true).joinToString(" ") { it.id }
+        val program = c.getOverlays(false).joinToString(" ") { it.id }
+        val stagedFull = c.getOverlays(true).joinToString("|") { it.toString() }
+        val programFull = c.getOverlays(false).joinToString("|") { it.toString() }
+        val dirty = stagedFull != programFull
+        val summary = "推流: ${program.ifEmpty { "无" }}   预览: ${staged.ifEmpty { "无" }}" +
+            if (dirty) "   （有未提交改动）" else ""
+        post { events.onOverlays(summary) }
+    }
+
+    /** 运行时生成 Logo：半透明绿底圆角矩形 + 白字（带 alpha 通道，演示按透明度混合）。 */
+    private fun logoFile(): File? {
+        val f = File(context.cacheDir, "tg_logo.png")
+        if (f.isFile) return f
+        return try {
+            val bmp = Bitmap.createBitmap(320, 120, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bmp)
+            val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(200, 0, 200, 80) }
+            canvas.drawRoundRect(RectF(0f, 0f, 320f, 120f), 24f, 24f, bg)
+            val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE; textSize = 64f; textAlign = Paint.Align.CENTER; isFakeBoldText = true
+            }
+            canvas.drawText("TG LIVE", 160f, 82f, text)
+            f.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            bmp.recycle()
+            f
+        } catch (e: Exception) {
+            log("生成 logo 失败: ${e.message}")
+            null
+        }
     }
 
     /** 统计在 worker 上取（避免与 release 并发），结果回主线程。 */
@@ -108,6 +239,17 @@ class LiveSession(
             log("createScreenCapture 失败")
             return false
         }
+        if (config.fileSource) {
+            if (!c.createLocalFileCapture(config.videoFile, config.videoFileLoop)) {
+                log("createLocalFileCapture 失败：${config.videoFile}（文件不存在 / 无 H.264 视频轨，详见 logcat）")
+                return false
+            }
+            // 文件里的音轨不会自动加入，需要声音另加文件音频源（两者各自按墙钟播放）
+            if (config.videoFileAudio) {
+                val id = c.addFileAudioSource("file", config.videoFile, config.videoFileLoop, 1.0f)
+                log("addFileAudioSource(主画面音轨) id=$id")
+            }
+        }
         // 音频源失败不致命：缺哪一路就少哪一路，内核会对缺数据的情况上报断流
         if (config.mic) check("enableMicrophoneCapture", c.enableMicrophoneCapture())
         if (config.speaker) check("enableSpeakerCapture", c.enableSpeakerCapture())
@@ -125,13 +267,17 @@ class LiveSession(
         finished = true
         signals?.stop()
         signals = null
-        capturer?.let {
+        val c = synchronized(previewLock) {
+            capturer.also { capturer = null }
+        }
+        c?.let {
             it.stop()
             it.release()
         }
-        capturer = null
         post { events.onFinished(err) }
     }
+
+    private fun rcText(rc: Int) = if (rc == 0) "0" else "$rc(${ErrorText.of(rc)})"
 
     private fun check(what: String, rc: Int): Boolean {
         if (rc != 0) log("$what 失败 rc=$rc (${ErrorText.of(rc)})")
@@ -163,6 +309,11 @@ class LiveSession(
 
     private companion object {
         const val TGERR_FAILED = -1
+        const val LOGO_ID = "logo"
+        const val PIP_ID = "pip"
+        const val PIP_WIDTH = 0.35f
+        /** 画中画的四个角（左上角坐标，画布比例；PIP_WIDTH = 0.35 时 16:9 素材高约 0.35） */
+        val PIP_CORNERS = listOf(0.62f to 0.60f, 0.03f to 0.60f, 0.03f to 0.05f, 0.62f to 0.05f)
     }
 }
 
@@ -201,6 +352,9 @@ object ErrorText {
         30 -> "VideoRecovered"
         31 -> "AudioRecovered"
         40 -> "EncoderFallback"
+        41 -> "AudioSourceAdded"
+        42 -> "AudioSourceRemoved"
+        43 -> "OverlayCommitted"
         else -> "type=$type"
     }
 }

@@ -57,9 +57,11 @@ public final class TGCapturer {
     public static final int NOTIFY_ENCODER_FALLBACK = 40;
     /** 运行期音频源增删：content = 音频源 id，data = 混流通道号 */
     public static final int NOTIFY_AUDIO_SOURCE_ADDED = 41;
-    /** 文件音频源（不循环）播放结束：content = 音频源 id */
+    /** 文件源（不循环）播放结束：content = 音频源 id / "video:main"（本地文件主画面）/ "overlay:&lt;id&gt;"（视频叠加层） */
     public static final int NOTIFY_LOCAL_FILE_EOF = 21;
     public static final int NOTIFY_AUDIO_SOURCE_REMOVED = 42;
+    /** 叠加层已提交（推流画面已切到新场景）：data = 提交后的叠加层数 */
+    public static final int NOTIFY_OVERLAY_COMMITTED = 43;
 
     // AudioSourceKind（addAudioSource）
     public static final int AUDIO_SOURCE_MICROPHONE = 0;
@@ -70,6 +72,9 @@ public final class TGCapturer {
     // AudioCapSourceType（外部注入音频用）
     public static final int AUDIO_GAME = 0;
     public static final int AUDIO_GAME_MIC = 1;
+
+    /** TGErr_InvalidArgument（错误码完整列表见 TGCapturerInterface.h） */
+    public static final int ERR_INVALID_ARGUMENT = -20;
 
     private long mHandle;
 
@@ -181,6 +186,16 @@ public final class TGCapturer {
     /** 创建屏幕采集（MediaProjection）并设为视频源（= C++ CreateScreenCapture + AddVideoSource），需先 setMediaProjection。 */
     public boolean createScreenCapture() {
         return nativeCreateScreenCapture(handle());
+    }
+
+    /**
+     * 本地视频文件（mp4 / mov / flv 里的 H.264）作主画面，代替屏幕采集（= C++ CreateLocalFileCapture）。
+     * 按文件时间戳实时出帧，原生尺寸采集、由编码器缩放。loop = false 播完停在最后一帧并回调
+     * onNotify(NOTIFY_LOCAL_FILE_EOF, "video:main")。文件里的音轨不会自动加入（需要声音另调 addFileAudioSource）。
+     * 文件打不开 / 无视频轨返回 false；预览或推流中不能更换主画面。
+     */
+    public boolean createLocalFileCapture(String filePath, boolean loop) {
+        return filePath != null && nativeCreateLocalFileCapture(handle(), filePath, loop);
     }
 
     public int setupVideoEncoder(VideoEncoderParams p) {
@@ -331,6 +346,41 @@ public final class TGCapturer {
         return nativePushAudioSourceFrame(handle(), id, data, bytes, sampleRate, channels, ptsUs);
     }
 
+    // ------------------------------------------------------------------ 视频叠加层（staged / commit）
+    /**
+     * 新增或修改一个叠加层（按 id），只改暂存场景：预览画面立即可见，推流画面要等 {@link #commitOverlays()}。
+     * 只改几何 / 透明度 / 层级 / 可见性时复用已加载的内容（视频不会从头播）。任意状态可调，素材在调用线程上加载。
+     * 失败：TGErr_InvalidArgument（id / 取值非法）、文件打不开 / 解码器不支持时返回对应错误码，暂存场景不变。
+     */
+    public int stageOverlay(OverlayDesc d) {
+        if (d == null) {
+            return ERR_INVALID_ARGUMENT;
+        }
+        return nativeStageOverlay(handle(), d.id, d.kind, d.path, d.loop, d.x, d.y, d.width, d.height, d.opacity,
+                d.zOrder, d.visible);
+    }
+
+    /** 从暂存场景删除（id 不存在返回 TGErr_InvalidArgument）。 */
+    public int stageRemoveOverlay(String id) {
+        return nativeStageRemoveOverlay(handle(), id == null ? "" : id);
+    }
+
+    /** 暂存场景原子生效到推流画面；有改动时回调 onNotify(NOTIFY_OVERLAY_COMMITTED)。 */
+    public int commitOverlays() {
+        return nativeCommitOverlays(handle());
+    }
+
+    /** 丢弃暂存改动，回到已提交场景。 */
+    public int discardOverlayChanges() {
+        return nativeDiscardOverlayChanges(handle());
+    }
+
+    /** 当前叠加层（staged = true 取暂存场景，否则取已提交场景），按 zOrder 从下到上（相同按 id）。 */
+    public OverlayDesc[] getOverlays(boolean staged) {
+        OverlayDesc[] list = nativeGetOverlays(handle(), staged);
+        return list == null ? new OverlayDesc[0] : list;
+    }
+
     private long handle() {
         if (mHandle == 0) {
             throw new IllegalStateException("TGCapturer 已 release");
@@ -386,6 +436,20 @@ public final class TGCapturer {
     private static native int nativeEnableSpeaker(long handle);
 
     private static native boolean nativeCreateScreenCapture(long handle);
+
+    private static native boolean nativeCreateLocalFileCapture(long handle, String filePath, boolean loop);
+
+    private static native int nativeStageOverlay(long handle, String id, int kind, String path, boolean loop, float x,
+                                                 float y, float width, float height, float opacity, int zOrder,
+                                                 boolean visible);
+
+    private static native int nativeStageRemoveOverlay(long handle, String id);
+
+    private static native int nativeCommitOverlays(long handle);
+
+    private static native int nativeDiscardOverlayChanges(long handle);
+
+    private static native OverlayDesc[] nativeGetOverlays(long handle, boolean staged);
 
     private static native int nativeSetupVideoEncoder(long handle, int width, int height, float fps, int bitrate,
                                                       float bitrateMaxFactor, int gop, String codec, int perfMode,

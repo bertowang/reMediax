@@ -34,10 +34,19 @@ data class DemoConfig(
     val sampleRate: Int,
     val channels: Int,
     val avTimeoutMs: Long,
+    /** 视频源 = 本地文件时的路径与选项 */
+    val videoFile: String,
+    val videoFileLoop: Boolean,
+    val videoFileAudio: Boolean,
+    /** 开播同时开预览（画面下方的 SurfaceView，显示暂存场景） */
+    val preview: Boolean,
+    /** 画中画叠加层用的视频文件 */
+    val overlayVideo: String,
 ) {
     val screenCapture get() = videoSource == VIDEO_SCREEN
     val testPattern get() = videoSource == VIDEO_PATTERN
-    val audioEnabled get() = mic || speaker || testTone
+    val fileSource get() = videoSource == VIDEO_FILE
+    val audioEnabled get() = mic || speaker || testTone || (fileSource && videoFileAudio)
 
     /** 录屏或系统内录都要先拿到 MediaProjection。 */
     val needsProjection get() = screenCapture || speaker
@@ -75,12 +84,22 @@ data class DemoConfig(
 
     fun summary() = buildString {
         append(if (outputMode == OUTPUT_FILE) "本地文件" else publishUrl).append(" [").append(muxerFormat).append("]\n")
-        append("视频 ").append(if (screenCapture) "录屏" else "测试图案").append(' ')
+        append("视频 ").append(
+            when {
+                screenCapture -> "录屏"
+                fileSource -> "文件 $videoFile" + if (videoFileLoop) "（循环）" else ""
+                else -> "测试图案"
+            }
+        ).append(' ')
         append(width).append('x').append(height).append('@').append(fps).append(' ')
         append(videoBitrateKbps).append("kbps ").append(videoCodec)
-        append(" gop=").append(fps * gopSeconds).append(if (perfMode == 1) " GPU" else " CPU").append('\n')
+        append(" gop=").append(fps * gopSeconds).append(if (perfMode == 1) " GPU" else " CPU")
+        append(if (preview) " 预览" else "").append('\n')
         if (audioEnabled) {
-            val src = listOfNotNull("麦克风".takeIf { mic }, "内录".takeIf { speaker }, "测试音".takeIf { testTone })
+            val src = listOfNotNull(
+                "麦克风".takeIf { mic }, "内录".takeIf { speaker }, "测试音".takeIf { testTone },
+                "文件音轨".takeIf { fileSource && videoFileAudio },
+            )
             append("音频 ").append(src.joinToString("+")).append(' ')
             append(sampleRate).append("Hz ").append(channels).append("ch ")
             append(audioBitrateKbps).append("kbps ").append(audioCodec)
@@ -94,9 +113,14 @@ data class DemoConfig(
         const val OUTPUT_FILE = "file"
         const val VIDEO_SCREEN = "screen"
         const val VIDEO_PATTERN = "pattern"
+        const val VIDEO_FILE = "file"
+
+        /** 默认素材目录：/sdcard/Android/data/<pkg>/files（adb push 即可，App 无需存储权限） */
+        fun mediaDir(context: Context): File = context.getExternalFilesDir(null) ?: context.filesDir
 
         fun load(context: Context): DemoConfig {
             val p = PreferenceManager.getDefaultSharedPreferences(context)
+            val media = mediaDir(context)
             val (long, short) = when (p.str("pref_resolution", "720")) {
                 "540" -> 960 to 540
                 "1080" -> 1920 to 1080
@@ -128,6 +152,11 @@ data class DemoConfig(
                 sampleRate = p.int("pref_audio_sample_rate", 44100),
                 channels = p.int("pref_audio_channels", 2),
                 avTimeoutMs = p.int("pref_av_timeout", 3000).toLong(),
+                videoFile = p.str("pref_video_file", File(media, "main.mp4").absolutePath),
+                videoFileLoop = p.getBoolean("pref_video_file_loop", true),
+                videoFileAudio = p.getBoolean("pref_video_file_audio", true),
+                preview = p.getBoolean("pref_preview", true),
+                overlayVideo = p.str("pref_overlay_video", File(media, "pip.mp4").absolutePath),
             )
         }
 

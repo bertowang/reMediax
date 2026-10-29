@@ -128,6 +128,30 @@
             app:useSimpleSummaryProvider="true" />
     </PreferenceCategory>
 
+    <PreferenceCategory app:title="@string/cat_media">
+        <EditTextPreference
+            app:key="pref_video_file"
+            app:title="@string/pref_video_file"
+            app:useSimpleSummaryProvider="true" />
+        <SwitchPreferenceCompat
+            app:defaultValue="true"
+            app:key="pref_video_file_loop"
+            app:title="@string/pref_video_file_loop" />
+        <SwitchPreferenceCompat
+            app:defaultValue="true"
+            app:key="pref_video_file_audio"
+            app:title="@string/pref_video_file_audio" />
+        <EditTextPreference
+            app:key="pref_overlay_video"
+            app:title="@string/pref_overlay_video"
+            app:useSimpleSummaryProvider="true" />
+        <SwitchPreferenceCompat
+            app:defaultValue="true"
+            app:key="pref_preview"
+            app:summary="@string/pref_preview_summary"
+            app:title="@string/pref_preview" />
+    </PreferenceCategory>
+
     <PreferenceCategory app:title="@string/cat_advanced">
         <ListPreference
             app:defaultValue="3000"

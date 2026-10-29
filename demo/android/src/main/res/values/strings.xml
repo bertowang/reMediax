@@ -45,4 +45,18 @@
     <string name="pref_audio_sample_rate">采样率</string>
     <string name="pref_audio_channels">声道</string>
     <string name="pref_av_timeout">断流告警阈值</string>
+
+    <string name="cat_media">本地素材（默认在 /sdcard/Android/data/com.tencent.tgcapture.demo/files）</string>
+    <string name="pref_video_file">主画面视频文件</string>
+    <string name="pref_video_file_loop">主画面循环播放</string>
+    <string name="pref_video_file_audio">带上主画面文件的音轨</string>
+    <string name="pref_overlay_video">画中画视频文件</string>
+    <string name="pref_preview">开播时显示预览</string>
+    <string name="pref_preview_summary">预览显示暂存的叠加层，推流画面要点「提交」才更新</string>
+
+    <string name="overlay_logo">Logo</string>
+    <string name="overlay_pip">画中画</string>
+    <string name="overlay_move">移动</string>
+    <string name="overlay_commit">提交</string>
+    <string name="overlay_discard">撤销</string>
 </resources>

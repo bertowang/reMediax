@@ -97,6 +97,83 @@
         </LinearLayout>
     </LinearLayout>
 
+    <!-- 预览（显示暂存场景）+ 叠加层控制：增删 / 移动只改暂存，提交后才进推流画面 -->
+    <LinearLayout
+        android:id="@+id/overlay_panel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="#FF000000"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <SurfaceView
+            android:id="@+id/preview"
+            android:layout_width="match_parent"
+            android:layout_height="180dp" />
+
+        <TextView
+            android:id="@+id/text_overlays"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:paddingStart="8dp"
+            android:paddingEnd="8dp"
+            android:textColor="#FFD4D4D4"
+            android:textSize="11sp"
+            tools:text="推流: logo   预览: logo pip   （有未提交改动）" />
+
+        <HorizontalScrollView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content">
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:paddingStart="4dp"
+                android:paddingEnd="4dp">
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_logo"
+                    style="?attr/materialButtonOutlinedStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="4dp"
+                    android:text="@string/overlay_logo" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_pip"
+                    style="?attr/materialButtonOutlinedStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="4dp"
+                    android:text="@string/overlay_pip" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_pip_move"
+                    style="?attr/materialButtonOutlinedStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="4dp"
+                    android:text="@string/overlay_move" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_commit"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="4dp"
+                    android:text="@string/overlay_commit" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_discard"
+                    style="?attr/materialButtonOutlinedStyle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/overlay_discard" />
+            </LinearLayout>
+        </HorizontalScrollView>
+    </LinearLayout>
+
     <!-- 事件日志（内核完整日志在 logcat 的 TGCapture tag） -->
     <LinearLayout
         android:layout_width="match_parent"

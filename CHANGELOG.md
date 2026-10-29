@@ -4,6 +4,16 @@
 
 ## Unreleased
 
+### Android：叠加层 / 本地文件主画面绑定与 demo（B10）
+- 绑定：`OverlayDesc`（Java）、`stageOverlay` / `stageRemoveOverlay` / `commitOverlays` / `discardOverlayChanges` / `getOverlays(staged)`、
+  `createLocalFileCapture(path, loop)`；常量 `NOTIFY_OVERLAY_COMMITTED = 43`、`ERR_INVALID_ARGUMENT`。
+  `getOverlays` 在 JNI 里直接构造 `OverlayDesc[]`（类与字段 ID 在 `JNI_OnLoad` 缓存），`consumer-rules.pro` 保留该类。
+- demo：开播时显示预览（SurfaceView，显示暂存场景）；叠加层按钮 Logo（运行时生成的半透明 png）/ 画中画（本地视频）/ 移动 / 提交 / 撤销，
+  状态行显示「推流 / 预览」两份列表及是否有未提交改动。视频源新增「本地视频文件」（可带上文件音轨），素材默认放 App 外部目录（adb push 即可）。
+  自动化新增 `tg_cmd ovl:logo|pip|move|commit|discard`。
+- 回归脚本：`--overlay` / `--overlay-video F` 逐帧校验录像（signalstats）—— 暂存不进推流、Logo 与画中画同一帧上推流、
+  移动时旧位置消失与新位置出现在同一帧；`--video-file F` 主画面走本地文件。
+
 ### 本地视频文件源与视频叠加层（B7/B8）
 - `CreateLocalFileCapture(index, path, loop)` 落地：`capture/FileVideoSource`，纯 ffmpeg、三端共用。按文件时间戳以墙钟节奏出帧，
   原生尺寸采集、编码器缩放；`loop = true` 无缝循环（下一遍的时间基 = 上一遍时长），`loop = false` 播完发

@@ -17,6 +17,14 @@ class SettingsFragment : PreferenceFragmentCompat() {
             it.setSingleLine()
             it.setSelection(it.text.length)
         }
+        // 素材路径默认放在 App 外部目录（adb push 即可，无需存储权限）
+        val media = DemoConfig.mediaDir(requireContext())
+        mapOf("pref_video_file" to "main.mp4", "pref_overlay_video" to "pip.mp4").forEach { (key, name) ->
+            findPreference<EditTextPreference>(key)?.apply {
+                if (text.isNullOrBlank()) text = java.io.File(media, name).absolutePath
+                setOnBindEditTextListener { it.setSingleLine() }
+            }
+        }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             findPreference<Preference>("pref_audio_speaker")?.apply {
                 isEnabled = false

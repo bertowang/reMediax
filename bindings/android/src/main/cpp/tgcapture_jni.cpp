@@ -60,6 +60,16 @@ struct ListenerMethods
     jmethodID onNotify = nullptr;
 } g_listener;
 
+// com.tencent.tgcapture.OverlayDesc：getOverlays 构造返回值用（JNI_OnLoad 时缓存）
+struct OverlayDescClass
+{
+    jclass cls = nullptr;   // GlobalRef
+    jmethodID ctor = nullptr;
+    jfieldID id = nullptr, kind = nullptr, path = nullptr, loop = nullptr;
+    jfieldID x = nullptr, y = nullptr, width = nullptr, height = nullptr, opacity = nullptr;
+    jfieldID zOrder = nullptr, visible = nullptr;
+} g_overlayDesc;
+
 void DetachOnThreadExit(void*)
 {
     if (g_vm) {
@@ -430,6 +440,127 @@ jboolean NativeCreateScreenCapture(JNIEnv*, jclass, jlong handle)
     return (source && s->capturer->AddVideoSource(source) == TGErr_OK) ? JNI_TRUE : JNI_FALSE;
 }
 
+jboolean NativeCreateLocalFileCapture(JNIEnv* env, jclass, jlong handle, jstring path, jboolean loop)
+{
+    Session* s = FromHandle(handle);
+    if (!s) {
+        return JNI_FALSE;
+    }
+    // CreateLocalFileCapture 自身已设为视频源；失败原因（文件打不开 / 无视频轨 / 采集中）见 logcat
+    return s->capturer->CreateLocalFileCapture(0, ToStdString(env, path), loop == JNI_TRUE) ? JNI_TRUE : JNI_FALSE;
+}
+
+// ------------------------------------------------------------------ 视频叠加层
+jint NativeStageOverlay(JNIEnv* env, jclass, jlong handle, jstring id, jint kind, jstring path, jboolean loop,
+                        jfloat x, jfloat y, jfloat width, jfloat height, jfloat opacity, jint zOrder, jboolean visible)
+{
+    Session* s = FromHandle(handle);
+    if (!s) {
+        return TGErr_InvalidState;
+    }
+    OverlayDesc d;
+    d.id = ToStdString(env, id);
+    d.kind = static_cast<OverlayKind>(kind);
+    d.path = ToStdString(env, path);
+    d.loop = loop == JNI_TRUE;
+    d.x = x;
+    d.y = y;
+    d.width = width;
+    d.height = height;
+    d.opacity = opacity;
+    d.zOrder = zOrder;
+    d.visible = visible == JNI_TRUE;
+    return s->capturer->StageOverlay(d);
+}
+
+jint NativeStageRemoveOverlay(JNIEnv* env, jclass, jlong handle, jstring id)
+{
+    Session* s = FromHandle(handle);
+    return s ? s->capturer->StageRemoveOverlay(ToStdString(env, id)) : TGErr_InvalidState;
+}
+
+jint NativeCommitOverlays(JNIEnv*, jclass, jlong handle)
+{
+    Session* s = FromHandle(handle);
+    return s ? s->capturer->CommitOverlays() : TGErr_InvalidState;
+}
+
+jint NativeDiscardOverlayChanges(JNIEnv*, jclass, jlong handle)
+{
+    Session* s = FromHandle(handle);
+    return s ? s->capturer->DiscardOverlayChanges() : TGErr_InvalidState;
+}
+
+jobjectArray NativeGetOverlays(JNIEnv* env, jclass, jlong handle, jboolean staged)
+{
+    Session* s = FromHandle(handle);
+    if (!s || !g_overlayDesc.cls) {
+        return nullptr;
+    }
+    std::vector<OverlayDesc> list;
+    s->capturer->GetOverlays(list, staged == JNI_TRUE);
+    jobjectArray out = env->NewObjectArray(static_cast<jsize>(list.size()), g_overlayDesc.cls, nullptr);
+    if (!out) {
+        return nullptr;
+    }
+    const auto& c = g_overlayDesc;
+    for (size_t i = 0; i < list.size(); ++i) {
+        const OverlayDesc& d = list[i];
+        jobject o = env->NewObject(c.cls, c.ctor);
+        if (!o) {
+            return nullptr;
+        }
+        jstring jid = ToJString(env, d.id.c_str());
+        jstring jpath = ToJString(env, d.path.c_str());
+        env->SetObjectField(o, c.id, jid);
+        env->SetIntField(o, c.kind, static_cast<jint>(d.kind));
+        env->SetObjectField(o, c.path, jpath);
+        env->SetBooleanField(o, c.loop, d.loop ? JNI_TRUE : JNI_FALSE);
+        env->SetFloatField(o, c.x, d.x);
+        env->SetFloatField(o, c.y, d.y);
+        env->SetFloatField(o, c.width, d.width);
+        env->SetFloatField(o, c.height, d.height);
+        env->SetFloatField(o, c.opacity, d.opacity);
+        env->SetIntField(o, c.zOrder, d.zOrder);
+        env->SetBooleanField(o, c.visible, d.visible ? JNI_TRUE : JNI_FALSE);
+        env->SetObjectArrayElement(out, static_cast<jsize>(i), o);
+        env->DeleteLocalRef(jid);
+        env->DeleteLocalRef(jpath);
+        env->DeleteLocalRef(o);
+    }
+    return out;
+}
+
+bool CacheOverlayDescClass(JNIEnv* env)
+{
+    jclass local = env->FindClass("com/tencent/tgcapture/OverlayDesc");
+    if (!local) {
+        env->ExceptionClear();
+        return false;
+    }
+    auto& c = g_overlayDesc;
+    c.cls = static_cast<jclass>(env->NewGlobalRef(local));
+    env->DeleteLocalRef(local);
+    c.ctor = env->GetMethodID(c.cls, "<init>", "()V");
+    c.id = env->GetFieldID(c.cls, "id", "Ljava/lang/String;");
+    c.kind = env->GetFieldID(c.cls, "kind", "I");
+    c.path = env->GetFieldID(c.cls, "path", "Ljava/lang/String;");
+    c.loop = env->GetFieldID(c.cls, "loop", "Z");
+    c.x = env->GetFieldID(c.cls, "x", "F");
+    c.y = env->GetFieldID(c.cls, "y", "F");
+    c.width = env->GetFieldID(c.cls, "width", "F");
+    c.height = env->GetFieldID(c.cls, "height", "F");
+    c.opacity = env->GetFieldID(c.cls, "opacity", "F");
+    c.zOrder = env->GetFieldID(c.cls, "zOrder", "I");
+    c.visible = env->GetFieldID(c.cls, "visible", "Z");
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return false;
+    }
+    return c.ctor && c.id && c.kind && c.path && c.loop && c.x && c.y && c.width && c.height && c.opacity &&
+           c.zOrder && c.visible;
+}
+
 jint NativeSetupVideoEncoder(JNIEnv* env, jclass, jlong handle, jint width, jint height, jfloat fps,
                              jint bitrate, jfloat maxFactor, jint gop, jstring codec, jint perfMode,
                              jint threads)
@@ -658,6 +789,12 @@ bool RegisterAll(JNIEnv* env)
         TG_NATIVE("nativeEnableMicrophone", "(J)I", NativeEnableMicrophone),
         TG_NATIVE("nativeEnableSpeaker", "(J)I", NativeEnableSpeaker),
         TG_NATIVE("nativeCreateScreenCapture", "(J)Z", NativeCreateScreenCapture),
+        TG_NATIVE("nativeCreateLocalFileCapture", "(JLjava/lang/String;Z)Z", NativeCreateLocalFileCapture),
+        TG_NATIVE("nativeStageOverlay", "(JLjava/lang/String;ILjava/lang/String;ZFFFFFIZ)I", NativeStageOverlay),
+        TG_NATIVE("nativeStageRemoveOverlay", "(JLjava/lang/String;)I", NativeStageRemoveOverlay),
+        TG_NATIVE("nativeCommitOverlays", "(J)I", NativeCommitOverlays),
+        TG_NATIVE("nativeDiscardOverlayChanges", "(J)I", NativeDiscardOverlayChanges),
+        TG_NATIVE("nativeGetOverlays", "(JZ)[Lcom/tencent/tgcapture/OverlayDesc;", NativeGetOverlays),
         TG_NATIVE("nativeSetupVideoEncoder", "(JIIFIFILjava/lang/String;II)I", NativeSetupVideoEncoder),
         TG_NATIVE("nativeSetupAudioEncoder", "(JIIILjava/lang/String;Z)I", NativeSetupAudioEncoder),
         TG_NATIVE("nativeSetupMuxer", "(JLjava/lang/String;Ljava/lang/String;II)I", NativeSetupMuxer),
@@ -736,6 +873,10 @@ bool RegisterAll(JNIEnv* env)
     g_listener.onError = env->GetMethodID(listener, "onError", "(IILjava/lang/String;)V");
     g_listener.onNotify = env->GetMethodID(listener, "onNotify", "(ILjava/lang/String;J)V");
     env->DeleteLocalRef(listener);
+    if (!CacheOverlayDescClass(env)) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag, "JNI_OnLoad: OverlayDesc 类 / 字段缺失（被 R8 裁剪？）");
+        return false;
+    }
     return g_listener.onPrepared && g_listener.onStarted && g_listener.onStopped && g_listener.onError &&
            g_listener.onNotify;
 }

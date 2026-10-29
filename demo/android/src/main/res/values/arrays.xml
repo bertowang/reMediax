@@ -21,10 +21,12 @@
     <string-array name="video_source_entries">
         <item>屏幕录制（MediaProjection）</item>
         <item>测试图案（外部注入 NV12）</item>
+        <item>本地视频文件</item>
     </string-array>
     <string-array name="video_source_values">
         <item>screen</item>
         <item>pattern</item>
+        <item>file</item>
     </string-array>
 
     <string-array name="resolution_entries">

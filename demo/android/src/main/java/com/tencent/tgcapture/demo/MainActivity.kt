@@ -11,6 +11,8 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import android.view.Surface
+import android.view.SurfaceHolder
 import android.view.View
 import android.view.WindowManager
 import androidx.activity.result.contract.ActivityResultContracts
@@ -39,6 +41,7 @@ class MainActivity : AppCompatActivity() {
     private var state = State.IDLE
     private var session: LiveSession? = null
     private var pendingConfig: DemoConfig? = null
+    private var previewSurface: Surface? = null
     private val logLines = ArrayDeque<String>()
 
     private val permissionLauncher =
@@ -76,6 +79,25 @@ class MainActivity : AppCompatActivity() {
         binding.btnStart.setOnClickListener { if (state == State.IDLE) onStartClicked() else stopLive() }
         binding.switchMuteAudio.setOnCheckedChangeListener { _, checked -> session?.muteAudio(checked) }
         binding.switchMuteVideo.setOnCheckedChangeListener { _, checked -> session?.muteVideo(checked) }
+        binding.btnLogo.setOnClickListener { session?.toggleLogo() }
+        binding.btnPip.setOnClickListener { session?.togglePip() }
+        binding.btnPipMove.setOnClickListener { session?.movePip() }
+        binding.btnCommit.setOnClickListener { session?.commitOverlays() }
+        binding.btnDiscard.setOnClickListener { session?.discardOverlays() }
+        binding.preview.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                previewSurface = holder.surface
+                session?.setPreviewSurface(holder.surface)
+            }
+
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
+
+            // 必须在返回前解绑：之后 Surface 即失效，内核再往里画会崩
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                previewSurface = null
+                session?.setPreviewSurface(null)
+            }
+        })
         binding.btnClearLog.setOnClickListener {
             logLines.clear()
             binding.textLog.text = ""
@@ -97,7 +119,9 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 回归脚本入口（scripts/regress_android_demo.sh），只在 debuggable 包里生效：
-     *   adb shell am start -n com.tencent.tgcapture.demo/.MainActivity --es tg_cmd start|stop|res:<档位|宽x高>|audiofile:<路径>
+     *   adb shell am start -n com.tencent.tgcapture.demo/.MainActivity --es tg_cmd <命令>
+     *   命令：start | stop | res:<档位|宽x高> | audiofile:<路径>
+     *         | ovl:logo | ovl:pip | ovl:move | ovl:commit | ovl:discard（与界面按钮相同）
      * 状态变化与日志同步打到 logcat（tag TGDemo），脚本据此等待 LIVE / IDLE。
      */
     private fun handleAutomation(intent: Intent?) {
@@ -105,16 +129,19 @@ class MainActivity : AppCompatActivity() {
         intent.removeExtra(EXTRA_CMD)
         if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE == 0) return
         Log.i(LOG_TAG, "automation cmd=$cmd state=$state")
-        when (cmd) {
-            "start" -> if (state == State.IDLE) onStartClicked()
-            "stop" -> if (state == State.LIVE) stopLive()
-            else -> if (cmd.startsWith("res:") && state == State.LIVE) {
-                session?.switchResolution(cmd.removePrefix("res:"))
-            } else if (cmd.startsWith("audiofile:") && state == State.LIVE) {
-                session?.addFileAudio(cmd.removePrefix("audiofile:"))
-            } else {
-                Log.w(LOG_TAG, "unknown automation cmd: $cmd")
-            }
+        val s = session.takeIf { state == State.LIVE }
+        when {
+            cmd == "start" -> if (state == State.IDLE) onStartClicked()
+            cmd == "stop" -> if (state == State.LIVE) stopLive()
+            s == null -> Log.w(LOG_TAG, "not live, ignored: $cmd")
+            cmd.startsWith("res:") -> s.switchResolution(cmd.removePrefix("res:"))
+            cmd.startsWith("audiofile:") -> s.addFileAudio(cmd.removePrefix("audiofile:"))
+            cmd == "ovl:logo" -> s.toggleLogo()
+            cmd == "ovl:pip" -> s.togglePip()
+            cmd == "ovl:move" -> s.movePip()
+            cmd == "ovl:commit" -> s.commitOverlays()
+            cmd == "ovl:discard" -> s.discardOverlays()
+            else -> Log.w(LOG_TAG, "unknown automation cmd: $cmd")
         }
     }
 
@@ -173,6 +200,7 @@ class MainActivity : AppCompatActivity() {
     private fun startSession(cfg: DemoConfig, projection: MediaProjection?) {
         pendingConfig = null
         setState(State.STARTING)
+        showPreview(cfg)
         session = LiveSession(this, cfg, projection, object : LiveSession.Events {
             override fun onLog(line: String) = appendLog(line)
 
@@ -187,7 +215,26 @@ class MainActivity : AppCompatActivity() {
                 appendLog(if (err == 0) "已停播" else "开播失败（详见上方日志）")
                 finishSession()
             }
-        }).also { it.start() }
+
+            override fun onOverlays(summary: String) {
+                Log.i(LOG_TAG, "overlays $summary")
+                binding.textOverlays.text = summary
+            }
+        }).also {
+            it.setPreviewSurface(previewSurface)
+            it.start()
+        }
+    }
+
+    /** 预览区高度按编码宽高比算（预览缓冲 = 采集尺寸，系统拉伸到 View）。叠加层按钮跟预览一起显示。 */
+    private fun showPreview(cfg: DemoConfig) {
+        binding.overlayPanel.visibility = View.VISIBLE
+        binding.preview.visibility = if (cfg.preview) View.VISIBLE else View.GONE
+        binding.textOverlays.text = ""
+        val w = resources.displayMetrics.widthPixels
+        binding.preview.layoutParams = binding.preview.layoutParams.apply {
+            height = minOf(w * cfg.height / maxOf(1, cfg.width), resources.displayMetrics.heightPixels / 3)
+        }
     }
 
     private fun stopLive() {
@@ -204,6 +251,7 @@ class MainActivity : AppCompatActivity() {
         TGProjectionService.stop(this)
         binding.switchMuteAudio.isChecked = false
         binding.switchMuteVideo.isChecked = false
+        binding.overlayPanel.visibility = View.GONE
         setState(State.IDLE)
     }
 
@@ -225,6 +273,8 @@ class MainActivity : AppCompatActivity() {
         val live = s == State.LIVE
         binding.switchMuteAudio.isEnabled = live
         binding.switchMuteVideo.isEnabled = live
+        listOf(binding.btnLogo, binding.btnPip, binding.btnPipMove, binding.btnCommit, binding.btnDiscard)
+            .forEach { it.isEnabled = live }
         binding.liveInfo.visibility = if (s == State.IDLE) View.INVISIBLE else View.VISIBLE
         (supportFragmentManager.findFragmentById(R.id.settings_container) as? SettingsFragment)
             ?.setLocked(s != State.IDLE)
