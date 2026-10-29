@@ -4,6 +4,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 #include "TGCapture/TGCapturerInterface.h"
 #include "TGCapture/Export.h"
@@ -156,6 +157,27 @@ public:
     // 输出音频 PTS 由内核按输出样本数生成，不直接使用 ptsUs。
     virtual int PushExternalAudioFrame(AudioCapSourceType type, const uint8_t* data, int size,
                                        int sampleRate, int channels, int64_t ptsUs) = 0;
+
+    // ---------------- 运行期音频源（任意状态可调，推流不中断） ----------------
+    // 开播中增加：该路立即打开 / 开始采集，混音时淡入 20ms；移除：先淡出 20ms 再停采集、关设备。
+    // 全部移除后混音输出静音，音频时间轴照常推进（视频不受影响）。
+    // 旧接口创建的源也有 id：EnableMicrophoneCapture → "mic"，EnableSpeakerCapture → "speaker"，
+    // PushExternalAudioFrame(type) → "ext.<type>"（仅推流期间存在，Stop 时移除）。
+    //
+    // AddAudioSource 失败：TGErr_InvalidArgument（id 重复 / 非法，File 缺路径，volume 越界）
+    //                     TGErr_NotSupported（本平台无该类原生采集）/ TGErr_InvalidState（推流中但未启用音频）
+    // 成功后发 EsCap_Notify_AudioSource_Added；outId 返回实际 id
+    virtual int AddAudioSource(const AudioSourceDesc& desc, std::string* outId = nullptr) = 0;
+    // 失败：TGErr_InvalidArgument（id 不存在）。成功后发 EsCap_Notify_AudioSource_Removed
+    virtual int RemoveAudioSource(const std::string& id) = 0;
+    // 线性增益 0 ~ 4，立即生效。失败：TGErr_InvalidArgument
+    virtual int SetAudioSourceVolume(const std::string& id, float volume) = 0;
+    // 各路电平（增益后、实际混入的样本）+ "master"（混音输出）。未开播时全部为 -100
+    virtual int GetAudioLevels(std::vector<AudioSourceLevel>& levels) = 0;
+    // External 类音频源推 PCM（交错 S16）。ptsUs 约定同 PushExternalAudioFrame。
+    // 失败：TGErr_InvalidArgument（id 不存在 / 不是 External / 参数非法）/ TGErr_InvalidState（未开播）
+    virtual int PushAudioSourceFrame(const std::string& id, const uint8_t* data, int size, int sampleRate,
+                                     int channels, int64_t ptsUs) = 0;
 };
 
 }  // namespace TGCapture

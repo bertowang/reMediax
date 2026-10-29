@@ -11,6 +11,7 @@
 //
 // 运行期增删音频源 = 事务里 Register + Link(…, "audio_mixer", kAnyPort) / Unregister：
 // 混音器在 OnInputAttached / OnInputDetached 里建 / 拆对应通道，端口由总线分配，删后再加不会撞号。
+// 运行期新接入的通道自动淡入；移除前门面先 FadeOutInput 并等 InputFaded（见 core/AudioMixer.h）。
 #ifndef TGCAPTURE_NODES_AUDIO_NODES_H
 #define TGCAPTURE_NODES_AUDIO_NODES_H
 
@@ -19,6 +20,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -120,6 +122,17 @@ public:
     // 停线程 → 复位音频主时钟 → 打印汇总 → Reset 混流器
     void NodeStop() override;
 
+    // 某个上游接在哪个输入端口（= 混流通道号）
+    [[nodiscard]] std::optional<size_t> PortOf(const std::string& upstream) const;
+    // 输入增益（线性 0 ~ 4）。通道尚未建立时先记下，建通道时生效；跨轮次（Stop / Prepare）保留
+    void SetInputGain(size_t port, float gain);
+    // 运行期移除前的淡出。混音线程没在跑时（未开播）InputFaded 直接为真
+    void FadeOutInput(size_t port);
+    [[nodiscard]] bool InputFaded(size_t port) const;
+    // 电平：各输入端口 + 混音输出
+    [[nodiscard]] core::AudioMixer::Level InputLevel(size_t port) const;
+    [[nodiscard]] core::AudioMixer::Level MasterLevel() const { return m_mixer.MasterLevel(); }
+
     // 每输出一帧回调一次（混音线程内，参数为墙钟 us）：断流看护据此判断音频是否还在出
     void SetOutputObserver(std::function<void(int64_t)> fn);
     // 每 10s 回调一次（混音线程内）：门面打印心跳
@@ -134,15 +147,17 @@ private:
     void MixLoop(std::stop_token token);
     // 首帧到达时为该端口建通道（运行期新接入 / 外部注入）。失败返回 false
     bool EnsureChannel(size_t port, const core::Frame& frame);
+    void ApplyGainLocked(size_t port);
 
     core::AudioMixer m_mixer;
     std::atomic_bool m_enabled{true};
     std::atomic_bool m_running{false};
 
-    mutable std::mutex m_mutex;          // 保护下面三项
+    mutable std::mutex m_mutex;          // 保护下面几项
     Config m_config;
     std::map<size_t, std::string> m_inputs;   // 已接入的端口 -> 上游名
     std::map<size_t, bool> m_created;         // 端口 -> 混流通道是否已建
+    std::map<size_t, float> m_gains;          // 端口 -> 增益（建通道时生效）
 
     std::function<void(int64_t)> m_onOutput;
     std::function<void()> m_onHeartbeat;

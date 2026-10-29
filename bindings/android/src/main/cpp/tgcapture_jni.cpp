@@ -12,6 +12,7 @@
 #include <jni.h>
 #include <pthread.h>
 
+#include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <mutex>
@@ -535,6 +536,74 @@ jint NativePushAudioFrame(JNIEnv* env, jclass, jlong handle, jint type, jobject 
                                                sampleRate, channels, ptsUs);
 }
 
+// ------------------------------------------------------------------ 运行期音频源
+// 成功返回实际 id，失败返回 null（错误码见 logcat）
+jstring NativeAddAudioSource(JNIEnv* env, jclass, jlong handle, jint kind, jstring id, jfloat volume,
+                             jstring filePath, jboolean loop)
+{
+    Session* s = FromHandle(handle);
+    if (!s) {
+        return nullptr;
+    }
+    AudioSourceDesc desc;
+    desc.kind = static_cast<AudioSourceKind>(kind);
+    desc.id = ToStdString(env, id);
+    desc.volume = volume;
+    desc.filePath = ToStdString(env, filePath);
+    desc.loop = loop == JNI_TRUE;
+    std::string actual;
+    const int ret = s->capturer->AddAudioSource(desc, &actual);
+    if (ret != TGErr_OK) {
+        __android_log_print(ANDROID_LOG_WARN, kTag, "addAudioSource kind=%d id=%s 失败：%d", kind, desc.id.c_str(),
+                            ret);
+        return nullptr;
+    }
+    return ToJString(env, actual.c_str());
+}
+
+jint NativeRemoveAudioSource(JNIEnv* env, jclass, jlong handle, jstring id)
+{
+    Session* s = FromHandle(handle);
+    return s ? s->capturer->RemoveAudioSource(ToStdString(env, id)) : TGErr_InvalidState;
+}
+
+jint NativeSetAudioSourceVolume(JNIEnv* env, jclass, jlong handle, jstring id, jfloat volume)
+{
+    Session* s = FromHandle(handle);
+    return s ? s->capturer->SetAudioSourceVolume(ToStdString(env, id), volume) : TGErr_InvalidState;
+}
+
+// JSON：[{"id":"mic","peak":-12.3,"rms":-20.1}, ...]，最后一项 id = "master"
+jstring NativeGetAudioLevels(JNIEnv* env, jclass, jlong handle)
+{
+    Session* s = FromHandle(handle);
+    if (!s) {
+        return nullptr;
+    }
+    std::vector<AudioSourceLevel> levels;
+    s->capturer->GetAudioLevels(levels);
+    std::string json = "[";
+    char buf[192];
+    for (size_t i = 0; i < levels.size(); ++i) {
+        std::snprintf(buf, sizeof(buf), "%s{\"id\":\"%s\",\"peak\":%.1f,\"rms\":%.1f}", i ? "," : "",
+                      levels[i].id.c_str(), levels[i].peakDb, levels[i].rmsDb);
+        json += buf;
+    }
+    json += "]";
+    return ToJString(env, json.c_str());
+}
+
+jint NativePushAudioSourceFrame(JNIEnv* env, jclass, jlong handle, jstring id, jobject pcm, jint bytes,
+                                jint sampleRate, jint channels, jlong ptsUs)
+{
+    Session* s = FromHandle(handle);
+    auto* data = pcm ? static_cast<const uint8_t*>(env->GetDirectBufferAddress(pcm)) : nullptr;
+    if (!s || !data) {
+        return TGErr_InvalidArgument;
+    }
+    return s->capturer->PushAudioSourceFrame(ToStdString(env, id), data, bytes, sampleRate, channels, ptsUs);
+}
+
 #define TG_NATIVE(name, sig, fn) JNINativeMethod{const_cast<char*>(name), const_cast<char*>(sig), reinterpret_cast<void*>(fn)}
 
 bool RegisterAll(JNIEnv* env)
@@ -563,6 +632,13 @@ bool RegisterAll(JNIEnv* env)
         TG_NATIVE("nativeMuteVideo", "(JZ)Z", NativeMuteVideo),
         TG_NATIVE("nativeSetPreviewSurface", "(JLandroid/view/Surface;)V", NativeSetPreviewSurface),
         TG_NATIVE("nativeStartPreview", "(J)I", NativeStartPreview),
+        TG_NATIVE("nativeAddAudioSource", "(JILjava/lang/String;FLjava/lang/String;Z)Ljava/lang/String;",
+                  NativeAddAudioSource),
+        TG_NATIVE("nativeRemoveAudioSource", "(JLjava/lang/String;)I", NativeRemoveAudioSource),
+        TG_NATIVE("nativeSetAudioSourceVolume", "(JLjava/lang/String;F)I", NativeSetAudioSourceVolume),
+        TG_NATIVE("nativeGetAudioLevels", "(J)Ljava/lang/String;", NativeGetAudioLevels),
+        TG_NATIVE("nativePushAudioSourceFrame", "(JLjava/lang/String;Ljava/nio/ByteBuffer;IIIJ)I",
+                  NativePushAudioSourceFrame),
         TG_NATIVE("nativeStopPreview", "(J)V", NativeStopPreview),
         TG_NATIVE("nativeIsPreviewing", "(J)Z", NativeIsPreviewing),
         TG_NATIVE("nativeSetAVTimeout", "(JJJ)I", NativeSetAVTimeout),

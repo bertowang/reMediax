@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <iterator>
+#include <thread>
 #include <vector>
 
 #include "core/Logger.h"
@@ -142,21 +145,14 @@ int TGCapturer::EnableMicrophoneCapture(bool usingGVoice)
         TG_LOGE("TGCapturer: 当前平台不支持麦克风采集");
         return TGErr_NotSupported;
     }
-#if defined(_WIN32)
-    auto source = std::make_shared<platform::WinAudioCapture>(TypeOfSelfMicphone, false);
-#elif defined(__ANDROID__)
-    auto source = std::make_shared<platform::AndroidAudioCapture>(TypeOfSelfMicphone, false);
-#elif TG_OS_IOS
-    auto source = std::make_shared<platform::IOSAudioCapture>(TypeOfSelfMicphone);
-#endif
-
-#if TG_HAS_NATIVE_CAPTURE
-    m_ownedAudioSources.push_back(source);
-    return AddAudioSource(source.get());
-#else
-    TG_LOGW("TGCapturer: 当前平台无麦克风采集实现（外部注入请用 PushExternalAudioFrame）");
-    return TGErr_NotSupported;
-#endif
+    auto source = CreateNativeAudioSource(AudioSourceKind::Microphone);
+    if (!source) {
+        TG_LOGW("TGCapturer: 当前平台无麦克风采集实现（外部注入请用 PushExternalAudioFrame）");
+        return TGErr_NotSupported;
+    }
+    std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+    WaitStopSettled(lock);
+    return AddNativeAudioSourceLocked(source.get(), source, "", 1.0f, nullptr);
 }
 
 int TGCapturer::EnableSpeakerCapture()
@@ -165,26 +161,47 @@ int TGCapturer::EnableSpeakerCapture()
         TG_LOGE("TGCapturer: 当前平台不支持扬声器/系统内录");
         return TGErr_NotSupported;
     }
-#if defined(_WIN32)
-    auto source = std::make_shared<platform::WinAudioCapture>(TypeOfSpeaker, true);  // WASAPI loopback
-#elif defined(__ANDROID__)
-    auto source = std::make_shared<platform::AndroidAudioCapture>(TypeOfSpeaker, true);  // AudioPlaybackCapture
-    // AudioPlaybackCapture 与屏幕采集共用同一个 MediaProjection；不传的话 Open 直接返回 -1，
-    // 表现为"内录开了但没声音"。因此宿主须先 SetPrivateData("android.MediaProjection") 再调本接口
-    if (!m_mediaProjection) {
-        TG_LOGW("TGCapturer: 系统内录需要先 SetPrivateData(\"android.MediaProjection\")，否则打开会失败");
+    auto source = CreateNativeAudioSource(AudioSourceKind::Speaker);
+    if (!source) {
+        // iOS 没有系统内录：需宿主 App 加 Broadcast Upload Extension 后走 PushExternalAudioFrame
+        TG_LOGW("TGCapturer: 当前平台无扬声器/系统内录实现");
+        return TGErr_NotSupported;
     }
-    source->SetProjection(static_cast<jobject>(m_mediaProjection));
-#endif
+    std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+    WaitStopSettled(lock);
+    return AddNativeAudioSourceLocked(source.get(), source, "", 1.0f, nullptr);
+}
 
-#if defined(_WIN32) || defined(__ANDROID__)
-    m_ownedAudioSources.push_back(source);
-    return AddAudioSource(source.get());
-#else
-    // iOS 没有系统内录：需宿主 App 加 Broadcast Upload Extension 后走 PushExternalAudioFrame
-    TG_LOGW("TGCapturer: 当前平台无扬声器/系统内录实现");
-    return TGErr_NotSupported;
+std::shared_ptr<capture::AudioSourceBase> TGCapturer::CreateNativeAudioSource(AudioSourceKind kind)
+{
+#if defined(_WIN32)
+    if (kind == AudioSourceKind::Microphone) {
+        return std::make_shared<platform::WinAudioCapture>(TypeOfSelfMicphone, false);
+    }
+    if (kind == AudioSourceKind::Speaker) {
+        return std::make_shared<platform::WinAudioCapture>(TypeOfSpeaker, true);   // WASAPI loopback
+    }
+#elif defined(__ANDROID__)
+    if (kind == AudioSourceKind::Microphone) {
+        return std::make_shared<platform::AndroidAudioCapture>(TypeOfSelfMicphone, false);
+    }
+    if (kind == AudioSourceKind::Speaker) {
+        auto source = std::make_shared<platform::AndroidAudioCapture>(TypeOfSpeaker, true);   // AudioPlaybackCapture
+        // AudioPlaybackCapture 与屏幕采集共用同一个 MediaProjection；不传的话 Open 直接返回 -1，
+        // 表现为"内录开了但没声音"。因此宿主须先 SetPrivateData("android.MediaProjection")
+        if (!m_mediaProjection) {
+            TG_LOGW("TGCapturer: 系统内录需要先 SetPrivateData(\"android.MediaProjection\")，否则打开会失败");
+        }
+        source->SetProjection(static_cast<jobject>(m_mediaProjection));
+        return source;
+    }
+#elif TG_OS_IOS
+    if (kind == AudioSourceKind::Microphone) {
+        return std::make_shared<platform::IOSAudioCapture>(TypeOfSelfMicphone);
+    }
 #endif
+    (void)kind;
+    return nullptr;
 }
 
 IVideoSource* TGCapturer::CreateScreenCapture(int index, VideoCapMode mode, VideoScaleStrategy strategy)
@@ -253,27 +270,105 @@ int TGCapturer::AddAudioSource(IAudioSource* source)
         TG_LOGE("TGCapturer: AddAudioSource 的对象不是本 SDK 创建的音频源");
         return TGErr_InvalidArgument;
     }
+    std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+    WaitStopSettled(lock);
+    return AddNativeAudioSourceLocked(base, nullptr, "", 1.0f, nullptr);
+}
+
+int TGCapturer::AddNativeAudioSourceLocked(capture::AudioSourceBase* base,
+                                           std::shared_ptr<capture::AudioSourceBase> owned,
+                                           const std::string& id, float volume, std::string* outId)
+{
     if (std::find(m_audioSources.begin(), m_audioSources.end(), base) != m_audioSources.end()) {
         return 0;   // 已添加
     }
     // 每路源一个 asrc.* 节点，接到混音器的空闲端口（端口号 = 混流通道号，由总线分配）
     const AudioCapSourceType type = base->GetAudioCapSourceType();
-    const std::string name = UniqueAudioNodeName(type == TypeOfSelfMicphone ? "asrc.mic"
-                                                 : type == TypeOfSpeaker    ? "asrc.speaker"
-                                                                            : "asrc.src");
+    const std::string name = !id.empty() ? "asrc." + id
+                                         : UniqueAudioNodeName(type == TypeOfSelfMicphone ? "asrc.mic"
+                                                               : type == TypeOfSpeaker    ? "asrc.speaker"
+                                                                                          : "asrc.src");
     auto node = std::make_shared<nodes::AudioSourceNode>(name, base);
-    if (!m_bus.Begin().Register(name, node).Link(name, 0, "audio_mixer", core::kAnyPort).Commit()) {
+    if (const int ret = AttachAudioNodeLocked(node, volume); ret != TGErr_OK) {
         node->Detach();
-        TG_LOGE("TGCapturer: 音频源 %s 接入总线失败", name.c_str());
-        return TGErr_Internal;
+        return ret;
+    }
+    {
+        std::lock_guard<std::mutex> guard(m_externalAudioMutex);
+        m_audioSourceNodes.push_back(node);
+    }
+    if (owned) {
+        m_ownedAudioSources.push_back(std::move(owned));
     }
     m_audioSources.push_back(base);
-    m_audioSourceNodes.push_back(std::move(node));
     if (!m_audioSource) {
         m_audioSource = base;
     }
-    TG_LOGI("TGCapturer: 音频源 +1 %s（当前 %zu 路）", name.c_str(), m_audioSources.size());
+    if (outId) {
+        *outId = AudioIdOf(name);
+    }
+    TG_LOGI("TGCapturer: 音频源 +1 %s（当前原生 %zu 路）", name.c_str(), m_audioSources.size());
     return 0;
+}
+
+int TGCapturer::AttachAudioNodeLocked(const std::shared_ptr<nodes::AudioSourceNode>& node, float volume)
+{
+    const State st = m_state.load();
+    // 已 Prepare（编码参数已定）：接入后立即按编码格式打开；推流中再立即开始采集
+    const bool configured = st == State::Prepared || st == State::Starting || st == State::Running;
+    if (configured && !m_audioEnabled) {
+        TG_LOGE("TGCapturer: 本轮未启用音频（AudioEncoderParams.enabled=false），不能增加音频源");
+        return TGErr_InvalidState;
+    }
+    const std::string& name = node->Name();
+    if (!m_bus.Begin().Register(name, node).Link(name, 0, "audio_mixer", core::kAnyPort).Commit()) {
+        TG_LOGE("TGCapturer: 音频源 %s 接入总线失败", name.c_str());
+        return TGErr_Internal;
+    }
+    if (auto port = m_audioMixer->PortOf(name)) {
+        m_audioMixer->SetInputGain(*port, volume);
+    }
+    if (configured) {
+        node->SetEnabled(true);
+        node->SetOpenFormat(m_audioParams.sampleRate, m_audioParams.channels);
+        node->Configure();
+        if (st == State::Running && !node->StartNode()) {
+            TG_LOGW("TGCapturer: 音频源 %s 启动失败，该路按静音处理", name.c_str());
+        }
+    }
+    return TGErr_OK;
+}
+
+void TGCapturer::DetachAudioNodeLocked(const std::shared_ptr<nodes::AudioSourceNode>& node)
+{
+    const std::string name = node->Name();
+    // 推流中：先用该路接下来的 20ms 数据淡出（最多等 150ms：源已断流时没有数据可淡出）
+    if (auto port = m_audioMixer->PortOf(name); port && m_audioMixer->IsMixing()) {
+        m_audioMixer->FadeOutInput(*port);
+        const int64_t deadline = core::MonotonicClock::NowUs() + 150000;
+        while (!m_audioMixer->InputFaded(*port) && core::MonotonicClock::NowUs() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    // 关闸 + 停采集（等在飞回调）→ 关设备 → 解除回调绑定 → 摘下总线（混音器随之移除通道）
+    node->StopNode();
+    node->CloseNode();
+    node->Detach();
+    m_bus.Unregister(name);
+}
+
+std::string TGCapturer::AudioIdOf(const std::string& nodeName)
+{
+    static const std::string kPrefix = "asrc.";
+    return nodeName.compare(0, kPrefix.size(), kPrefix) == 0 ? nodeName.substr(kPrefix.size()) : nodeName;
+}
+
+std::shared_ptr<nodes::AudioSourceNode> TGCapturer::FindAudioNode(const std::string& id) const
+{
+    if (id.empty()) {
+        return nullptr;
+    }
+    return std::dynamic_pointer_cast<nodes::AudioSourceNode>(m_bus.Get("asrc." + id));
 }
 
 std::string TGCapturer::UniqueAudioNodeName(const std::string& base) const
@@ -707,6 +802,12 @@ int TGCapturer::PrepareLocked(PrepareError& err)
         node->SetEnabled(m_audioEnabled);
         node->SetOpenFormat(m_audioParams.sampleRate, m_audioParams.channels);
     }
+    {
+        std::lock_guard<std::mutex> lock(m_externalAudioMutex);
+        for (const auto& [_, node] : m_namedExternalAudio) {
+            node->SetEnabled(m_audioEnabled);
+        }
+    }
     m_audioMixer->SetEnabled(m_audioEnabled);
     if (m_audioEnabled) {
         for (const auto& node : m_audioSourceNodes) {
@@ -1093,11 +1194,19 @@ void TGCapturer::ReleaseAll()
     // 那个线程还在 PublishSync 里回调宿主
     WaitStopSettled(lock);
     // 先把音频源节点从总线上摘下并解除与源的回调绑定，再释放源（源可能比节点先销毁）
-    for (const auto& node : m_audioSourceNodes) {
+    std::vector<std::shared_ptr<nodes::AudioSourceNode>> audioNodes;
+    {
+        std::lock_guard<std::mutex> guard(m_externalAudioMutex);
+        audioNodes.swap(m_audioSourceNodes);
+        for (auto& [_, node] : m_namedExternalAudio) {
+            audioNodes.push_back(node);
+        }
+        m_namedExternalAudio.clear();
+    }
+    for (const auto& node : audioNodes) {
         node->Detach();
         m_bus.Unregister(node->Name());
     }
-    m_audioSourceNodes.clear();
     RemoveExternalAudioNodes();
     // 视频源同理：先解除 vsrc.main 与源的回调绑定，再释放源
     BindVideoSourceLocked(nullptr);
@@ -1149,6 +1258,29 @@ void TGCapturer::OnAudioFrame(AudioCapSourceType type, core::FramePtr frame)
 }
 
 // ------------------------------------------------------------------ 外部注入
+namespace
+{
+// 外部 PCM（交错 S16）→ 帧。ptsUs：调用方自带的采集时间戳。既写进 frame->ptsUs（供 Encoder 用），
+// 也写进 frame->captureUs（供 Mixer 的漂移测量）。只写 ptsUs 的话 Mixer 会走墙钟兜底，
+// 调用方 PTS 实际被丢弃（抖动 / 回退 / 跳变全被内核无感吸收，故障完全不可观测）
+core::FramePtr MakePcmFrame(const uint8_t* data, int size, int sampleRate, int channels, int64_t ptsUs)
+{
+    auto frame = std::make_shared<core::Frame>();
+    frame->kind = core::MediaKind::Audio;
+    frame->sampleRate = sampleRate;
+    frame->channels = channels;
+    frame->sampleFmt = AV_SAMPLE_FMT_S16;
+    frame->audioBytes = static_cast<size_t>(size);
+    frame->audioData =
+        std::shared_ptr<uint8_t>(new uint8_t[static_cast<size_t>(size)], std::default_delete<uint8_t[]>());
+    memcpy(frame->audioData.get(), data, static_cast<size_t>(size));
+    const int64_t effectivePts = ptsUs >= 0 ? ptsUs : core::MonotonicClock::NowUs();
+    frame->ptsUs = effectivePts;
+    frame->captureUs = effectivePts;
+    return frame;
+}
+}  // namespace
+
 int TGCapturer::PushExternalVideoFrame(const uint8_t* data, int width, int height, int stride,
                                        int64_t ptsUs, void* pixelBuffer)
 {
@@ -1224,23 +1356,211 @@ int TGCapturer::PushExternalAudioFrame(AudioCapSourceType type, const uint8_t* d
         // 原先这些参数错误与"未 Start"共用 -1，宿主无法区分是时序问题还是参数问题
         return TGErr_InvalidArgument;
     }
-    auto frame = std::make_shared<core::Frame>();
-    frame->kind = core::MediaKind::Audio;
-    frame->sampleRate = sampleRate;
-    frame->channels = channels;
-    frame->sampleFmt = AV_SAMPLE_FMT_S16;
-    frame->audioBytes = static_cast<size_t>(size);
-    frame->audioData = std::shared_ptr<uint8_t>(new uint8_t[static_cast<size_t>(size)], std::default_delete<uint8_t[]>());
-    memcpy(frame->audioData.get(), data, static_cast<size_t>(size));
-    // ptsUs：调用方自带的采集时间戳。既写进 frame->ptsUs（供 Encoder 用），
-    // 也写进 frame->captureUs（供 Mixer 的 ChannelClock 做 drift 校正）。
-    // 之前只写了 ptsUs，没写 captureUs → Mixer 走兜底用 wallclock，调用方 PTS 实际被丢弃
-    // （PTS 抖动 / 回退 / 跳变全被内核无感吸收，故障完全不可观测）。
-    // 对齐 PushExternalVideoFrame 的 captureUs 处理，让两条外灌通路语义一致。
-    const int64_t effectivePts = ptsUs >= 0 ? ptsUs : core::MonotonicClock::NowUs();
-    frame->ptsUs = effectivePts;
-    frame->captureUs = effectivePts;
-    OnAudioFrame(type, std::move(frame));
+    OnAudioFrame(type, MakePcmFrame(data, size, sampleRate, channels, ptsUs));
+    return TGErr_OK;
+}
+
+// ------------------------------------------------------------------ 运行期音频源
+namespace
+{
+bool IsValidAudioId(const std::string& id)
+{
+    if (id.empty() || id.size() > 64 || id == "master") {
+        return false;
+    }
+    for (char c : id) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' ||
+                        c == '_' || c == '-';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+float ToDb(float linear)
+{
+    return linear > 1e-5f ? 20.0f * std::log10(linear) : -100.0f;
+}
+}  // namespace
+
+int TGCapturer::AddAudioSource(const AudioSourceDesc& desc, std::string* outId)
+{
+    if (!(desc.volume >= 0.0f && desc.volume <= 4.0f)) {
+        return TGErr_InvalidArgument;
+    }
+    if (!desc.id.empty() && !IsValidAudioId(desc.id)) {
+        TG_LOGE("TGCapturer: 音频源 id 非法：%s（只允许字母数字 . _ -，且不能是 master）", desc.id.c_str());
+        return TGErr_InvalidArgument;
+    }
+    if (desc.kind == AudioSourceKind::File && desc.filePath.empty()) {
+        return TGErr_InvalidArgument;
+    }
+
+    std::string id;
+    int port = -1;
+    {
+        std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+        WaitStopSettled(lock);
+        if (!desc.id.empty() && m_bus.Get("asrc." + desc.id)) {
+            TG_LOGE("TGCapturer: 音频源 id 重复：%s", desc.id.c_str());
+            return TGErr_InvalidArgument;
+        }
+        int ret = TGErr_OK;
+        switch (desc.kind) {
+            case AudioSourceKind::Microphone:
+            case AudioSourceKind::Speaker: {
+                const bool mic = desc.kind == AudioSourceKind::Microphone;
+                auto source = IsSupported(mic ? CaptureFeature::Microphone : CaptureFeature::Speaker)
+                                  ? CreateNativeAudioSource(desc.kind)
+                                  : nullptr;
+                if (!source) {
+                    TG_LOGE("TGCapturer: 当前平台不支持%s采集", mic ? "麦克风" : "系统内录");
+                    return TGErr_NotSupported;
+                }
+                const std::string want = !desc.id.empty() ? desc.id
+                                                          : AudioIdOf(UniqueAudioNodeName(mic ? "asrc.mic" : "asrc.speaker"));
+                ret = AddNativeAudioSourceLocked(source.get(), source, want, desc.volume, &id);
+                break;
+            }
+            case AudioSourceKind::External: {
+                id = !desc.id.empty() ? desc.id : AudioIdOf(UniqueAudioNodeName("asrc.pcm"));
+                auto node = std::make_shared<nodes::AudioSourceNode>("asrc." + id, TypeOfGameAudio4Slave);
+                ret = AttachAudioNodeLocked(node, desc.volume);
+                if (ret == TGErr_OK) {
+                    std::lock_guard<std::mutex> guard(m_externalAudioMutex);
+                    m_namedExternalAudio[id] = node;
+                }
+                break;
+            }
+            case AudioSourceKind::File:
+                TG_LOGE("TGCapturer: 文件音频源尚未实现");
+                return TGErr_NotSupported;
+        }
+        if (ret != TGErr_OK) {
+            return ret;
+        }
+        if (auto p = m_audioMixer->PortOf("asrc." + id)) {
+            port = static_cast<int>(*p);
+        }
+        TG_LOGI("TGCapturer: 增加音频源 id=%s kind=%d volume=%.2f port=%d state=%d", id.c_str(),
+                static_cast<int>(desc.kind), desc.volume, port, static_cast<int>(m_state.load()));
+    }
+    if (outId) {
+        *outId = id;
+    }
+    FireNotify(EsCap_Notify_AudioSource_Added, id, port);
+    return TGErr_OK;
+}
+
+int TGCapturer::RemoveAudioSource(const std::string& id)
+{
+    int port = -1;
+    {
+        std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+        WaitStopSettled(lock);
+        auto node = FindAudioNode(id);
+        if (!node) {
+            return TGErr_InvalidArgument;
+        }
+        if (auto p = m_audioMixer->PortOf(node->Name())) {
+            port = static_cast<int>(*p);
+        }
+        // 先从各表摘掉（推帧线程不再找得到它），再停
+        {
+            std::lock_guard<std::mutex> guard(m_externalAudioMutex);
+            m_audioSourceNodes.erase(std::remove(m_audioSourceNodes.begin(), m_audioSourceNodes.end(), node),
+                                     m_audioSourceNodes.end());
+            m_namedExternalAudio.erase(id);
+            for (auto it = m_externalAudioNodes.begin(); it != m_externalAudioNodes.end();) {
+                it = it->second == node ? m_externalAudioNodes.erase(it) : std::next(it);
+            }
+        }
+        DetachAudioNodeLocked(node);
+        if (auto* src = node->Source()) {
+            m_audioSources.erase(std::remove(m_audioSources.begin(), m_audioSources.end(), src), m_audioSources.end());
+            if (m_audioSource == src) {
+                m_audioSource = m_audioSources.empty() ? nullptr : m_audioSources.front();
+            }
+            m_ownedAudioSources.erase(
+                std::remove_if(m_ownedAudioSources.begin(), m_ownedAudioSources.end(),
+                               [src](const std::shared_ptr<capture::AudioSourceBase>& p) { return p.get() == src; }),
+                m_ownedAudioSources.end());
+        }
+        TG_LOGI("TGCapturer: 移除音频源 id=%s port=%d", id.c_str(), port);
+    }
+    FireNotify(EsCap_Notify_AudioSource_Removed, id, port);
+    return TGErr_OK;
+}
+
+int TGCapturer::SetAudioSourceVolume(const std::string& id, float volume)
+{
+    if (!(volume >= 0.0f && volume <= 4.0f)) {
+        return TGErr_InvalidArgument;
+    }
+    auto node = FindAudioNode(id);
+    if (!node) {
+        return TGErr_InvalidArgument;
+    }
+    auto port = m_audioMixer->PortOf(node->Name());
+    if (!port) {
+        return TGErr_InvalidArgument;
+    }
+    m_audioMixer->SetInputGain(*port, volume);
+    return TGErr_OK;
+}
+
+int TGCapturer::GetAudioLevels(std::vector<AudioSourceLevel>& levels)
+{
+    levels.clear();
+    std::vector<std::string> names;
+    {
+        std::lock_guard<std::mutex> guard(m_externalAudioMutex);
+        for (const auto& node : m_audioSourceNodes) {
+            names.push_back(node->Name());
+        }
+        for (const auto& [_, node] : m_externalAudioNodes) {
+            names.push_back(node->Name());
+        }
+        for (const auto& [_, node] : m_namedExternalAudio) {
+            names.push_back(node->Name());
+        }
+    }
+    std::sort(names.begin(), names.end());
+    for (const auto& name : names) {
+        AudioSourceLevel level;
+        level.id = AudioIdOf(name);
+        if (auto port = m_audioMixer->PortOf(name)) {
+            const auto l = m_audioMixer->InputLevel(*port);
+            level.peakDb = ToDb(l.peak);
+            level.rmsDb = ToDb(l.rms);
+        }
+        levels.push_back(std::move(level));
+    }
+    const auto master = m_audioMixer->MasterLevel();
+    levels.push_back(AudioSourceLevel{"master", ToDb(master.peak), ToDb(master.rms)});
+    return TGErr_OK;
+}
+
+int TGCapturer::PushAudioSourceFrame(const std::string& id, const uint8_t* data, int size, int sampleRate,
+                                     int channels, int64_t ptsUs)
+{
+    if (!data || size <= 0 || sampleRate <= 0 || channels <= 0) {
+        return TGErr_InvalidArgument;
+    }
+    std::shared_ptr<nodes::AudioSourceNode> node;
+    {
+        std::lock_guard<std::mutex> guard(m_externalAudioMutex);
+        auto it = m_namedExternalAudio.find(id);
+        if (it == m_namedExternalAudio.end()) {
+            return TGErr_InvalidArgument;
+        }
+        node = it->second;
+    }
+    if (m_state.load() != State::Running || !m_audioEnabled) {
+        return TGErr_InvalidState;
+    }
+    node->Push(MakePcmFrame(data, size, sampleRate, channels, ptsUs));
     return TGErr_OK;
 }
 

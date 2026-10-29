@@ -53,6 +53,15 @@ public final class TGCapturer {
     // NotifyMsgType（TGCaptureListener.onNotify 的 type，完整列表见 TGCapturerInterface.h）
     /** 编码器回落：content = "video:h264_mediacodec->libopenh264"，data = 0 视频 / 1 音频 */
     public static final int NOTIFY_ENCODER_FALLBACK = 40;
+    /** 运行期音频源增删：content = 音频源 id，data = 混流通道号 */
+    public static final int NOTIFY_AUDIO_SOURCE_ADDED = 41;
+    public static final int NOTIFY_AUDIO_SOURCE_REMOVED = 42;
+
+    // AudioSourceKind（addAudioSource）
+    public static final int AUDIO_SOURCE_MICROPHONE = 0;
+    public static final int AUDIO_SOURCE_SPEAKER = 1;
+    public static final int AUDIO_SOURCE_EXTERNAL = 2;
+    public static final int AUDIO_SOURCE_FILE = 3;
 
     // AudioCapSourceType（外部注入音频用）
     public static final int AUDIO_GAME = 0;
@@ -238,6 +247,43 @@ public final class TGCapturer {
         return nativePushAudioFrame(handle(), type, data, bytes, sampleRate, channels, ptsUs);
     }
 
+    // ------------------------------------------------------------------ 运行期音频源
+    /**
+     * 增加一路音频源（任意状态；推流中立即生效，淡入 20ms）。
+     *
+     * @param kind   AUDIO_SOURCE_*
+     * @param id     唯一标识（字母数字 . _ -），null = 内核生成（mic / speaker / pcm / file …）
+     * @param volume 线性增益 0 ~ 4
+     * @return 实际 id；失败返回 null（原因见 logcat）
+     */
+    public String addAudioSource(int kind, String id, float volume) {
+        return nativeAddAudioSource(handle(), kind, id, volume, null, true);
+    }
+
+    /** 文件音轨（mp4 / mov / flv / ts，AAC）。 */
+    public String addFileAudioSource(String id, String filePath, boolean loop, float volume) {
+        return nativeAddAudioSource(handle(), AUDIO_SOURCE_FILE, id, volume, filePath, loop);
+    }
+
+    /** 移除（推流中先淡出 20ms）。旧接口建的源 id：mic / speaker / ext.&lt;type&gt;。 */
+    public int removeAudioSource(String id) {
+        return nativeRemoveAudioSource(handle(), id);
+    }
+
+    public int setAudioSourceVolume(String id, float volume) {
+        return nativeSetAudioSourceVolume(handle(), id, volume);
+    }
+
+    /** 各路电平 JSON：[{"id":"mic","peak":-12.3,"rms":-20.1}, …, {"id":"master",…}]，单位 dBFS（-100 = 静音）。 */
+    public String getAudioLevels() {
+        return nativeGetAudioLevels(handle());
+    }
+
+    /** External 类音频源推交错 S16 PCM（data 必须是 DirectByteBuffer）。 */
+    public int pushAudioSourceFrame(String id, ByteBuffer data, int bytes, int sampleRate, int channels, long ptsUs) {
+        return nativePushAudioSourceFrame(handle(), id, data, bytes, sampleRate, channels, ptsUs);
+    }
+
     private long handle() {
         if (mHandle == 0) {
             throw new IllegalStateException("TGCapturer 已 release");
@@ -267,6 +313,18 @@ public final class TGCapturer {
     private static native void nativeSetPreviewSurface(long handle, Surface surface);
 
     private static native int nativeStartPreview(long handle);
+
+    private static native String nativeAddAudioSource(long handle, int kind, String id, float volume, String filePath,
+                                                      boolean loop);
+
+    private static native int nativeRemoveAudioSource(long handle, String id);
+
+    private static native int nativeSetAudioSourceVolume(long handle, String id, float volume);
+
+    private static native String nativeGetAudioLevels(long handle);
+
+    private static native int nativePushAudioSourceFrame(long handle, String id, ByteBuffer data, int bytes,
+                                                         int sampleRate, int channels, long ptsUs);
 
     private static native void nativeStopPreview(long handle);
 

@@ -84,6 +84,13 @@ public:
     int PushExternalAudioFrame(AudioCapSourceType type, const uint8_t* data, int size,
                                int sampleRate, int channels, int64_t ptsUs) override;
 
+    int AddAudioSource(const AudioSourceDesc& desc, std::string* outId = nullptr) override;
+    int RemoveAudioSource(const std::string& id) override;
+    int SetAudioSourceVolume(const std::string& id, float volume) override;
+    int GetAudioLevels(std::vector<AudioSourceLevel>& levels) override;
+    int PushAudioSourceFrame(const std::string& id, const uint8_t* data, int size, int sampleRate,
+                             int channels, int64_t ptsUs) override;
+
 private:
     enum class State
     {
@@ -138,6 +145,19 @@ private:
     std::string UniqueAudioNodeName(const std::string& base) const;
     // 拆掉外部注入音频的 asrc.ext.* 节点（Prepare 前 / 停止后），下一轮按首帧重新建
     void RemoveExternalAudioNodes();
+    // 创建本平台的原生音频采集源（麦克风 / 系统内录）。不支持返回 nullptr
+    std::shared_ptr<capture::AudioSourceBase> CreateNativeAudioSource(AudioSourceKind kind);
+    // 原生源（宿主传入 / 本对象创建）接入：一个 asrc.<id> 节点。id 为空按类型命名（mic / speaker / src）
+    int AddNativeAudioSourceLocked(capture::AudioSourceBase* base, std::shared_ptr<capture::AudioSourceBase> owned,
+                                   const std::string& id, float volume, std::string* outId);
+    // 把一路音频源节点接入混音器（任意状态）：已 Prepare 则立即打开，推流中则立即开始采集。
+    // 持 m_lifecycleMutex 调用
+    int AttachAudioNodeLocked(const std::shared_ptr<nodes::AudioSourceNode>& node, float volume);
+    // 运行期移除：淡出 → 停采集 → 关设备 → 摘下总线。持 m_lifecycleMutex 调用
+    void DetachAudioNodeLocked(const std::shared_ptr<nodes::AudioSourceNode>& node);
+    // 按 id 找音频源节点（节点名 = "asrc." + id）
+    std::shared_ptr<nodes::AudioSourceNode> FindAudioNode(const std::string& id) const;
+    static std::string AudioIdOf(const std::string& nodeName);
     // 混音线程每 10s 回调：打印同步 / 混流 / 总线累计状态
     void LogHeartbeat();
 
@@ -239,7 +259,10 @@ private:
     // 外部多路（如游戏音频 + 游戏麦克风）也必须各占一路，否则会被串成一条时间轴，
     // 结果不是"混音"而是"交替输出"。
     std::unordered_map<int, std::shared_ptr<nodes::AudioSourceNode>> m_externalAudioNodes;
-    std::mutex m_externalAudioMutex;
+    // AddAudioSource(External) 建的具名外部源：id -> 节点。跨轮次保留，直到 RemoveAudioSource / 销毁
+    std::unordered_map<std::string, std::shared_ptr<nodes::AudioSourceNode>> m_namedExternalAudio;
+    // 保护两张外部源表与 m_audioSourceNodes 的增删（读电平的宿主线程只拿这把锁，不碰生命周期锁）
+    mutable std::mutex m_externalAudioMutex;
     // 断流阈值（SetAVTimeout 可改）与看护状态
     std::atomic<int64_t> m_audioTimeoutMs{3000};
     std::atomic<int64_t> m_videoTimeoutMs{3000};

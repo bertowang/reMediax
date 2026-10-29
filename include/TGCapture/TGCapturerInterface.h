@@ -61,6 +61,9 @@ enum NotifyMsgType
     // content = "video:h264_mediacodec->libopenh264" 或 "audio:aac_at->aac"；data = 0 视频 / 1 音频。
     // 想提前知道哪些编码器可用，用 ITGCapturerMgr::IsEncoderAvailable / GetAvailableEncoders。
     EsCap_Notify_Encoder_Fallback = 40,
+    // 运行期音频源增删（AddAudioSource / RemoveAudioSource 成功后发出）：content = 音频源 id，data = 混流通道号
+    EsCap_Notify_AudioSource_Added = 41,
+    EsCap_Notify_AudioSource_Removed = 42,
 };
 
 // ------------------------------------------------------------------ 错误码
@@ -325,6 +328,31 @@ struct WatermarkParams
     int32_t offset_x = 0;
     int32_t offset_y = 0;
     std::string url;
+};
+
+// ------------------------------------------------------------------ 运行期音频源
+enum class AudioSourceKind : int32_t
+{
+    Microphone = 0,   // 系统麦克风（WASAPI / AudioRecord / AVAudioSession）
+    Speaker = 1,      // 系统内录（Windows WASAPI loopback / Android AudioPlaybackCapture，需 MediaProjection）
+    External = 2,     // 宿主推 PCM（PushAudioSourceFrame）
+    File = 3,         // 本地媒体文件的音轨（mp4 / mov / flv / ts，AAC），可循环
+};
+
+struct AudioSourceDesc
+{
+    AudioSourceKind kind = AudioSourceKind::External;
+    std::string id;             // 唯一标识（字母数字 . _ -）；空 = 内核生成：mic / speaker / ext.N / file.N
+    float volume = 1.0f;        // 线性增益 0 ~ 4
+    std::string filePath;       // File
+    bool loop = true;           // File：播完从头再来
+};
+
+struct AudioSourceLevel
+{
+    std::string id;             // 音频源 id；"master" = 混音输出
+    float peakDb = -100.0f;     // dBFS，-100 = 静音
+    float rmsDb = -100.0f;
 };
 
 // ------------------------------------------------------------------ 预览

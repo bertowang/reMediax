@@ -1,6 +1,7 @@
 ﻿#include "core/AudioMixer.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 extern "C"
@@ -265,8 +266,13 @@ int AudioMixer::AddChannel(int id, int sampleRate, int channels, int64_t nowUs)
     av_channel_layout_uninit(&inLayout);
     av_channel_layout_uninit(&outLayout);
 
-    TG_LOGI("AudioMixer: 通道 +1 id=%d %dHz %dch（输出 %dHz %dch）",
-            id, ch.sampleRate, ch.channels, m_outSampleRate.load(), m_outChannels.load());
+    if (m_outputStarted && m_outSampleRate > 0) {
+        // 运行期接入：淡入，避免直接切入的爆音
+        ch.fadeInTotal = kFadeUs * m_outSampleRate / 1000000LL;
+    }
+    TG_LOGI("AudioMixer: 通道 +1 id=%d %dHz %dch（输出 %dHz %dch）%s",
+            id, ch.sampleRate, ch.channels, m_outSampleRate.load(), m_outChannels.load(),
+            ch.fadeInTotal > 0 ? " 淡入" : "");
     m_channels.push_back(std::move(ch));
     return 0;
 }
@@ -313,6 +319,13 @@ void AudioMixer::ResetChannelRuntime(Channel& ch)
     ch.compensationUs = 0;
     ch.productionDropUs = 0;
     ch.overflowDropUs = 0;
+    ch.fadeInTotal = 0;
+    ch.fadeInPos = 0;
+    ch.removing = false;
+    ch.faded = false;
+    ch.fadeOutTotal = 0;
+    ch.fadeOutPos = 0;
+    ch.level = Level{};
 }
 
 void AudioMixer::Reset()
@@ -331,6 +344,7 @@ void AudioMixer::Reset()
     m_lagWinStartWallUs = 0;
     m_lagWinMinUs = 0;
     m_stats = MixerStats{};
+    m_masterLevel = Level{};
 }
 
 void AudioMixer::ShiftOutputTimeline(int64_t shiftUs)
@@ -442,6 +456,98 @@ void AudioMixer::SetChannelGain(int id, float gain)
         ch->gain = gain;
         TG_LOGI("AudioMixer: 通道 %d 增益 %.2f", id, gain);
     }
+}
+
+void AudioMixer::FadeOutChannel(int id, int64_t durUs)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto* ch = Find(id);
+    if (!ch || ch->removing) {
+        return;
+    }
+    ch->removing = true;
+    ch->fadeOutPos = 0;
+    ch->fadeOutTotal = m_outSampleRate > 0 ? std::max<int64_t>(1, durUs * m_outSampleRate / 1000000LL) : 1;
+}
+
+bool AudioMixer::IsChannelFaded(int id) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto* ch = Find(id);
+    return !ch || ch->faded || !m_outputStarted;
+}
+
+AudioMixer::Level AudioMixer::ChannelLevel(int id) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto* ch = Find(id);
+    return ch ? ch->level : Level{};
+}
+
+AudioMixer::Level AudioMixer::MasterLevel() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_masterLevel;
+}
+
+namespace
+{
+// 电平平滑：峰值取"新峰值 / 旧峰值衰减"的较大者（每帧约 -1.4dB 回落），RMS 一阶低通
+void UpdateLevel(AudioMixer::Level& level, float peak, float rms)
+{
+    level.peak = std::max(peak, level.peak * 0.85f);
+    level.rms = level.rms * 0.6f + rms * 0.4f;
+}
+}  // namespace
+
+void AudioMixer::Accumulate(Channel& ch, std::vector<int32_t>& acc, size_t n, size_t frameSamples)
+{
+    const auto oc = static_cast<size_t>(m_outChannels.load());
+    const bool fadingIn = ch.fadeInTotal > 0 && ch.fadeInPos < ch.fadeInTotal;
+    const float g = ch.gain;
+    int32_t peak = 0;
+    double sumSq = 0.0;
+    if (!fadingIn && !ch.removing) {
+        for (size_t i = 0; i < n; ++i) {
+            const int32_t v = g == 1.0f ? ch.pcm[i] : static_cast<int32_t>(ch.pcm[i] * g);
+            acc[i] += v;
+            peak = std::max(peak, v < 0 ? -v : v);
+            sumSq += static_cast<double>(v) * v;
+        }
+    } else {
+        for (size_t i = 0; i < n; ++i) {
+            const auto f = static_cast<int64_t>(i / oc);
+            float r = g;
+            if (fadingIn) {
+                const int64_t p = ch.fadeInPos + f;
+                if (p < ch.fadeInTotal) {
+                    r *= static_cast<float>(p) / static_cast<float>(ch.fadeInTotal);
+                }
+            }
+            if (ch.removing) {
+                const int64_t p = ch.fadeOutPos + f;
+                r *= p < ch.fadeOutTotal ? 1.0f - static_cast<float>(p) / static_cast<float>(ch.fadeOutTotal) : 0.0f;
+            }
+            const auto v = static_cast<int32_t>(ch.pcm[i] * r);
+            acc[i] += v;
+            peak = std::max(peak, v < 0 ? -v : v);
+            sumSq += static_cast<double>(v) * v;
+        }
+        const auto frames = static_cast<int64_t>(n / oc);
+        if (fadingIn) {
+            ch.fadeInPos = std::min(ch.fadeInTotal, ch.fadeInPos + frames);
+        }
+        if (ch.removing) {
+            ch.fadeOutPos += frames;
+            if (ch.fadeOutPos >= ch.fadeOutTotal) {
+                ch.faded = true;
+            }
+        }
+    }
+    // 电平按整帧样本数归一（迟到 / 尾巴不足一帧的部分按静音计）
+    const double denom = static_cast<double>(std::max<size_t>(frameSamples, 1));
+    UpdateLevel(ch.level, static_cast<float>(peak) / 32768.0f,
+                static_cast<float>(std::sqrt(sumSq / denom) / 32768.0));
 }
 
 void AudioMixer::FallbackToWall(Channel& ch, const char* reason, int64_t valueUs)
@@ -605,7 +711,10 @@ void AudioMixer::Push(int id, const int16_t* data, int frames, int64_t captureUs
 bool AudioMixer::Mix(int frameSamples, std::shared_ptr<uint8_t>& outData, int64_t& outPtsUs)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_channels.empty() || m_outChannels <= 0 || m_outSampleRate <= 0 || frameSamples <= 0) {
+    if (m_outChannels <= 0 || m_outSampleRate <= 0 || frameSamples <= 0) {
+        return false;
+    }
+    if (m_channels.empty() && !m_outputStarted) {
         return false;
     }
 
@@ -614,21 +723,32 @@ bool AudioMixer::Mix(int frameSamples, std::shared_ptr<uint8_t>& outData, int64_
     const int64_t frameDurUs = static_cast<int64_t>(frameSamples) * 1000000LL / m_outSampleRate;
 
     // 活跃通道：kChannelIdleUs 内推过数据（从未推过 / 已停推的通道不等待，例如无声时不出包的回环采集）
+    // 淡出完成的通道不再参与（等待移除）
     auto isLive = [&](const Channel& ch) {
-        return ch.active && ch.lastPushWallUs > 0 && nowUs - ch.lastPushWallUs <= kChannelIdleUs;
+        return ch.active && !ch.faded && ch.lastPushWallUs > 0 && nowUs - ch.lastPushWallUs <= kChannelIdleUs;
     };
 
     bool anyReady = false;
     bool allLiveReady = true;
+    bool anyEstablished = false;   // 有"出过声、且不在移除中"的通道
     for (const auto& ch : m_channels) {
+        if (ch.faded) {
+            continue;
+        }
+        if (ch.lastPushWallUs > 0 && !ch.removing) {
+            anyEstablished = true;
+        }
         if (ch.pcm.size() >= need) {
             anyReady = true;
         } else if (isLive(ch)) {
             allLiveReady = false;
         }
     }
-    if (!anyReady) {
-        return false;   // 全部没数据：不产出纯静音包（断流期间时间轴空着，恢复后按墙钟前移）
+    // 无源保持：输出已开始、但没有任何已出过声的通道（全部被移除 / 新加的还没推数据）→ 按墙钟出静音帧，
+    // 输出流不中断。已出过声的通道断流时仍不出帧（断流期间时间轴空着，恢复后按墙钟前移，断流看护据此上报）
+    const bool keepAlive = m_outputStarted && !anyEstablished;
+    if (!anyReady && !keepAlive) {
+        return false;
     }
 
     // ---- 输出时钟 ----
@@ -646,7 +766,10 @@ bool AudioMixer::Mix(int frameSamples, std::shared_ptr<uint8_t>& outData, int64_
             // 来源整体快于墙钟 / 突发灌入：暂停出帧，多出的数据由缓冲上限丢弃
             return false;
         }
-        if (!allLiveReady) {
+        if (!anyReady && lag < 0) {
+            return false;   // 无源保持的静音帧按墙钟节奏出，不超前
+        }
+        if (anyReady && !allLiveReady) {
             // 有活跃通道迟到：等到输出落后墙钟 kMixWaitFrames 帧再出帧（迟到通道本帧静音）。
             // 这样出帧节奏由墙钟兜底：慢路 / 卡顿路不会拖慢时间轴，快路也不能单独把帧数刷上去。
             if (lag < kMixWaitFrames * frameDurUs) {
@@ -685,33 +808,45 @@ bool AudioMixer::Mix(int frameSamples, std::shared_ptr<uint8_t>& outData, int64_
     outData = std::shared_ptr<uint8_t>(new uint8_t[bytes], std::default_delete<uint8_t[]>());
     auto* dst = reinterpret_cast<int16_t*>(outData.get());
 
-    // 先累加（32 位），再饱和到 S16；按通道 gain 加权
+    // 先累加（32 位），再饱和到 S16；按通道 gain 与淡入淡出加权
     std::vector<int32_t> acc(need, 0);
-    auto accumulate = [&acc](const std::deque<int16_t>& pcm, size_t n, float g) {
-        if (g == 1.0f) {
-            for (size_t i = 0; i < n; ++i) acc[i] += pcm[i];
-        } else {
-            for (size_t i = 0; i < n; ++i) acc[i] += static_cast<int32_t>(pcm[i] * g);
-        }
-    };
     for (auto& ch : m_channels) {
-        if (ch.pcm.size() >= need) {
-            accumulate(ch.pcm, need, ch.gain);
+        if (ch.faded) {
+            ch.pcm.clear();   // 淡出完成：后续数据丢弃，等待移除
+            UpdateLevel(ch.level, 0.0f, 0.0f);
+        } else if (ch.pcm.size() >= need) {
+            Accumulate(ch, acc, need, need);
             ch.pcm.erase(ch.pcm.begin(), ch.pcm.begin() + static_cast<long>(need));
         } else if (isLive(ch)) {
             // 活跃但迟到：本帧按静音处理，已有的残余数据保留到下一帧（不丢样本、不在帧中间插静音）
             ++ch.underrun;
+            UpdateLevel(ch.level, 0.0f, 0.0f);
         } else if (!ch.pcm.empty()) {
             // 已停推通道的尾巴：混进本帧后清空（否则恢复推流时会把陈旧数据拼到新数据前面）
             const size_t avail = ch.pcm.size() - (ch.pcm.size() % static_cast<size_t>(m_outChannels));
-            accumulate(ch.pcm, avail, ch.gain);
+            Accumulate(ch, acc, avail, need);
             ch.pcm.clear();
+            if (ch.removing) {
+                ch.faded = true;   // 移除中且已没有后续数据：尾巴就是最后的声音
+            }
+        } else {
+            if (ch.removing) {
+                ch.faded = true;
+            }
+            UpdateLevel(ch.level, 0.0f, 0.0f);
         }
     }
 
+    int32_t masterPeak = 0;
+    double masterSq = 0.0;
     for (size_t i = 0; i < need; ++i) {
-        dst[i] = static_cast<int16_t>(std::clamp<int32_t>(acc[i], -32768, 32767));
+        const int32_t v = std::clamp<int32_t>(acc[i], -32768, 32767);
+        dst[i] = static_cast<int16_t>(v);
+        masterPeak = std::max(masterPeak, v < 0 ? -v : v);
+        masterSq += static_cast<double>(v) * v;
     }
+    UpdateLevel(m_masterLevel, static_cast<float>(masterPeak) / 32768.0f,
+                static_cast<float>(std::sqrt(masterSq / static_cast<double>(need)) / 32768.0));
 
     // 输出 PTS：按输出样本数线性累加（PTS 与内容严格一致）
     if (!m_outputStarted) {

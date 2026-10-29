@@ -32,6 +32,14 @@
 //   保证视频（由音频时钟反推）不会因为音频断流而整体滞后。
 //
 // AudioChannelClock 的 PI/BURST 结果保留为诊断统计（drift/jump），不再写入输出 PTS。
+//
+// 运行期增删通道（输出流不中断）：
+//   - 输出开始后新加的通道自动淡入 kFadeUs（20ms），避免"啪"的一声切入
+//   - 移除前先 FadeOutChannel：用该路接下来的 20ms 数据淡出到 0，IsChannelFaded 为真后再 RemoveChannel
+//   - 输出开始后若没有任何"已出过声"的通道（全部移除 / 新加的还没推数据），按墙钟输出静音帧，
+//     音频时间轴（以及由它反推的视频 PTS）照常推进。已推过数据的通道断流仍按原逻辑不出帧（断流看护据此上报）
+//
+// 电平：每次出帧时按各路实际混入的样本（含增益与淡入淡出）统计峰值 / RMS，峰值带衰减保持。
 #ifndef TGCAPTURE_CORE_AUDIO_MIXER_H
 #define TGCAPTURE_CORE_AUDIO_MIXER_H
 
@@ -151,6 +159,22 @@ public:
     // 运行期通道增益（线性，0.0 ~ 4.0；clamp 由 Mixer 内部完成，不停流不重建管线）
     void SetChannelGain(int id, float gain);
 
+    // 淡入淡出时长
+    static constexpr int64_t kFadeUs = 20000;
+    // 开始淡出（之后该路的数据在 durUs 内线性衰减到 0，此后不再混入）
+    void FadeOutChannel(int id, int64_t durUs = kFadeUs);
+    // 淡出完成（或该路已不存在 / 输出尚未开始）
+    [[nodiscard]] bool IsChannelFaded(int id) const;
+
+    // 电平（线性，0 ~ 1，相对 S16 满幅）
+    struct Level
+    {
+        float peak = 0.0f;
+        float rms = 0.0f;
+    };
+    [[nodiscard]] Level ChannelLevel(int id) const;
+    [[nodiscard]] Level MasterLevel() const;
+
 private:
     struct Channel
     {
@@ -164,6 +188,15 @@ private:
         uint64_t underrun = 0;        // 活跃但迟到的次数
         float gain = 1.0f;            // 运行期增益（SetChannelGain）
         int64_t lastPushWallUs = 0;   // 最近一次 Push 的墙钟（判定通道是否活跃）
+
+        // 淡入 / 淡出（单位：输出样本帧）。淡出开始后 removing=true，淡完 faded=true（不再混入）
+        int64_t fadeInTotal = 0;
+        int64_t fadeInPos = 0;
+        bool removing = false;
+        bool faded = false;
+        int64_t fadeOutTotal = 0;
+        int64_t fadeOutPos = 0;
+        Level level{};
 
         // 漂移测量：offset_i = (ts_i - ts_origin) - 已推样本时长_i，按 5s 窗口取平均，
         // 相邻窗口平均值之差即本窗口的速率漂移（抖动被平均掉，不随时间累积）。
@@ -222,8 +255,11 @@ private:
     int64_t m_lagWinStartWallUs = 0;  // 最小 lag 统计窗口
     int64_t m_lagWinMinUs = 0;
     MixerStats m_stats{};
+    Level m_masterLevel{};
 
     void ShiftOutputTimeline(int64_t shiftUs);
+    // 把一路的 n 个样本（交错）按增益 / 淡入淡出加到 acc，并统计本帧电平（按 frameSamples 个样本归一）
+    void Accumulate(Channel& ch, std::vector<int32_t>& acc, size_t n, size_t frameSamples);
 
 public:
     AudioMixer() = default;

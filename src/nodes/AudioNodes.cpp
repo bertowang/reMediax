@@ -140,10 +140,50 @@ void AudioMixerNode::OnInputAttached(size_t port, const std::string& from)
     m_created[port] = false;   // 通道在该端口首帧到达时按其格式建（外部注入的格式事先不知道）
 }
 
+std::optional<size_t> AudioMixerNode::PortOf(const std::string& upstream) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (const auto& [port, name] : m_inputs) {
+        if (name == upstream) {
+            return port;
+        }
+    }
+    return std::nullopt;
+}
+
+void AudioMixerNode::SetInputGain(size_t port, float gain)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_gains[port] = gain;
+    auto it = m_created.find(port);
+    if (it != m_created.end() && it->second) {
+        m_mixer.SetChannelGain(static_cast<int>(port), gain);
+    }
+}
+
+void AudioMixerNode::FadeOutInput(size_t port)
+{
+    if (!m_running.load()) {
+        return;
+    }
+    m_mixer.FadeOutChannel(static_cast<int>(port));
+}
+
+bool AudioMixerNode::InputFaded(size_t port) const
+{
+    return !m_running.load() || m_mixer.IsChannelFaded(static_cast<int>(port));
+}
+
+core::AudioMixer::Level AudioMixerNode::InputLevel(size_t port) const
+{
+    return m_mixer.ChannelLevel(static_cast<int>(port));
+}
+
 void AudioMixerNode::OnInputDetached(size_t port, const std::string& from)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_inputs.erase(port);
+    m_gains.erase(port);
     auto it = m_created.find(port);
     if (it != m_created.end()) {
         if (it->second) {
@@ -164,8 +204,17 @@ int AudioMixerNode::NodeConfigure()
     for (auto& [port, created] : m_created) {
         created = m_mixer.AddChannel(static_cast<int>(port), m_config.sampleRate, m_config.channels,
                                      nowUs) == 0;
+        ApplyGainLocked(port);
     }
     return 0;
+}
+
+void AudioMixerNode::ApplyGainLocked(size_t port)
+{
+    auto g = m_gains.find(port);
+    if (g != m_gains.end()) {
+        m_mixer.SetChannelGain(static_cast<int>(port), g->second);
+    }
 }
 
 bool AudioMixerNode::EnsureChannel(size_t port, const core::Frame& frame)
@@ -187,6 +236,7 @@ bool AudioMixerNode::EnsureChannel(size_t port, const core::Frame& frame)
         return false;
     }
     it->second = true;
+    ApplyGainLocked(port);
     TG_LOGI("AudioMixerNode: 输入 port=%zu（%s）占用混流通道（%dHz %dch）", port,
             m_inputs.count(port) ? m_inputs[port].c_str() : "?", frame.sampleRate, frame.channels);
     return true;
