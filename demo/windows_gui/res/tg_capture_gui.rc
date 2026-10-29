@@ -2,6 +2,7 @@
 #pragma code_page(65001)
 
 #include <windows.h>
+#include <commctrl.h>   // 滑块 / 电平条 / 列表控件的样式常量
 #include "resource.h"
 #include "version.h"   // 由 CMake 从 version.h.in 生成，版本号只在根 CMakeLists.txt 的 project(VERSION) 定义
 
@@ -13,110 +14,165 @@ IDI_APP ICON "app.ico"
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "tg_capture_gui.manifest"
 
 /////////////////////////////////////////////////////////////////////////////
-// 主界面：左列 = 开播配置（开播前设置），右列 = 直播中控制 + 运行状态 + 日志
-IDD_MAIN DIALOGEX 0, 0, 640, 268
+// 主界面：左列 = 采集 / 编码配置（①②③）+ 画面控制（④）+ 开播按钮；
+//         右列 = 预览 + 运行状态 + 叠加层（⑤）+ 日志
+IDD_MAIN DIALOGEX 0, 0, 760, 364
 STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME
 EXSTYLE WS_EX_APPWINDOW
 CAPTION "TGCapture 开播测试工具"
 FONT 9, "Microsoft YaHei UI", 400, 0, 0x1
 BEGIN
     // ---------------------------------------------------------------- ① 视频源
-    GROUPBOX        "① 视频源", IDC_STATIC, 7, 5, 315, 57
+    GROUPBOX        "① 视频源（预览 / 直播期间不能更换）", IDC_STATIC, 7, 5, 315, 57
     LTEXT           "采集对象", IDC_STATIC, 14, 18, 34, 8
-    CONTROL         "整个显示器", IDC_SRC_MONITOR, "Button", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 58, 17, 62, 10
-    CONTROL         "指定窗口", IDC_SRC_WINDOW, "Button", BS_AUTORADIOBUTTON, 124, 17, 60, 10
-    LTEXT           "显示器", IDC_TARGET_LABEL, 14, 32, 34, 8, WS_GROUP
+    CONTROL         "整个显示器", IDC_SRC_MONITOR, "Button", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 58, 17, 56, 10
+    CONTROL         "指定窗口", IDC_SRC_WINDOW, "Button", BS_AUTORADIOBUTTON, 116, 17, 50, 10
+    CONTROL         "本地视频文件", IDC_SRC_FILE, "Button", BS_AUTORADIOBUTTON, 168, 17, 66, 10
+    LTEXT           "显示器", IDC_TARGET_LABEL, 14, 32, 40, 8, WS_GROUP
     COMBOBOX        IDC_MONITOR_LIST, 58, 30, 258, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
     COMBOBOX        IDC_WINDOW_LIST, 58, 30, 216, 200, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
     PUSHBUTTON      "刷新", IDC_WINDOW_REFRESH, 278, 29, 38, 14
-    LTEXT           "采集方式", IDC_STATIC, 14, 47, 34, 8
+    EDITTEXT        IDC_VFILE_PATH, 58, 30, 216, 12, ES_AUTOHSCROLL
+    PUSHBUTTON      "浏览…", IDC_VFILE_BROWSE, 278, 29, 38, 14
+    LTEXT           "采集方式", IDC_CAP_MODE_LABEL, 14, 47, 34, 8
     COMBOBOX        IDC_CAP_MODE, 58, 45, 116, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    AUTOCHECKBOX    "循环播放", IDC_VFILE_LOOP, 58, 46, 48, 10
+    AUTOCHECKBOX    "带上文件音轨", IDC_VFILE_AUDIO, 108, 46, 66, 10
     LTEXT           "性能模式", IDC_STATIC, 182, 47, 34, 8
     COMBOBOX        IDC_PERF_MODE, 218, 45, 98, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
 
     // ---------------------------------------------------------------- ② 音频源
-    GROUPBOX        "② 音频源（可同时开启，内核自动混音）", IDC_STATIC, 7, 66, 315, 44
+    GROUPBOX        "② 音频源（滑块 = 音量 0~200%，右侧 = 电平；预览 / 直播中可随时开关）", IDC_STATIC, 7, 66, 315, 76
     AUTOCHECKBOX    "麦克风", IDC_MIC_ENABLE, 14, 79, 44, 10
-    COMBOBOX        IDC_MIC_DEVICE, 62, 77, 186, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    AUTOCHECKBOX    "静音", IDC_MIC_MUTE, 254, 79, 30, 10
-    PUSHBUTTON      "刷新", IDC_AUDIO_REFRESH, 286, 76, 30, 14
+    COMBOBOX        IDC_MIC_DEVICE, 60, 77, 118, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    AUTOCHECKBOX    "静音", IDC_MIC_MUTE, 182, 79, 28, 10
+    CONTROL         "", IDC_MIC_VOLUME, "msctls_trackbar32", TBS_HORZ | TBS_NOTICKS | TBS_TOOLTIPS | WS_TABSTOP, 212, 77, 56, 13
+    CONTROL         "", IDC_MIC_LEVEL, "msctls_progress32", PBS_SMOOTH | WS_BORDER, 270, 80, 46, 7
     AUTOCHECKBOX    "系统声音", IDC_SPK_ENABLE, 14, 94, 46, 10
-    COMBOBOX        IDC_SPK_DEVICE, 62, 92, 186, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    AUTOCHECKBOX    "静音", IDC_SPK_MUTE, 254, 94, 30, 10
+    COMBOBOX        IDC_SPK_DEVICE, 60, 92, 118, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    AUTOCHECKBOX    "静音", IDC_SPK_MUTE, 182, 94, 28, 10
+    CONTROL         "", IDC_SPK_VOLUME, "msctls_trackbar32", TBS_HORZ | TBS_NOTICKS | TBS_TOOLTIPS | WS_TABSTOP, 212, 92, 56, 13
+    CONTROL         "", IDC_SPK_LEVEL, "msctls_progress32", PBS_SMOOTH | WS_BORDER, 270, 95, 46, 7
+    AUTOCHECKBOX    "文件", IDC_FILE_ENABLE, 14, 109, 44, 10
+    EDITTEXT        IDC_FILE_PATH, 60, 107, 94, 12, ES_AUTOHSCROLL
+    PUSHBUTTON      "…", IDC_FILE_BROWSE, 156, 106, 22, 14
+    AUTOCHECKBOX    "循环", IDC_FILE_LOOP, 182, 109, 28, 10
+    CONTROL         "", IDC_FILE_VOLUME, "msctls_trackbar32", TBS_HORZ | TBS_NOTICKS | TBS_TOOLTIPS | WS_TABSTOP, 212, 107, 56, 13
+    CONTROL         "", IDC_FILE_LEVEL, "msctls_progress32", PBS_SMOOTH | WS_BORDER, 270, 110, 46, 7
+    LTEXT           "混音输出", IDC_STATIC, 14, 126, 40, 8
+    CONTROL         "", IDC_MASTER_LEVEL, "msctls_progress32", PBS_SMOOTH | WS_BORDER, 60, 127, 118, 7
+    PUSHBUTTON      "刷新设备", IDC_AUDIO_REFRESH, 270, 123, 46, 14
 
     // ---------------------------------------------------------------- ③ 编码与输出
-    GROUPBOX        "③ 编码与输出", IDC_STATIC, 7, 114, 315, 120
-    LTEXT           "输出地址", IDC_STATIC, 14, 128, 34, 8
-    COMBOBOX        IDC_OUTPUT_URL, 58, 126, 216, 120, CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP
-    PUSHBUTTON      "浏览…", IDC_OUTPUT_BROWSE, 278, 125, 38, 14
-    LTEXT           "封装格式", IDC_STATIC, 14, 143, 34, 8
-    COMBOBOX        IDC_MUXER, 58, 141, 92, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "分辨率", IDC_STATIC, 158, 143, 26, 8
-    COMBOBOX        IDC_RESOLUTION, 186, 141, 130, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "视频编码", IDC_STATIC, 14, 158, 34, 8
-    COMBOBOX        IDC_VCODEC, 58, 156, 150, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "帧率", IDC_STATIC, 216, 158, 18, 8
-    COMBOBOX        IDC_FPS, 236, 156, 80, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "视频码率", IDC_STATIC, 14, 173, 34, 8
-    EDITTEXT        IDC_VBITRATE, 58, 171, 40, 12, ES_AUTOHSCROLL | ES_NUMBER
-    LTEXT           "kbps", IDC_STATIC, 101, 173, 20, 8
-    LTEXT           "GOP", IDC_STATIC, 158, 173, 18, 8
-    EDITTEXT        IDC_GOP, 186, 171, 36, 12, ES_AUTOHSCROLL | ES_NUMBER
-    LTEXT           "帧（关键帧间隔）", IDC_STATIC, 226, 173, 90, 8
-    LTEXT           "音频编码", IDC_STATIC, 14, 188, 34, 8
-    COMBOBOX        IDC_ACODEC, 58, 186, 92, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "音频码率", IDC_STATIC, 158, 188, 34, 8
-    COMBOBOX        IDC_ABITRATE, 194, 186, 60, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "kbps", IDC_STATIC, 258, 188, 20, 8
-    LTEXT           "画面旋转", IDC_STATIC, 14, 203, 34, 8
-    COMBOBOX        IDC_ROTATION, 58, 201, 92, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "画面翻转", IDC_STATIC, 158, 203, 34, 8
-    COMBOBOX        IDC_FLIP, 194, 201, 92, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "断流告警", IDC_STATIC, 14, 218, 34, 8
-    LTEXT           "音频", IDC_STATIC, 58, 218, 16, 8
-    EDITTEXT        IDC_A_TIMEOUT, 76, 216, 40, 12, ES_AUTOHSCROLL | ES_NUMBER
-    LTEXT           "视频", IDC_STATIC, 124, 218, 16, 8
-    EDITTEXT        IDC_V_TIMEOUT, 142, 216, 40, 12, ES_AUTOHSCROLL | ES_NUMBER
-    LTEXT           "毫秒没有新数据即告警", IDC_STATIC, 188, 218, 128, 8
-
-    // ---------------------------------------------------------------- 底部按钮
-    PUSHBUTTON      "开始直播", IDC_START, 7, 240, 110, 22
-    PUSHBUTTON      "暂停画面", IDC_PAUSE_VIDEO, 123, 240, 80, 22
-    PUSHBUTTON      "打开输出目录", IDC_OPEN_OUTPUT_DIR, 209, 240, 80, 22
+    GROUPBOX        "③ 编码与输出", IDC_STATIC, 7, 146, 315, 120
+    LTEXT           "输出地址", IDC_STATIC, 14, 160, 34, 8
+    COMBOBOX        IDC_OUTPUT_URL, 58, 158, 216, 120, CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "浏览…", IDC_OUTPUT_BROWSE, 278, 157, 38, 14
+    LTEXT           "封装格式", IDC_STATIC, 14, 175, 34, 8
+    COMBOBOX        IDC_MUXER, 58, 173, 92, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "分辨率", IDC_STATIC, 158, 175, 26, 8
+    COMBOBOX        IDC_RESOLUTION, 186, 173, 92, 140, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "切换", IDC_RES_APPLY, 282, 172, 34, 14
+    LTEXT           "视频编码", IDC_STATIC, 14, 190, 34, 8
+    COMBOBOX        IDC_VCODEC, 58, 188, 150, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "帧率", IDC_STATIC, 216, 190, 18, 8
+    COMBOBOX        IDC_FPS, 236, 188, 80, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "视频码率", IDC_STATIC, 14, 205, 34, 8
+    EDITTEXT        IDC_VBITRATE, 58, 203, 40, 12, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "kbps", IDC_STATIC, 101, 205, 20, 8
+    LTEXT           "GOP", IDC_STATIC, 158, 205, 18, 8
+    EDITTEXT        IDC_GOP, 186, 203, 36, 12, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "帧（关键帧间隔）", IDC_STATIC, 226, 205, 90, 8
+    LTEXT           "音频编码", IDC_STATIC, 14, 220, 34, 8
+    COMBOBOX        IDC_ACODEC, 58, 218, 92, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "音频码率", IDC_STATIC, 158, 220, 34, 8
+    COMBOBOX        IDC_ABITRATE, 194, 218, 60, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "kbps", IDC_STATIC, 258, 220, 20, 8
+    LTEXT           "画面旋转", IDC_STATIC, 14, 235, 34, 8
+    COMBOBOX        IDC_ROTATION, 58, 233, 92, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "画面翻转", IDC_STATIC, 158, 235, 34, 8
+    COMBOBOX        IDC_FLIP, 194, 233, 92, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "断流告警", IDC_STATIC, 14, 250, 34, 8
+    LTEXT           "音频", IDC_STATIC, 58, 250, 16, 8
+    EDITTEXT        IDC_A_TIMEOUT, 76, 248, 40, 12, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "视频", IDC_STATIC, 124, 250, 16, 8
+    EDITTEXT        IDC_V_TIMEOUT, 142, 248, 40, 12, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "毫秒没有新数据即告警", IDC_STATIC, 188, 250, 128, 8
 
     // ---------------------------------------------------------------- ④ 画面控制
-    GROUPBOX        "④ 画面控制（暂停图片开播前可设；Logo 直播中操作）", IDC_STATIC, 330, 5, 303, 75
-    LTEXT           "暂停图片", IDC_STATIC, 338, 19, 36, 8
-    EDITTEXT        IDC_PAUSE_PIC, 376, 17, 170, 12, ES_AUTOHSCROLL
-    PUSHBUTTON      "浏览…", IDC_PAUSE_PIC_BROWSE, 550, 16, 38, 14
-    PUSHBUTTON      "应用", IDC_PAUSE_PIC_APPLY, 592, 16, 34, 14
-    LTEXT           "Logo 图片", IDC_STATIC, 338, 34, 36, 8
-    EDITTEXT        IDC_LOGO_PATH, 376, 32, 170, 12, ES_AUTOHSCROLL
-    PUSHBUTTON      "浏览…", IDC_LOGO_BROWSE, 550, 31, 38, 14
-    LTEXT           "序号", IDC_STATIC, 338, 49, 18, 8
-    COMBOBOX        IDC_LOGO_INDEX, 376, 47, 32, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "位置", IDC_STATIC, 414, 49, 18, 8
-    COMBOBOX        IDC_LOGO_POS, 434, 47, 64, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "X", IDC_STATIC, 504, 49, 8, 8
-    EDITTEXT        IDC_LOGO_X, 514, 47, 30, 12, ES_AUTOHSCROLL | ES_NUMBER
-    LTEXT           "Y", IDC_STATIC, 550, 49, 8, 8
-    EDITTEXT        IDC_LOGO_Y, 560, 47, 30, 12, ES_AUTOHSCROLL | ES_NUMBER
-    PUSHBUTTON      "添加 Logo", IDC_LOGO_ADD, 376, 62, 56, 14
-    PUSHBUTTON      "更新 Logo", IDC_LOGO_UPDATE, 436, 62, 56, 14
-    PUSHBUTTON      "删除 Logo", IDC_LOGO_REMOVE, 496, 62, 56, 14
+    GROUPBOX        "④ 画面控制（暂停图片开播前可设；Logo 直播中操作）", IDC_STATIC, 7, 270, 315, 60
+    LTEXT           "暂停图片", IDC_STATIC, 14, 284, 36, 8
+    EDITTEXT        IDC_PAUSE_PIC, 52, 282, 182, 12, ES_AUTOHSCROLL
+    PUSHBUTTON      "浏览…", IDC_PAUSE_PIC_BROWSE, 238, 281, 38, 14
+    PUSHBUTTON      "应用", IDC_PAUSE_PIC_APPLY, 280, 281, 36, 14
+    LTEXT           "Logo 图片", IDC_STATIC, 14, 299, 36, 8
+    EDITTEXT        IDC_LOGO_PATH, 52, 297, 182, 12, ES_AUTOHSCROLL
+    PUSHBUTTON      "浏览…", IDC_LOGO_BROWSE, 238, 296, 38, 14
+    LTEXT           "序号", IDC_STATIC, 14, 314, 18, 8
+    COMBOBOX        IDC_LOGO_INDEX, 34, 312, 26, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "位置", IDC_STATIC, 64, 314, 16, 8
+    COMBOBOX        IDC_LOGO_POS, 82, 312, 58, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "X", IDC_STATIC, 144, 314, 6, 8
+    EDITTEXT        IDC_LOGO_X, 152, 312, 22, 12, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "Y", IDC_STATIC, 178, 314, 6, 8
+    EDITTEXT        IDC_LOGO_Y, 186, 312, 22, 12, ES_AUTOHSCROLL | ES_NUMBER
+    PUSHBUTTON      "添加", IDC_LOGO_ADD, 214, 311, 32, 14
+    PUSHBUTTON      "更新", IDC_LOGO_UPDATE, 249, 311, 32, 14
+    PUSHBUTTON      "删除", IDC_LOGO_REMOVE, 284, 311, 32, 14
+
+    // ---------------------------------------------------------------- 底部按钮
+    PUSHBUTTON      "开始直播", IDC_START, 7, 336, 96, 22
+    PUSHBUTTON      "开启预览", IDC_PREVIEW, 107, 336, 70, 22
+    PUSHBUTTON      "暂停画面", IDC_PAUSE_VIDEO, 181, 336, 66, 22
+    PUSHBUTTON      "打开输出目录", IDC_OPEN_OUTPUT_DIR, 251, 336, 71, 22
+
+    // ---------------------------------------------------------------- 预览
+    GROUPBOX        "预览（含暂存未提交的叠加层）", IDC_PREVIEW_GROUP, 330, 5, 232, 140
+    CONTROL         "", IDC_PREVIEW_VIEW, "Static", SS_OWNERDRAW, 337, 17, 218, 123
 
     // ---------------------------------------------------------------- 运行状态
-    GROUPBOX        "运行状态", IDC_STATUS_GROUP, 330, 84, 303, 74
-    LTEXT           "● 未开播", IDC_STATUS, 338, 96, 288, 12, SS_PATHELLIPSIS | SS_NOPREFIX
-    EDITTEXT        IDC_STATS, 338, 110, 288, 44, ES_MULTILINE | ES_READONLY | NOT WS_BORDER | NOT WS_TABSTOP
+    GROUPBOX        "运行状态", IDC_STATUS_GROUP, 566, 5, 187, 140
+    LTEXT           "● 未开播", IDC_STATUS, 573, 17, 174, 12, SS_PATHELLIPSIS | SS_NOPREFIX
+    EDITTEXT        IDC_STATS, 573, 31, 174, 110, ES_MULTILINE | ES_READONLY | NOT WS_BORDER | NOT WS_TABSTOP
+
+    // ---------------------------------------------------------------- ⑤ 叠加层
+    GROUPBOX        "⑤ 叠加层（暂存：只进预览；提交：推流画面同一帧整体切换）", IDC_OVL_GROUP, 330, 149, 423, 104
+    CONTROL         "", IDC_OVL_LIST, "SysListView32", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 337, 161, 206, 74
+    LTEXT           "推流 0 层 · 预览 0 层", IDC_OVL_STATUS, 337, 239, 206, 10, SS_NOPREFIX
+    LTEXT           "ID", IDC_STATIC, 548, 163, 22, 8
+    EDITTEXT        IDC_OVL_ID, 572, 161, 58, 12, ES_AUTOHSCROLL
+    LTEXT           "类型", IDC_STATIC, 636, 163, 18, 8
+    COMBOBOX        IDC_OVL_KIND, 656, 161, 90, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "文件", IDC_STATIC, 548, 178, 22, 8
+    EDITTEXT        IDC_OVL_PATH, 572, 176, 148, 12, ES_AUTOHSCROLL
+    PUSHBUTTON      "…", IDC_OVL_BROWSE, 724, 175, 22, 14
+    LTEXT           "X%", IDC_STATIC, 548, 193, 14, 8
+    EDITTEXT        IDC_OVL_X, 564, 191, 26, 12, ES_AUTOHSCROLL
+    LTEXT           "Y%", IDC_STATIC, 594, 193, 14, 8
+    EDITTEXT        IDC_OVL_Y, 610, 191, 26, 12, ES_AUTOHSCROLL
+    LTEXT           "宽%", IDC_STATIC, 640, 193, 16, 8
+    EDITTEXT        IDC_OVL_W, 658, 191, 26, 12, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "高%", IDC_STATIC, 688, 193, 16, 8
+    EDITTEXT        IDC_OVL_H, 706, 191, 26, 12, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "不透明度%", IDC_STATIC, 548, 208, 36, 8
+    EDITTEXT        IDC_OVL_OPACITY, 586, 206, 26, 12, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "层级", IDC_STATIC, 618, 208, 18, 8
+    EDITTEXT        IDC_OVL_Z, 638, 206, 26, 12, ES_AUTOHSCROLL
+    AUTOCHECKBOX    "显示", IDC_OVL_VISIBLE, 670, 207, 32, 10
+    AUTOCHECKBOX    "循环", IDC_OVL_LOOP, 706, 207, 34, 10
+    PUSHBUTTON      "暂存", IDC_OVL_STAGE, 548, 222, 46, 14
+    PUSHBUTTON      "移除", IDC_OVL_REMOVE, 598, 222, 46, 14
+    PUSHBUTTON      "提交", IDC_OVL_COMMIT, 648, 222, 46, 14
+    PUSHBUTTON      "撤销改动", IDC_OVL_DISCARD, 698, 222, 48, 14
+    LTEXT           "高% 填 0 = 按素材宽高比；点列表行把该层载入编辑", IDC_STATIC, 548, 240, 198, 8
 
     // ---------------------------------------------------------------- 日志
-    GROUPBOX        "日志（内核日志 + SDK 回调）", IDC_LOG_GROUP, 330, 162, 303, 100
-    LTEXT           "级别", IDC_STATIC, 338, 176, 18, 8
-    COMBOBOX        IDC_LOG_LEVEL, 358, 174, 60, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    PUSHBUTTON      "清空", IDC_LOG_CLEAR, 532, 173, 40, 14
-    PUSHBUTTON      "日志目录", IDC_OPEN_LOG_DIR, 576, 173, 50, 14
-    EDITTEXT        IDC_LOG, 338, 190, 288, 68, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL
+    GROUPBOX        "日志（内核日志 + SDK 回调）", IDC_LOG_GROUP, 330, 257, 423, 101
+    LTEXT           "级别", IDC_STATIC, 338, 271, 18, 8
+    COMBOBOX        IDC_LOG_LEVEL, 358, 269, 60, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "清空", IDC_LOG_CLEAR, 652, 268, 40, 14
+    PUSHBUTTON      "日志目录", IDC_OPEN_LOG_DIR, 696, 268, 50, 14
+    EDITTEXT        IDC_LOG, 338, 285, 408, 69, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL
 END
 
 /////////////////////////////////////////////////////////////////////////////

@@ -12,24 +12,49 @@
 namespace tgui
 {
 
+enum class VideoSourceKind
+{
+    Monitor,   // 整个显示器（CreateScreenCapture）
+    Window,    // 指定窗口（CreateWindowCapture）
+    File,      // 本地视频文件（CreateLocalFileCapture）
+};
+
+// 界面上的三路音频源。运行期（预览 / 直播中）可以随时开关，对应 AddAudioSource / RemoveAudioSource
+enum class AudioSlot : int
+{
+    Mic = 0,
+    Speaker = 1,
+    File = 2,
+};
+constexpr int kAudioSlotCount = 3;
+
+struct AudioSlotConfig
+{
+    bool enabled = false;
+    std::wstring deviceId;   // Mic / Speaker：WASAPI 端点 id，空 = 系统默认设备
+    std::string filePath;    // File：mp4 / m4a / flv 里的 AAC 音轨（UTF-8 绝对路径）
+    bool loop = true;        // File：播完从头再来
+    float volume = 1.0f;     // 线性增益，界面上 0 ~ 200%
+    bool muted = false;      // Mic / Speaker：MuteAudio 按类型静音
+};
+
 struct LiveConfig
 {
     // ---- 视频源 ----
-    bool captureWindow = false;   // false = 整个显示器，true = 指定窗口
+    VideoSourceKind source = VideoSourceKind::Monitor;
     int monitorIndex = 0;         // EnumDisplayMonitors 的顺序
     HWND window = nullptr;
     TGCapture::VideoCapMode capMode = TGCapture::DXGI;   // 显示器：DXGI / GDI；窗口：WGC / WGC_No_TBar
     TGCapture::PerformanceMode perfMode = TGCapture::PerformanceMode::Cpu;
+    std::string videoFile;        // 本地视频文件（UTF-8 绝对路径）
+    bool videoFileLoop = true;
+    bool videoFileAudio = false;  // 把视频文件自己的音轨也加进来（id = "vfile"）
 
-    // ---- 音频源（deviceId 为空 = 系统默认设备）----
-    bool micEnabled = true;
-    std::wstring micDeviceId;
-    bool micMuted = false;
-    bool speakerEnabled = false;
-    std::wstring speakerDeviceId;
-    bool speakerMuted = false;
+    // ---- 音频源（下标 = AudioSlot）----
+    AudioSlotConfig audio[kAudioSlotCount];
 
     // ---- 视频编码 ----
+    std::string resolutionPreset = "720p";   // 档位名（仅用于日志；宽高 / 码率已按档位填好）
     int width = 1280;
     int height = 720;
     int fps = 30;
@@ -52,6 +77,20 @@ struct LiveConfig
     int audioTimeoutMs = 3000;    // SetAVTimeout：超过该时长没有新数据即上报 *CaptureStalled
     int videoTimeoutMs = 3000;
     std::string pausePicture;     // "暂停画面"期间显示的图片；空 = 冻结最后一帧
+
+    const AudioSlotConfig& Slot(AudioSlot s) const { return audio[static_cast<int>(s)]; }
+    AudioSlotConfig& Slot(AudioSlot s) { return audio[static_cast<int>(s)]; }
+
+    // 推流是否带音轨：开播时没有任何音频源 = 纯视频推流（之后也不能再加音频源）
+    bool HasAudio() const
+    {
+        for (const auto& a : audio) {
+            if (a.enabled) {
+                return true;
+            }
+        }
+        return source == VideoSourceKind::File && videoFileAudio;
+    }
 };
 
 // rtmp:// srt:// udp:// 等带协议头的地址视为网络推流，其余视为本地文件

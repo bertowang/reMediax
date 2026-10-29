@@ -12,7 +12,8 @@ set(TGUI_SOURCES
     src/LiveConfig.cpp
     src/LiveSession.cpp
     src/LogBuffer.cpp
-    src/MainDialog.cpp)
+    src/MainDialog.cpp
+    src/PreviewView.cpp)
 
 set(TGUI_HEADERS
     src/Devices.h
@@ -20,6 +21,7 @@ set(TGUI_HEADERS
     src/LiveSession.h
     src/LogBuffer.h
     src/MainDialog.h
+    src/PreviewView.h
     src/StringUtil.h)
 
 set(TGUI_RESOURCES

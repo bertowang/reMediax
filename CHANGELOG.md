@@ -4,6 +4,19 @@
 
 ## Unreleased
 
+### Windows 图形界面工具 `tg_capture_gui` 跟进新能力
+- 视频源新增「本地视频文件」（`CreateLocalFileCapture`，可循环、可带文件音轨）。
+- 预览：「开启预览」独立于开播，预览与直播共用一个实例（两者都停了才 `Destroy`）；`PreviewView` 在内核预览线程把 NV12 转 BGRA 并等比缩放，
+  界面线程只贴图，重绘请求去重；GPU 模式（硬件纹理帧）只显示提示。
+- 叠加层面板：列表 + 表单，暂存 / 移除 / 提交 / 撤销改动（`StageOverlay` / `StageRemoveOverlay` / `CommitOverlays` / `DiscardOverlayChanges`），
+  列表标出未提交的新增 / 修改 / 移除，并显示推流与预览各自的层数。
+- 音频源：麦克风 / 系统声音 / 文件三路，预览或直播中勾选即 `AddAudioSource`、取消即 `RemoveAudioSource`；每路音量滑块（`SetAudioSourceVolume`）
+  与电平条，外加混音输出电平。默认设备与文件走 `AddAudioSource(AudioSourceDesc, &id)`，指定设备仍自建 `WinAudioCapture`（id 由 `GetAudioLevels` 差集取得）。
+  纯视频推流时直播中禁止再加音频源。
+- 分辨率档位改为取自 `ITGCapturerMgr::GetResolutionPresets`，预览 / 直播中可「切换」（`SetResolutionPreset`）。
+- 窗口可缩放（状态区、日志区跟随）；设置持久化补充新增项。
+- 构建：新增 `src/PreviewView.*`。
+
 ### Android：叠加层 / 本地文件主画面绑定与 demo（B10）
 - 绑定：`OverlayDesc`（Java）、`stageOverlay` / `stageRemoveOverlay` / `commitOverlays` / `discardOverlayChanges` / `getOverlays(staged)`、
   `createLocalFileCapture(path, loop)`；常量 `NOTIFY_OVERLAY_COMMITTED = 43`、`ERR_INVALID_ARGUMENT`。
