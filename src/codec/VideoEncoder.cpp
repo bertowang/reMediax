@@ -6,6 +6,7 @@
 #include <limits>
 
 #include <cstdio>
+#include <cstring>
 
 #include "core/AvError.h"
 #include "core/Logger.h"
@@ -173,26 +174,6 @@ VideoEncoder::~VideoEncoder()
 
 int VideoEncoder::Open(const VideoEncoderParams& params, const core::VideoMediaType& srcType)
 {
-    const int ret = OpenCodec(params, srcType);
-    if (ret == 0) {
-        return 0;
-    }
-    // 硬编能否打开取决于设备 / 驱动（模拟器、老机型、无对应显卡），属于运行环境问题，
-    // 不该让开播直接失败：回落软编。软编失败是配置问题（名字写错 / 未编进），照常报错。
-    const std::string requested = params.vCodec.empty() ? kSoftwareVideoEncoder : params.vCodec;
-    if (!IsHardwareVideoEncoder(requested) || !avcodec_find_encoder_by_name(kSoftwareVideoEncoder)) {
-        return ret;
-    }
-    TG_LOGW("VideoEncoder: 硬编 %s 在本机打不开（ret=%d averr=%d），回退 %s", requested.c_str(), ret,
-            static_cast<int>(m_lastAvError.load()), kSoftwareVideoEncoder);
-    Close();   // 失败路径可能残留 ctx / 硬件上下文
-    VideoEncoderParams soft = params;
-    soft.vCodec = kSoftwareVideoEncoder;
-    return OpenCodec(soft, srcType);
-}
-
-int VideoEncoder::OpenCodec(const VideoEncoderParams& params, const core::VideoMediaType& srcType)
-{
     if (m_opened.load()) {
         return 0;
     }
@@ -206,7 +187,47 @@ int VideoEncoder::OpenCodec(const VideoEncoderParams& params, const core::VideoM
     m_encodeFail.Configure(1000000, 200000);
     m_lastAvError.store(0);
     m_srcType = srcType;
-    m_codecName = params.vCodec.empty() ? "libopenh264" : params.vCodec;
+    m_attachExtradata = false;
+    {
+        // 上一轮遗留的切换请求作废：本轮参数以 Open 传入的为准
+        std::lock_guard<std::mutex> lock(m_reconfMutex);
+        m_pendingParams.reset();
+        m_hasPending.store(false);
+    }
+
+    int ret = OpenCodec(params, srcType);
+    VideoEncoderParams used = params;
+    if (ret != 0) {
+        // 硬编能否打开取决于设备 / 驱动（模拟器、老机型、无对应显卡），属于运行环境问题，
+        // 不该让开播直接失败：回落软编。软编失败是配置问题（名字写错 / 未编进），照常报错。
+        const std::string requested = params.vCodec.empty() ? kSoftwareVideoEncoder : params.vCodec;
+        if (!IsHardwareVideoEncoder(requested) || !avcodec_find_encoder_by_name(kSoftwareVideoEncoder)) {
+            return ret;
+        }
+        TG_LOGW("VideoEncoder: 硬编 %s 在本机打不开（ret=%d averr=%d），回退 %s", requested.c_str(), ret,
+                static_cast<int>(m_lastAvError.load()), kSoftwareVideoEncoder);
+        ReleaseCodec();   // 失败路径可能残留 ctx / 硬件上下文
+        used.vCodec = kSoftwareVideoEncoder;
+        m_lastAvError.store(0);   // 回落成功后不残留上一次失败的错误码
+        ret = OpenCodec(used, srcType);
+        if (ret != 0) {
+            return ret;
+        }
+    }
+    used.vCodec = m_codecName;
+    m_params = used;
+    m_preferredCodec = m_codecName;
+    m_opened.store(true);
+    return 0;
+}
+
+int VideoEncoder::OpenCodec(const VideoEncoderParams& params, const core::VideoMediaType& srcType)
+{
+    const std::string name = params.vCodec.empty() ? "libopenh264" : params.vCodec;
+    if (m_codecName != name) {
+        std::lock_guard<std::mutex> lock(m_codecNameMutex);
+        m_codecName = name;
+    }
 
     const AVCodec* codec = avcodec_find_encoder_by_name(m_codecName.c_str());
     if (!codec) {
@@ -298,10 +319,10 @@ int VideoEncoder::OpenCodec(const VideoEncoderParams& params, const core::VideoM
         TG_LOGE("VideoEncoder: avcodec_open2 失败 %d (%s) codec=%s", ret, core::AvErr(ret),
                 m_codecName.c_str());
         m_lastAvError.store(ret);
-        // 走 Close() 而不是只 free ctx：此前 InitHardwareContext / InitHardwareFrames 已经建起
+        // 走 ReleaseCodec() 而不是只 free ctx：此前 InitHardwareContext / InitHardwareFrames 已经建起
         // m_hwDeviceCtx / m_hwFramesCtx（Windows 上还有 staging 纹理），只放 ctx 的话它们会残留，
         // 下一轮 Open 直接覆盖指针 —— 每失败一次泄漏一整套硬件帧池。
-        Close();
+        ReleaseCodec();
         return -3;
     }
 
@@ -309,10 +330,12 @@ int VideoEncoder::OpenCodec(const VideoEncoderParams& params, const core::VideoM
     m_dstType.SetHeight(m_ctx->height);
     m_dstType.SetPixelFormat(m_ctx->pix_fmt);
     m_dstType.SetFrameRate(m_ctx->framerate.num, m_ctx->framerate.den);
+    m_encodeWidth.store(m_ctx->width);
+    m_encodeHeight.store(m_ctx->height);
 
-    m_opened.store(true);
-    TG_LOGI("VideoEncoder: %s %dx%d fps=%.2f hw=%d",
-            m_codecName.c_str(), m_ctx->width, m_ctx->height, m_dstType.FrameRateFloat(), m_useHwFrame ? 1 : 0);
+    TG_LOGI("VideoEncoder: %s %dx%d fps=%.2f bitrate=%lld hw=%d", m_codecName.c_str(), m_ctx->width,
+            m_ctx->height, m_dstType.FrameRateFloat(), static_cast<long long>(m_ctx->bit_rate),
+            m_useHwFrame ? 1 : 0);
     return 0;
 }
 
@@ -509,7 +532,7 @@ bool VideoEncoder::ReadBackD3D11Texture(const core::FramePtr& frame, core::Frame
 }
 #endif
 
-void VideoEncoder::Close()
+void VideoEncoder::ReleaseCodec()
 {
     if (m_ctx) {
         avcodec_free_context(&m_ctx);
@@ -518,6 +541,9 @@ void VideoEncoder::Close()
         sws_freeContext(m_sws);
         m_sws = nullptr;
     }
+    m_swsSrcWidth = 0;
+    m_swsSrcHeight = 0;
+    m_swsSrcFmt = AV_PIX_FMT_NONE;
     if (m_hwFramesCtx) {
         av_buffer_unref(&m_hwFramesCtx);
         m_hwFramesCtx = nullptr;
@@ -540,12 +566,104 @@ void VideoEncoder::Close()
     m_d3dContext = nullptr;
 #endif
     m_useHwFrame = false;
+}
+
+void VideoEncoder::Close()
+{
+    ReleaseCodec();
     m_queue->Close();
     m_opened.store(false);
     // 关键：PTS 单调保护的状态必须随流复位。
     // 否则 Stop→Start 重开时，新一轮时间轴已从 0 起，而 m_lastPtsUs 还是上一轮的末值，
     // 所有视频帧都会被判成"PTS 回退"而丢弃，第二个文件只有音频甚至 0 字节。
     m_lastPtsUs = -1;
+    m_attachExtradata = false;
+    std::lock_guard<std::mutex> lock(m_reconfMutex);
+    m_pendingParams.reset();
+    m_hasPending.store(false);
+}
+
+void VideoEncoder::Reconfigure(const VideoEncoderParams& params)
+{
+    std::lock_guard<std::mutex> lock(m_reconfMutex);
+    m_pendingParams = std::make_unique<VideoEncoderParams>(params);
+    m_hasPending.store(true, std::memory_order_release);
+}
+
+void VideoEncoder::ApplyPendingReconfigure()
+{
+    std::unique_ptr<VideoEncoderParams> pending;
+    {
+        std::lock_guard<std::mutex> lock(m_reconfMutex);
+        pending = std::move(m_pendingParams);
+        m_hasPending.store(false);
+    }
+    if (!pending) {
+        return;
+    }
+    // 只换尺寸 / 码率相关字段：帧率、像素格式、线程数等沿用当前生效的参数。
+    // 编码器优先用 Prepare 时实际打开的那个（含 Prepare 时的回落结果）：
+    // 此前某次切换因尺寸不被硬编接受而临时回落软编的，换到硬编能接受的尺寸时切回硬编
+    VideoEncoderParams next = m_params;
+    next.width = pending->width;
+    next.height = pending->height;
+    next.vBitrate = pending->vBitrate > 0 ? pending->vBitrate : m_params.vBitrate;
+    next.vBitrateMaxFactor = pending->vBitrateMaxFactor;
+    next.gop = pending->gop;
+    next.ResolutionName = pending->ResolutionName;
+    next.vCodec = m_preferredCodec.empty() ? m_codecName : m_preferredCodec;
+    if (m_ctx && next.vCodec == m_codecName && next.width == m_ctx->width && next.height == m_ctx->height &&
+        next.vBitrate == m_params.vBitrate && next.vBitrateMaxFactor == m_params.vBitrateMaxFactor &&
+        next.gop == m_params.gop) {
+        return;
+    }
+
+    const int oldW = m_ctx ? m_ctx->width : 0;
+    const int oldH = m_ctx ? m_ctx->height : 0;
+    const int64_t t0 = core::MonotonicClock::NowUs();
+    // 旧编码器里缓着的帧先全部吐出来（低延迟配置下通常为 0~1 帧），时间轴不留洞
+    DrainLocked();
+    ReleaseCodec();
+    int ret = OpenCodec(next, m_srcType);
+    if (ret != 0 && IsHardwareVideoEncoder(m_codecName) && avcodec_find_encoder_by_name(kSoftwareVideoEncoder)) {
+        // 与 Prepare 同样的回落策略：硬编在新尺寸下打不开（典型：h264_mediacodec 要求 16 对齐，
+        // 不对齐时依赖 h264_metadata 裁剪而它没编进来）→ 换软编按新尺寸重开，分辨率切换照常生效
+        const std::string hw = m_codecName;
+        TG_LOGW("VideoEncoder: 硬编 %s 打不开 %dx%d（ret=%d %s），回退 %s", hw.c_str(), next.width, next.height,
+                ret, core::AvErr(m_lastAvError.load()), kSoftwareVideoEncoder);
+        ReleaseCodec();
+        VideoEncoderParams soft = next;
+        soft.vCodec = kSoftwareVideoEncoder;
+        m_lastAvError.store(0);
+        ret = OpenCodec(soft, m_srcType);
+        if (ret == 0) {
+            next = soft;
+            ReportNotify(EsCap_Notify_Encoder_Fallback, "video:" + hw + "->" + kSoftwareVideoEncoder, 0);
+        }
+    }
+    if (ret == 0) {
+        m_params = next;
+    } else {
+        const int32_t averr = m_lastAvError.load();
+        TG_LOGE("VideoEncoder: 运行期切换到 %dx%d 失败 ret=%d (%s)，回退 %dx%d", next.width, next.height, ret,
+                core::AvErr(averr), m_params.width, m_params.height);
+        ReleaseCodec();
+        m_lastAvError.store(0);
+        const int back = OpenCodec(m_params, m_srcType);
+        char message[160];
+        std::snprintf(message, sizeof(message), "video reconfigure to %dx%d failed%s (%s)", next.width,
+                      next.height, back == 0 ? ", reverted" : ", revert failed too", core::AvErr(averr));
+        ReportError(TGErr_VideoEncodeFailed, message, averr);
+        if (back != 0) {
+            TG_LOGE("VideoEncoder: 回退原参数也失败，视频停止出帧");
+            return;
+        }
+    }
+    // 新编码器的第一帧本来就是 IDR；显式置位是防御（个别硬编重开后不保证）
+    m_forceKeyFrame.store(true);
+    m_attachExtradata = ret == 0;
+    TG_LOGI("VideoEncoder: 运行期切换 %dx%d -> %dx%d bitrate=%d 耗时 %lldms", oldW, oldH, m_ctx->width,
+            m_ctx->height, m_params.vBitrate, static_cast<long long>((core::MonotonicClock::NowUs() - t0) / 1000));
 }
 
 bool VideoEncoder::Submit(core::FramePtr frame)
@@ -580,6 +698,9 @@ bool VideoEncoder::OnCommand(const core::BusCommand& command)
 void VideoEncoder::Loop(std::stop_token token)
 {
     while (!token.stop_requested()) {
+        if (m_hasPending.load(std::memory_order_acquire)) {
+            ApplyPendingReconfigure();   // 排在下一帧之前：切换点之后的帧一律按新尺寸编码
+        }
         auto item = m_queue->TryPop(std::chrono::milliseconds(50));
         if (!item.has_value()) {
             continue;
@@ -742,6 +863,23 @@ void VideoEncoder::DeliverPacket(core::AVPacketPtr packet)
     out->kind = core::MediaKind::Packet;
     out->streamKind = core::MediaKind::Video;
     out->keyFrame = (packet->flags & AV_PKT_FLAG_KEY) != 0;
+    // 运行期切换后的第一个关键包：带上新的 SPS/PPS。flv 封装据此重发 AVC sequence header，
+    // Muxer 对 ts 等其它格式据此更新流参数（IDR 前插入的参数集取自 codecpar->extradata）
+    if (m_attachExtradata && out->keyFrame && m_ctx) {
+        m_attachExtradata = false;
+        if (m_ctx->extradata && m_ctx->extradata_size > 0) {
+            uint8_t* side = av_packet_new_side_data(packet.get(), AV_PKT_DATA_NEW_EXTRADATA,
+                                                    static_cast<size_t>(m_ctx->extradata_size));
+            if (side) {
+                memcpy(side, m_ctx->extradata, static_cast<size_t>(m_ctx->extradata_size));
+            } else {
+                TG_LOGW("VideoEncoder: 附加 NEW_EXTRADATA 失败，播放端可能解不出新分辨率");
+            }
+        }
+        char content[32];
+        std::snprintf(content, sizeof(content), "%dx%d", m_ctx->width, m_ctx->height);
+        ReportNotify(EsCap_Notify_VideoMetaInfo_Changed, content, m_ctx->bit_rate);
+    }
     out->packet = std::move(packet);
     Forward(std::move(out));
 }

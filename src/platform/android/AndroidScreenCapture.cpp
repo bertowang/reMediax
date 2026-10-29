@@ -85,6 +85,49 @@ void AndroidScreenCapture::Close()
     StopJava();
 }
 
+bool AndroidScreenCapture::Resize(int width, int height)
+{
+    const int w = width & ~1;
+    const int h = height & ~1;
+    if (!m_started || w <= 0 || h <= 0) {
+        return false;
+    }
+    if (w == m_width && h == m_height) {
+        return true;
+    }
+    if (m_encoderSurface) {
+        return false;   // Surface 直连：尺寸由编码器 Surface 决定
+    }
+    JNIEnv* env = AndroidJni::Env();
+    if (!env) {
+        return false;
+    }
+    jclass clazz = AndroidJni::HelperClass(env);
+    if (!clazz) {
+        return false;
+    }
+    bool ok = false;
+    if (jmethodID resize = env->GetStaticMethodID(clazz, "resizeScreen", "(IIJ)Z")) {
+        ok = env->CallStaticBooleanMethod(clazz, resize, w, h, reinterpret_cast<jlong>(this)) == JNI_TRUE;
+    } else {
+        TG_LOGE("AndroidScreenCapture: 找不到 resizeScreen（Java 侧版本不匹配？）");
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        ok = false;
+    }
+    env->DeleteLocalRef(clazz);
+    if (!ok) {
+        TG_LOGW("AndroidScreenCapture: 改尺寸 %dx%d -> %dx%d 失败，保持原尺寸（编码器缩放）", m_width, m_height, w, h);
+        return false;
+    }
+    TG_LOGI("AndroidScreenCapture: 采集尺寸 %dx%d -> %dx%d", m_width, m_height, w, h);
+    m_width = w;
+    m_height = h;
+    return true;
+}
+
 void AndroidScreenCapture::StopJava()
 {
     if (!m_started) {

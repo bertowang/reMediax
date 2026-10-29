@@ -92,6 +92,8 @@ protected:
 
 private:
     int WriteOne(core::AVPacketPtr packet, bool isVideo);
+    // 关键包带 AV_PKT_DATA_NEW_EXTRADATA（编码器运行期重开）时，按封装格式更新流参数
+    void ApplyNewExtradata(AVStream* stream, const AVPacket* packet);
     void UpdateTraffic(size_t payloadBytes, bool isVideo);
     void OnWriteResult(bool ok, int ret, int64_t startUs, int64_t endUs);
 

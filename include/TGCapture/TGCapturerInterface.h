@@ -49,6 +49,8 @@ enum VideoCapSourceType
 enum NotifyMsgType
 {
     EsCap_Notify_Fisrt_Frame_OK = 0,
+    // 编码分辨率 / 码率已切换（SetVideoResolution / SetResolutionPreset 在推流中生效后发出，
+    // 新参数的第一个 IDR 已进入封装）：content = "宽x高"，data = 目标码率 bps
     EsCap_Notify_VideoMetaInfo_Changed = 1,
     EsCap_Notify_AudioMetaInfo_Changed = 10,
     EsCap_Notify_SystemFreeze = 20,
@@ -231,6 +233,7 @@ private:
 struct VideoEncoderParams
 {
     std::string ConfigureVersion;
+    // 分辨率档位名（"720p" 等），由 ITGCapturerMgr::ApplyResolutionPreset 填写，仅用于日志 / 统计
     std::string ResolutionName;
 
     int width = 1280;

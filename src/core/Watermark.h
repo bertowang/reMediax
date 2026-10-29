@@ -28,8 +28,12 @@ struct WatermarkTexture
     uint32_t index = 0;
     int width = 0;
     int height = 0;
-    int offsetX = 0;        // 画布坐标（已按 position 解析完成）
+    int offsetX = 0;        // 按 Apply 时画布尺寸解析出的坐标（仅日志用）
     int offsetY = 0;
+    // 定位参数原样保存：BlendOnto 按每帧的实际尺寸重新解析，画布尺寸变化（运行期切分辨率）后位置仍正确
+    int32_t position = 0;
+    int32_t rawX = 0;
+    int32_t rawY = 0;
     float opacity = 1.0f;
     std::shared_ptr<uint8_t> yPlane;    // (width * height)
     std::shared_ptr<uint8_t> uvPlane;   // (width * height / 2) —— NV12 布局
@@ -45,6 +49,7 @@ public:
     void Clear();
 
     // 对 NV12 CPU 帧叠加所有 index 的水印；frame 的 planes 必须可写。
+    // 位置按 frame 的宽高解析（右下 / 底中等相对位置随画布尺寸变化）。
     // 水印 vector 内部已按 index 稳定排序，图层顺序 = 加入顺序。
     void BlendOnto(Frame& nv12) const;
 

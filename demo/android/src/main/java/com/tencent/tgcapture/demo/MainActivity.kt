@@ -97,7 +97,7 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 回归脚本入口（scripts/regress_android_demo.sh），只在 debuggable 包里生效：
-     *   adb shell am start -n com.tencent.tgcapture.demo/.MainActivity --es tg_cmd start|stop
+     *   adb shell am start -n com.tencent.tgcapture.demo/.MainActivity --es tg_cmd start|stop|res:<档位|宽x高>
      * 状态变化与日志同步打到 logcat（tag TGDemo），脚本据此等待 LIVE / IDLE。
      */
     private fun handleAutomation(intent: Intent?) {
@@ -108,7 +108,11 @@ class MainActivity : AppCompatActivity() {
         when (cmd) {
             "start" -> if (state == State.IDLE) onStartClicked()
             "stop" -> if (state == State.LIVE) stopLive()
-            else -> Log.w(LOG_TAG, "unknown automation cmd: $cmd")
+            else -> if (cmd.startsWith("res:") && state == State.LIVE) {
+                session?.switchResolution(cmd.removePrefix("res:"))
+            } else {
+                Log.w(LOG_TAG, "unknown automation cmd: $cmd")
+            }
         }
     }
 

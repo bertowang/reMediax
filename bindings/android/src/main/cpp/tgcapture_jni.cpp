@@ -253,6 +253,27 @@ jstring NativeGetAvailableEncoders(JNIEnv* env, jclass, jboolean video)
     return ToJString(env, ITGCapturerMgr::GetAvailableEncoders(video == JNI_TRUE).c_str());
 }
 
+jstring NativeGetResolutionPresets(JNIEnv* env, jclass)
+{
+    return ToJString(env, ITGCapturerMgr::GetResolutionPresets().c_str());
+}
+
+// {宽, 高, 帧率 × 1000, 码率}；档位名不认识返回 null
+jintArray NativeGetResolutionPreset(JNIEnv* env, jclass, jstring name, jboolean portrait)
+{
+    VideoEncoderParams params;
+    if (!ITGCapturerMgr::ApplyResolutionPreset(ToStdString(env, name), params, portrait == JNI_TRUE)) {
+        return nullptr;
+    }
+    const jint values[4] = {params.width, params.height, static_cast<jint>(params.fps * 1000.0f + 0.5f),
+                            params.vBitrate};
+    jintArray out = env->NewIntArray(4);
+    if (out) {
+        env->SetIntArrayRegion(out, 0, 4, values);
+    }
+    return out;
+}
+
 jlong NativeCreate(JNIEnv*, jclass)
 {
     auto* s = new Session();
@@ -498,6 +519,19 @@ jint NativeSetAVTimeout(JNIEnv*, jclass, jlong handle, jlong audioMs, jlong vide
     return s ? s->capturer->SetAVTimeout(audioMs, videoMs) : TGErr_InvalidState;
 }
 
+jint NativeSetVideoResolution(JNIEnv*, jclass, jlong handle, jint width, jint height, jint bitrate)
+{
+    Session* s = FromHandle(handle);
+    return s ? s->capturer->SetVideoResolution(width, height, bitrate) : TGErr_InvalidState;
+}
+
+jint NativeSetResolutionPreset(JNIEnv* env, jclass, jlong handle, jstring name, jboolean portrait)
+{
+    Session* s = FromHandle(handle);
+    return s ? s->capturer->SetResolutionPreset(ToStdString(env, name), portrait == JNI_TRUE)
+             : TGErr_InvalidState;
+}
+
 jfloat NativeGetTrafficStats(JNIEnv*, jclass, jlong handle)
 {
     Session* s = FromHandle(handle);
@@ -614,6 +648,8 @@ bool RegisterAll(JNIEnv* env)
         TG_NATIVE("nativeVersion", "()Ljava/lang/String;", NativeVersion),
         TG_NATIVE("nativeIsEncoderAvailable", "(Ljava/lang/String;)Z", NativeIsEncoderAvailable),
         TG_NATIVE("nativeGetAvailableEncoders", "(Z)Ljava/lang/String;", NativeGetAvailableEncoders),
+        TG_NATIVE("nativeGetResolutionPresets", "()Ljava/lang/String;", NativeGetResolutionPresets),
+        TG_NATIVE("nativeGetResolutionPreset", "(Ljava/lang/String;Z)[I", NativeGetResolutionPreset),
         TG_NATIVE("nativeCreate", "()J", NativeCreate),
         TG_NATIVE("nativeDestroy", "(J)V", NativeDestroy),
         TG_NATIVE("nativeSetListener", "(JLcom/tencent/tgcapture/TGCaptureListener;)V", NativeSetListener),
@@ -642,6 +678,8 @@ bool RegisterAll(JNIEnv* env)
         TG_NATIVE("nativeStopPreview", "(J)V", NativeStopPreview),
         TG_NATIVE("nativeIsPreviewing", "(J)Z", NativeIsPreviewing),
         TG_NATIVE("nativeSetAVTimeout", "(JJJ)I", NativeSetAVTimeout),
+        TG_NATIVE("nativeSetVideoResolution", "(JIII)I", NativeSetVideoResolution),
+        TG_NATIVE("nativeSetResolutionPreset", "(JLjava/lang/String;Z)I", NativeSetResolutionPreset),
         TG_NATIVE("nativeGetTrafficStats", "(J)F", NativeGetTrafficStats),
         TG_NATIVE("nativeGetStatsInfo", "(JI)Ljava/lang/String;", NativeGetStatsInfo),
         TG_NATIVE("nativePushVideoFrame", "(JLjava/nio/ByteBuffer;IIIJ)I", NativePushVideoFrame),

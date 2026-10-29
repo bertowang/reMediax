@@ -135,6 +135,9 @@ bool Watermark::DecodeImage(const std::string& url, int canvasW, int canvasH,
     BGRAToNv12Alpha(bgra.data(), ew, eh, ew * 4, out.yPlane.get(), out.uvPlane.get(), out.alpha.get());
 
     out.opacity = std::clamp(opacity, 0.0f, 1.0f);
+    out.position = position;
+    out.rawX = offX;
+    out.rawY = offY;
     ResolvePosition(position, offX, offY, canvasW, canvasH, ew, eh, out.offsetX, out.offsetY);
     return true;
 }
@@ -195,17 +198,20 @@ void Watermark::BlendOnto(Frame& nv12) const
 
     for (const auto& [idx, tex] : m_layers) {
         if (!tex.yPlane || !tex.uvPlane || !tex.alpha) continue;
-        const int x0 = std::max(0, tex.offsetX);
-        const int y0 = std::max(0, tex.offsetY);
-        const int x1 = std::min(dstW, tex.offsetX + tex.width);
-        const int y1 = std::min(dstH, tex.offsetY + tex.height);
+        int offX = 0;
+        int offY = 0;
+        ResolvePosition(tex.position, tex.rawX, tex.rawY, dstW, dstH, tex.width, tex.height, offX, offY);
+        const int x0 = std::max(0, offX);
+        const int y0 = std::max(0, offY);
+        const int x1 = std::min(dstW, offX + tex.width);
+        const int y1 = std::min(dstH, offY + tex.height);
         if (x0 >= x1 || y0 >= y1) continue;
 
         // Y 平面（全分辨率）
         for (int y = y0; y < y1; ++y) {
-            const int ly = y - tex.offsetY;
+            const int ly = y - offY;
             for (int x = x0; x < x1; ++x) {
-                const int lx = x - tex.offsetX;
+                const int lx = x - offX;
                 const int a = static_cast<int>(tex.alpha.get()[ly * tex.width + lx]) *
                               static_cast<int>(tex.opacity * 255) / 255;
                 const int yl = tex.yPlane.get()[ly * tex.width + lx];
@@ -217,9 +223,9 @@ void Watermark::BlendOnto(Frame& nv12) const
         const int x0u = x0 & ~1, y0u = y0 & ~1;
         const int x1u = x1 & ~1, y1u = y1 & ~1;
         for (int y = y0u; y < y1u; y += 2) {
-            const int ly = (y - (tex.offsetY & ~1)) / 2;
+            const int ly = (y - (offY & ~1)) / 2;
             for (int x = x0u; x < x1u; x += 2) {
-                const int lx = (x - (tex.offsetX & ~1)) / 2;
+                const int lx = (x - (offX & ~1)) / 2;
                 const int a = static_cast<int>(tex.alpha.get()[(ly * 2) * tex.width + (lx * 2)]) *
                               static_cast<int>(tex.opacity * 255) / 255;
                 const int ul = tex.uvPlane.get()[ly * tex.width + lx * 2];

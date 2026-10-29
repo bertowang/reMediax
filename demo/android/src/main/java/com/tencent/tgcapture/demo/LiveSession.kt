@@ -59,6 +59,18 @@ class LiveSession(
 
     fun muteVideo(mute: Boolean) = submit { capturer?.muteVideo(mute) }
 
+    /** 运行期切分辨率：spec = 档位名（720p / 360p …）或 "宽x高"。 */
+    fun switchResolution(spec: String) = submit {
+        val c = capturer ?: return@submit
+        val m = Regex("""(\d+)x(\d+)""").matchEntire(spec)
+        val rc = if (m != null) {
+            c.setVideoResolution(m.groupValues[1].toInt(), m.groupValues[2].toInt(), 0)
+        } else {
+            c.setResolutionPreset(spec, false)
+        }
+        log("switchResolution $spec rc=$rc (${ErrorText.of(rc)})")
+    }
+
     /** 统计在 worker 上取（避免与 release 并发），结果回主线程。 */
     fun queryStats(cb: (bps: Float, info: String) -> Unit) = submit {
         val c = capturer ?: return@submit

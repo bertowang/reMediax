@@ -4,6 +4,23 @@
 
 ## Unreleased
 
+### 分辨率档位与运行期切换（B6）
+- 档位表 `src/core/ResolutionPresets.h`：360p / 480p / 540p / 720p / 720p60 / 1080p / 1080p60（宽高 / 帧率 / 建议码率）。
+  `ITGCapturerMgr::ApplyResolutionPreset(name, params, portrait)` 填 `VideoEncoderParams`，`GetResolutionPresets()` 列名字。
+- `ITGCapturer::SetVideoResolution(w, h, bitrate)` / `SetResolutionPreset(name, portrait)`：任意状态可调。
+  推流中由编码线程排空旧编码器 → 按新尺寸重开 → 首帧 IDR，新 SPS/PPS 以 `AV_PKT_DATA_NEW_EXTRADATA` 交给封装
+  （flv 重发 AVC sequence header；ts 由 Muxer 更新 `codecpar->extradata`，之后每个 IDR 前插的都是新参数集）。
+  音频不受影响，视频时间轴连续；生效后发 `EsCap_Notify_VideoMetaInfo_Changed`（`"宽x高"`，data = 码率）。
+  硬编不接受新尺寸时回落软编（发 `Encoder_Fallback`），之后切到硬编能接受的尺寸会切回硬编；都打不开则回退原分辨率并报 `TGErr_VideoEncodeFailed`。
+  GPU 硬件帧直通时返回 `TGErr_NotSupported`。
+- 采集侧：`VideoSourceBase::Resize`；Android 屏幕采集用 `VirtualDisplay.resize + setSurface` 换新尺寸的 ImageReader（不重新授权）。
+- 暂停图常驻解码后的原图，帧尺寸变化时自动重新缩放；水印位置按每帧的实际尺寸解析。
+- `GetStatsInfo(videoInfo)` 新增 `width` / `height`（当前编码尺寸）。
+- Android 绑定：`setVideoResolution` / `setResolutionPreset` / `getResolutionPresets` / `applyResolutionPreset`，`NOTIFY_VIDEO_META_CHANGED`。
+- 依赖：Android ffmpeg 需要 `h264_metadata` / `hevc_metadata` bsf（宽高不是 16 的倍数时 `h264_mediacodec` 内部会插入），
+  FfmpegCompileShell 已将其并入强制 bsf 列表。
+- demo：命令行 `--switch-res <秒>:<档位|宽x高>`；Android demo 自动化 `tg_cmd res:<档位|宽x高>`，回归脚本 `--switch-res`。
+
 ### 流量统计：实时值 + 累计值
 - 修复 `GetStatsInfo(bitrateInfo).bytes`：此前是 1s 码率窗口内的字节数（每秒清零），并不是注释里说的累计值，
   现在改为真正的累计载荷字节。`bitrate_bps` / `packets` 的含义不变。

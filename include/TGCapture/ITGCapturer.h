@@ -28,6 +28,19 @@ public:
     // 本机可用的编码器，逗号分隔、按推荐顺序（视频：系统硬编在前）。
     // 只列 TGCapture 认识的 H.264 / AAC 编码器，例如 "h264_mediacodec,libopenh264" / "libfdk_aac,aac"。
     static std::string GetAvailableEncoders(bool video);
+
+    // ---------------- 分辨率档位 ----------------
+    // 内置档位（横屏宽x高 / 帧率 / 建议码率）：
+    //   360p    640x360   30fps  0.8 Mbps        720p     1280x720   30fps  3.0 Mbps
+    //   480p    854x480   30fps  1.2 Mbps        720p60   1280x720   60fps  4.5 Mbps
+    //   540p    960x540   30fps  1.8 Mbps        1080p    1920x1080  30fps  5.0 Mbps
+    //                                            1080p60  1920x1080  60fps  8.0 Mbps
+    // 名字不区分大小写。portrait = true 时宽高互换（竖屏）。
+    // 成功时改写 params 的 width / height / fps / vBitrate / ResolutionName，其余字段不动；
+    // 名字不认识返回 false，params 不变。
+    static bool ApplyResolutionPreset(const std::string& name, VideoEncoderParams& params, bool portrait = false);
+    // 全部档位名，逗号分隔、按分辨率从低到高
+    static std::string GetResolutionPresets();
 };
 
 // 错误处理约定（细节见 TGCapturerInterface.h 的 TGCaptureError）
@@ -124,6 +137,24 @@ public:
     // TGErr_VideoCaptureStalled，恢复时发对应的 Notify。≤0 = 关闭该路看护。
     // 非法入参返回 TGErr_InvalidArgument。可在运行期调用，立即生效。
     virtual int SetAVTimeout(int64_t audioTimeoutMs, int64_t videoTimeoutMs) = 0;
+
+    // ---------------- 运行期切换编码分辨率（推流不断） ----------------
+    // 任意状态可调（需先 SetupVideoEncoder）：
+    //   未开播（Idle / Previewing）：改写视频编码参数，下次 Prepare 生效；预览中采集尺寸一并跟随
+    //   Prepared / Running        ：编码线程排空旧编码器 → 按新尺寸重开 → 首帧 IDR，
+    //                                新的 SPS/PPS 带内交给封装（flv 重发 AVC sequence header，ts 在 IDR 前插入）。
+    //                                切换期间不丢音频、视频时间轴连续；生效后发 EsCap_Notify_VideoMetaInfo_Changed
+    // 采集侧：Android 屏幕采集按新尺寸改 VirtualDisplay（不重新申请授权）；其它平台按原生尺寸采集，
+    //         由编码器缩放。预览画面随采集尺寸变化（PreviewFrame 的宽高以每帧为准）。
+    // 暂停图 / 水印按每帧的实际尺寸自动重新缩放、定位。
+    // 帧率不随切换改变（档位里的帧率只在填 VideoEncoderParams 时使用）。
+    // 宽高必须 > 0、≤ 4096，奇数向下对齐为偶数；vBitrate = 0 保持当前码率。
+    // 失败：TGErr_InvalidArgument（尺寸 / 码率非法、档位名不认识）/ TGErr_NotConfigured（未 SetupVideoEncoder）
+    //       TGErr_NotSupported（GPU 性能模式下编码器正走硬件帧直通：编码尺寸跟随采集，不能单独切换）
+    // 重开编码器失败时回退到原分辨率继续推流，并上报 TGErr_VideoEncodeFailed（回退也失败则视频停止出帧）
+    virtual int SetVideoResolution(int width, int height, int vBitrate = 0) = 0;
+    // 按档位切换：分辨率与码率取档位值，帧率保持不变。portrait = true 时宽高互换
+    virtual int SetResolutionPreset(const std::string& name, bool portrait = false) = 0;
 
     // 运行统计（扁平 JSON）。bitrateInfo 同时给出实时值与累计值：
     //   实时（1s 窗口；写出停滞超过 2s 归 0）

@@ -20,6 +20,8 @@ import android.view.Surface;
 import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 采集桥接层（内部类，业务方不要直接调用）：把 Android 系统采集能力
@@ -36,6 +38,7 @@ public final class TGCaptureSystemCapture {
     private static VirtualDisplay sVirtualDisplay;
     private static ImageReader sImageReader;
     private static HandlerThread sVideoThread;
+    private static Handler sVideoHandler;
 
     /** 每个 native 音频源一路 AudioRecord（麦克风与系统内录可同时开）。 */
     private static final Map<Long, AudioSession> sAudio = new HashMap<>();
@@ -62,6 +65,7 @@ public final class TGCaptureSystemCapture {
         sVideoThread = new HandlerThread("tgcapture-screen");
         sVideoThread.start();
         final Handler handler = new Handler(sVideoThread.getLooper());
+        sVideoHandler = handler;
         try {
             if (encoderSurface != null) {
                 sVirtualDisplay = projection.createVirtualDisplay("tgcapture", width, height, dpi,
@@ -69,36 +73,7 @@ public final class TGCaptureSystemCapture {
                 return sVirtualDisplay != null;
             }
 
-            sImageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3);
-            sImageReader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
-                private boolean mFirst = true;
-
-                @Override
-                public void onImageAvailable(ImageReader r) {
-                    Image image = null;
-                    try {
-                        image = r.acquireLatestImage();
-                        if (image == null) {
-                            return;
-                        }
-                        Image.Plane plane = image.getPlanes()[0];
-                        if (mFirst) {
-                            mFirst = false;
-                            Log.i(TAG, "screen 首帧 " + image.getWidth() + "x" + image.getHeight()
-                                    + " rowStride=" + plane.getRowStride() + " pixelStride=" + plane.getPixelStride());
-                        }
-                        nativeOnRgbaFrame(nativePtr, plane.getBuffer(), plane.getRowStride(),
-                                image.getWidth(), image.getHeight(), System.nanoTime() / 1000L);
-                    } catch (IllegalStateException e) {
-                        Log.w(TAG, "acquireLatestImage: " + e.getMessage());
-                    } finally {
-                        if (image != null) {
-                            image.close();
-                        }
-                    }
-                }
-            }, handler);
-
+            sImageReader = newScreenReader(width, height, nativePtr, handler);
             sVirtualDisplay = projection.createVirtualDisplay("tgcapture", width, height, dpi,
                     DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, sImageReader.getSurface(), null, handler);
             return sVirtualDisplay != null;
@@ -109,6 +84,100 @@ public final class TGCaptureSystemCapture {
             stopScreen();
             return false;
         }
+    }
+
+    /**
+     * 运行期改采集尺寸：VirtualDisplay.resize + 换成新尺寸的 ImageReader。
+     * 不重建 VirtualDisplay（Android 14+ 同一 projection 只能 create 一次，重建要重新授权）。
+     *
+     * <p>换 Surface 与关旧 ImageReader 都放到采集线程上做：图像回调也在这个线程，
+     * 这样旧 reader 关闭时不会有回调正在读它的 Image。
+     */
+    public static synchronized boolean resizeScreen(final int width, final int height, final long nativePtr) {
+        if (sVirtualDisplay == null || sImageReader == null || sVideoHandler == null) {
+            return false;
+        }
+        final ImageReader reader;
+        try {
+            reader = newScreenReader(width, height, nativePtr, sVideoHandler);
+        } catch (RuntimeException e) {
+            Log.e(TAG, "resizeScreen: 创建 ImageReader 失败: " + e);
+            return false;
+        }
+        final ImageReader old = sImageReader;
+        final VirtualDisplay display = sVirtualDisplay;
+        final boolean[] ok = {false};
+        final CountDownLatch done = new CountDownLatch(1);
+        final boolean posted = sVideoHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    display.resize(width, height, 1);
+                    display.setSurface(reader.getSurface());
+                    old.setOnImageAvailableListener(null, null);
+                    old.close();
+                    ok[0] = true;
+                } catch (RuntimeException e) {
+                    Log.e(TAG, "resizeScreen: " + e);
+                } finally {
+                    done.countDown();
+                }
+            }
+        });
+        boolean finished = false;
+        if (posted) {
+            try {
+                finished = done.await(2, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        if (!finished || !ok[0]) {
+            if (!finished) {
+                Log.e(TAG, "resizeScreen: 采集线程未响应");
+            }
+            reader.setOnImageAvailableListener(null, null);
+            if (finished) {
+                reader.close();   // 没换上：新 reader 没被 VirtualDisplay 用着，可以直接关
+            }
+            return false;
+        }
+        sImageReader = reader;
+        Log.i(TAG, "resizeScreen " + width + "x" + height);
+        return true;
+    }
+
+    private static ImageReader newScreenReader(int width, int height, final long nativePtr, Handler handler) {
+        ImageReader reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3);
+        reader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
+            private boolean mFirst = true;
+
+            @Override
+            public void onImageAvailable(ImageReader r) {
+                Image image = null;
+                try {
+                    image = r.acquireLatestImage();
+                    if (image == null) {
+                        return;
+                    }
+                    Image.Plane plane = image.getPlanes()[0];
+                    if (mFirst) {
+                        mFirst = false;
+                        Log.i(TAG, "screen 首帧 " + image.getWidth() + "x" + image.getHeight()
+                                + " rowStride=" + plane.getRowStride() + " pixelStride=" + plane.getPixelStride());
+                    }
+                    nativeOnRgbaFrame(nativePtr, plane.getBuffer(), plane.getRowStride(),
+                            image.getWidth(), image.getHeight(), System.nanoTime() / 1000L);
+                } catch (IllegalStateException e) {
+                    Log.w(TAG, "acquireLatestImage: " + e.getMessage());
+                } finally {
+                    if (image != null) {
+                        image.close();
+                    }
+                }
+            }
+        }, handler);
+        return reader;
     }
 
     public static synchronized void stopScreen() {
@@ -125,6 +194,7 @@ public final class TGCaptureSystemCapture {
             sVideoThread.quitSafely();
             sVideoThread = null;
         }
+        sVideoHandler = null;
     }
 
     // ------------------------------------------------------------------ 音频

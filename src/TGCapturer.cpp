@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "core/Logger.h"
+#include "core/ResolutionPresets.h"
+#include "core/VideoTransform.h"
 
 // iOS 与 macOS 都定义 __APPLE__：原生采集（ReplayKit / AVAudioSession）只有 iOS 有，
 // macOS 本机构建（单测 / 命令行 demo）和 Linux 一样只走外灌帧
@@ -767,6 +769,8 @@ int TGCapturer::PrepareLocked(PrepareError& err)
     // 编码器没能建起硬件链路（hwdevice / hw_frames_ctx 初始化失败）时，采集侧必须一并退回系统内存。
     // 否则采集继续产出 GPU 纹理帧，而编码器走软件路径，BuildAVFrame 拿不到 planes[0]，
     // 结果是每帧被丢弃 —— 表现为"流能开、包在写、画面全黑"，且没有任何显式报错。
+    // GPU 硬件帧直通时编码尺寸由采集决定，运行期不能单独改（SetVideoResolution 据此拒绝）
+    m_encoderGpuPath = m_videoEncoder->IsGpuPath();
 #if defined(_WIN32)
     if (m_perfMode == PerformanceMode::Gpu && !m_videoEncoder->IsGpuPath()) {
         TG_LOGW("TGCapturer: 编码器硬件链路未就绪，采集侧一并回退 CPU（帧不再走显存）");
@@ -1648,6 +1652,77 @@ int TGCapturer::SetAVTimeout(int64_t audioTimeoutMs, int64_t videoTimeoutMs)
     return TGErr_OK;
 }
 
+// ------------------------------------------------------------------ 运行期切换分辨率
+int TGCapturer::SetVideoResolution(int width, int height, int vBitrate)
+{
+    constexpr int kMaxSide = 4096;
+    if (width <= 1 || height <= 1 || width > kMaxSide || height > kMaxSide || vBitrate < 0) {
+        TG_LOGE("TGCapturer: SetVideoResolution 参数非法 %dx%d bitrate=%d", width, height, vBitrate);
+        return TGErr_InvalidArgument;
+    }
+    return ApplyVideoResolution(width & ~1, height & ~1, vBitrate, {});
+}
+
+int TGCapturer::SetResolutionPreset(const std::string& name, bool portrait)
+{
+    const core::ResolutionPreset* p = core::FindResolutionPreset(name);
+    if (!p) {
+        TG_LOGE("TGCapturer: SetResolutionPreset 未知档位 %s（可选 %s）", name.c_str(),
+                ITGCapturerMgr::GetResolutionPresets().c_str());
+        return TGErr_InvalidArgument;
+    }
+    return ApplyVideoResolution(portrait ? p->height : p->width, portrait ? p->width : p->height,
+                                p->bitrate, p->name);
+}
+
+int TGCapturer::ApplyVideoResolution(int width, int height, int vBitrate, const std::string& presetName)
+{
+    std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+    // 不与收尾中的 Stop 交错：等它把编码器关完再改参数（否则改动可能落在已关的编码器上而丢失）
+    WaitStopSettled(lock);
+    if (!m_videoParamsSet) {
+        return TGErr_NotConfigured;
+    }
+    const State st = m_state.load();
+    const bool live = st == State::Prepared || st == State::Running;
+    if (live && m_encoderGpuPath) {
+        TG_LOGW("TGCapturer: GPU 硬件帧直通中，编码尺寸跟随采集，不能单独切换分辨率");
+        return TGErr_NotSupported;
+    }
+    const int oldW = m_videoParams.width;
+    const int oldH = m_videoParams.height;
+    m_videoParams.width = width;
+    m_videoParams.height = height;
+    if (vBitrate > 0) {
+        m_videoParams.vBitrate = vBitrate;
+    }
+    // 档位名只在按档位切换时更新；按尺寸切换时清空，免得日志 / 统计里挂着一个已经不符的名字
+    m_videoParams.ResolutionName = presetName;
+
+    // 采集侧：只有输出尺寸本来就按请求决定的源（Android 屏幕采集）才跟着改；
+    // 带裁剪 / 旋转时裁剪框是采集坐标，改采集尺寸会让它错位，这种情况保持采集尺寸、由编码器缩放
+    if (m_videoSourceOpened && m_videoSource) {
+        core::VideoTransform transform;
+        transform.rotation = m_videoParams.videoRotation;
+        transform.flipHorizontal = m_videoParams.videoFlipHorizontal;
+        transform.flipVertical = m_videoParams.videoFlipVertical;
+        transform.cropX = m_videoParams.videoCropX;
+        transform.cropY = m_videoParams.videoCropY;
+        transform.cropWidth = m_videoParams.videoCropWidth;
+        transform.cropHeight = m_videoParams.videoCropHeight;
+        if (transform.IsIdentity()) {
+            m_videoSource->Resize(width, height);
+        }
+    }
+    if (live) {
+        m_videoEncoder->Reconfigure(m_videoParams);
+    }
+    TG_LOGI("TGCapturer: 编码分辨率 %dx%d -> %dx%d bitrate=%d preset=%s state=%d%s", oldW, oldH, width,
+            height, m_videoParams.vBitrate, presetName.empty() ? "-" : presetName.c_str(),
+            static_cast<int>(st), live ? "（运行期切换）" : "（下次 Prepare 生效）");
+    return TGErr_OK;
+}
+
 // ------------------------------------------------------------------ 统计
 // 全部走 JSON（简单 escape 不处理，key 为已知 ASCII，value 来自内部数值/枚举字符串）。
 // 对齐 MediaX ESCapturer::GetStatsInfo：
@@ -1711,9 +1786,11 @@ std::string TGCapturer::GetStatsInfo(StatsInfoType type)
         }
         case StatsInfoType::videoInfo:
             snprintf(buffer.data(), buffer.size(),
-                     "{\"codec\":\"%s\",\"encoded\":%llu,\"dropped\":%llu,"
+                     "{\"codec\":\"%s\",\"width\":%d,\"height\":%d,\"encoded\":%llu,\"dropped\":%llu,"
                      "\"pending\":%zu,\"latency_us\":%lld}",
                      m_videoEncoder ? m_videoEncoder->CodecName().c_str() : "",
+                     m_videoEncoder ? m_videoEncoder->EncodeWidth() : 0,
+                     m_videoEncoder ? m_videoEncoder->EncodeHeight() : 0,
                      m_videoEncoder ? static_cast<unsigned long long>(m_videoEncoder->EncodedFrames()) : 0ULL,
                      m_videoEncoder ? static_cast<unsigned long long>(m_videoEncoder->DroppedFrames()) : 0ULL,
                      m_videoEncoder ? m_videoEncoder->Pending() : 0,

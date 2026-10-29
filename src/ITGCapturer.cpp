@@ -5,6 +5,7 @@
 #include "TGCapturer.h"
 #include "codec/EncoderProbe.h"
 #include "core/Logger.h"
+#include "core/ResolutionPresets.h"
 
 extern "C"
 {
@@ -119,6 +120,32 @@ std::string ITGCapturerMgr::GetAvailableEncoders(bool video)
             out += ',';
         }
         out += name;
+    }
+    return out;
+}
+
+bool ITGCapturerMgr::ApplyResolutionPreset(const std::string& name, VideoEncoderParams& params, bool portrait)
+{
+    const core::ResolutionPreset* p = core::FindResolutionPreset(name);
+    if (!p) {
+        return false;
+    }
+    params.width = portrait ? p->height : p->width;
+    params.height = portrait ? p->width : p->height;
+    params.fps = p->fps;
+    params.vBitrate = p->bitrate;
+    params.ResolutionName = p->name;
+    return true;
+}
+
+std::string ITGCapturerMgr::GetResolutionPresets()
+{
+    std::string out;
+    for (const auto& p : core::kResolutionPresets) {
+        if (!out.empty()) {
+            out += ',';
+        }
+        out += p.name;
     }
     return out;
 }

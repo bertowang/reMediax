@@ -87,6 +87,8 @@ struct Options
     bool        audio    = true;                              // 关掉就是纯视频
     int         seconds  = 10;                                // 0 = 直到视频 EOF
     int         logLevel = 1;
+    // 运行期切分辨率（可多次）：--switch-res <秒>:<档位名 | 宽x高>
+    std::vector<std::pair<double, std::string>> switchRes;
 
     // 工具
     std::string ffmpegBin = "ffmpeg";
@@ -117,6 +119,7 @@ void PrintUsage()
            "    --out <url>             out.flv / out.ts / rtmp:// / srt://，默认 out.flv\n"
            "    --seconds <n>           运行秒数，0 = 直到视频结束，默认 10\n"
            "    --w --h --fps --bitrate 编码参数，默认 1280 720 30 3000000\n"
+           "    --switch-res <s>:<r>    第 s 秒运行期切换编码分辨率，r = 档位名(720p…) 或 宽x高，可多次\n"
            "    --sample-rate <n>       音频采样率，默认 44100\n"
            "    --channels <n>          音频通道数，默认 2\n"
            "    --no-audio              纯视频\n"
@@ -165,6 +168,15 @@ Options ParseArgs(int argc, char** argv)
         else if (a == "--h")       { if (auto* v = next(i, "--h"))       opt.height = std::atoi(v); }
         else if (a == "--fps")     { if (auto* v = next(i, "--fps"))     opt.fps = static_cast<float>(std::atof(v)); }
         else if (a == "--bitrate") { if (auto* v = next(i, "--bitrate")) opt.bitrate = std::atoi(v); }
+        else if (a == "--switch-res") {
+            if (auto* v = next(i, "--switch-res")) {
+                const std::string arg = v;
+                const auto colon = arg.find(':');
+                if (colon != std::string::npos) {
+                    opt.switchRes.emplace_back(std::atof(arg.substr(0, colon).c_str()), arg.substr(colon + 1));
+                }
+            }
+        }
         else if (a == "--sample-rate") { if (auto* v = next(i, "--sample-rate")) opt.sampleRate = std::atoi(v); }
         else if (a == "--channels")    { if (auto* v = next(i, "--channels"))    opt.channels = std::atoi(v); }
         else if (a == "--ffmpeg")      { if (auto* v = next(i, "--ffmpeg"))      opt.ffmpegBin = v; }
@@ -599,10 +611,21 @@ int main(int argc, char** argv)
         return false;
     };
 
+    size_t nextSwitch = 0;
     while (!errored.load()) {
         if (s_stop.load()) { printf("[demo] 收到退出信号，刷 trailer\n"); break; }
         const int64_t now = ElapsedUs(t0);
         if (totalUs > 0 && now >= totalUs) { break; }
+        while (nextSwitch < opt.switchRes.size() &&
+               now >= static_cast<int64_t>(opt.switchRes[nextSwitch].first * 1e6)) {
+            const std::string& r = opt.switchRes[nextSwitch].second;
+            int w = 0, h = 0;
+            const int ret = std::sscanf(r.c_str(), "%dx%d", &w, &h) == 2
+                                ? capturer->SetVideoResolution(w, h)
+                                : capturer->SetResolutionPreset(r);
+            printf("[demo] t=%.3fs 切换分辨率 %s ret=%d\n", now / 1e6, r.c_str(), ret);
+            ++nextSwitch;
+        }
 
         // 心跳：30s/次，每路给出"本窗口帧数"和"累计帧数"，瞬时速率 = Δ/30
         if (now - lastBeatUs >= kDemoBeatUs) {

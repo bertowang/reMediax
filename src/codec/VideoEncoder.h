@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "TGCapture/TGCapturerInterface.h"
@@ -48,6 +49,18 @@ public:
     int Open(const VideoEncoderParams& params, const core::VideoMediaType& srcType);
     void Close();
 
+    // 运行期切换分辨率 / 码率（线程安全，立即返回）：由编码线程在处理下一帧之前执行
+    //   排空旧编码器 → 按新参数重开（沿用当前实际在用的编码器，不再探测 / 回落）→ 首帧强制 IDR，
+    //   新的 SPS/PPS 以 AV_PKT_DATA_NEW_EXTRADATA 挂在第一个关键包上交给封装。
+    // 只取 params 的 width / height / vBitrate / vBitrateMaxFactor / gop，帧率与像素格式不变。
+    // 新参数打不开时回退原参数并上报 TGErr_VideoEncodeFailed；第一个新关键包送出后上报
+    // EsCap_Notify_VideoMetaInfo_Changed（content = "宽x高"，data = 码率）。
+    // 多次调用只保留最后一次。编码线程未运行（Prepared）时在线程启动后、编码第一帧之前生效
+    void Reconfigure(const VideoEncoderParams& params);
+    // 当前生效的编码尺寸（编码线程写，任意线程读）
+    [[nodiscard]] int EncodeWidth() const noexcept { return m_encodeWidth.load(); }
+    [[nodiscard]] int EncodeHeight() const noexcept { return m_encodeHeight.load(); }
+
     // ---- 总线生命周期（output 组；Open 带参数，由持有者在 Prepare 里调用）----
     [[nodiscard]] core::NodeGroup Group() const override { return core::NodeGroup::Output; }
     [[nodiscard]] bool IsActive() const override { return IsOpened(); }
@@ -79,10 +92,16 @@ public:
     bool OnCommand(const core::BusCommand& command) override;
 
     [[nodiscard]] AVCodecContext* CodecContext() const noexcept { return m_ctx; }
-    [[nodiscard]] bool IsOpened() const noexcept { return m_ctx != nullptr; }
+    // 用标志而不是 m_ctx 判空：运行期重开时编码线程会替换 m_ctx，别的线程（总线启停查 IsActive）不能读它
+    [[nodiscard]] bool IsOpened() const noexcept { return m_opened.load(); }
     [[nodiscard]] uint64_t EncodedFrames() const noexcept { return m_encoded.load(); }
     [[nodiscard]] uint64_t DroppedFrames() const noexcept { return m_dropped.load(); }
-    [[nodiscard]] const std::string& CodecName() const noexcept { return m_codecName; }
+    // 返回副本：运行期切换分辨率时硬编可能回落软编，编码线程会改写编码器名
+    [[nodiscard]] std::string CodecName() const
+    {
+        std::lock_guard<std::mutex> lock(m_codecNameMutex);
+        return m_codecName;
+    }
     // 最后一次底层失败的 AVERROR（0 = 无）：Open 失败后由 TGCapturer 填进事件 extra
     [[nodiscard]] int32_t LastAvError() const noexcept { return m_lastAvError.load(); }
 
@@ -94,7 +113,11 @@ protected:
     void OnThreadExit() override;
 
 private:
+    // 只建 / 拆编码器上下文及其附属（硬件帧池、sws、staging 纹理），不碰队列与时间轴状态
     int OpenCodec(const VideoEncoderParams& params, const core::VideoMediaType& srcType);
+    void ReleaseCodec();
+    // 编码线程上执行挂起的 Reconfigure
+    void ApplyPendingReconfigure();
     int EncodeOne(const core::FramePtr& frame);
     // 编码结果归集：连续失败超过 1s 上报一次 TGErr_VideoEncodeFailed（extra = AVERROR）
     void OnEncodeResult(bool ok, int ret);
@@ -119,7 +142,8 @@ private:
     bool FillFromCpuFrame(const core::FramePtr& src, core::AVFramePtr& avFrame);
 
 private:
-    std::string m_codecName;
+    std::string m_codecName;               // 写：持 m_codecNameMutex；编码线程 / Open 内读可不加锁
+    mutable std::mutex m_codecNameMutex;
     AVCodecContext* m_ctx = nullptr;
     AVBufferRef* m_hwDeviceCtx = nullptr;
     AVBufferRef* m_hwFramesCtx = nullptr;
@@ -163,6 +187,16 @@ private:
     std::atomic<int32_t> m_lastAvError{0};
     int64_t m_lastPtsUs = -1;   // 上一帧 PTS，用于 PTS 回退保护
     std::atomic_bool m_opened{false};
+
+    // ---- 运行期重开 ----
+    VideoEncoderParams m_params;                 // 当前生效的参数（Open / 编码线程写）
+    std::string m_preferredCodec;                // Open 时实际打开的编码器：运行期重开优先用它（硬编临时回落后可切回）
+    std::mutex m_reconfMutex;
+    std::unique_ptr<VideoEncoderParams> m_pendingParams;   // 受 m_reconfMutex 保护
+    std::atomic_bool m_hasPending{false};
+    bool m_attachExtradata = false;              // 编码线程：下一个关键包挂 NEW_EXTRADATA 并发通知
+    std::atomic<int> m_encodeWidth{0};
+    std::atomic<int> m_encodeHeight{0};
 };
 
 }  // namespace codec

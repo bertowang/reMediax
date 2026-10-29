@@ -1,6 +1,7 @@
 #include "mux/Muxer.h"
 
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <vector>
 
@@ -395,6 +396,39 @@ void Muxer::Loop(std::stop_token token)
     }
 }
 
+// 编码器运行期重开（切分辨率）后，第一个关键包带着新的 SPS/PPS（AV_PKT_DATA_NEW_EXTRADATA）。
+//   flv   ：flvenc 自己认这个 side data —— 与 codecpar 比较后更新并重发 AVC sequence header。
+//           这里不能先替它改 codecpar，否则它比较时发现相同，就不会重发了。
+//   其它  ：mpegts 在每个 IDR 前插入的参数集取自 codecpar->extradata，必须由我们替换，
+//           否则新分辨率的 IDR 前面挂的是旧 SPS，播放端按旧尺寸解码 → 花屏。
+void Muxer::ApplyNewExtradata(AVStream* stream, const AVPacket* packet)
+{
+    size_t size = 0;
+    const uint8_t* side = av_packet_get_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, &size);
+    if (!side || size == 0 || !stream || !stream->codecpar) {
+        return;
+    }
+    AVCodecParameters* par = stream->codecpar;
+    if (m_format == "flv") {
+        TG_LOGI("Muxer: 视频参数集更新（flv 重发 sequence header）size=%zu", size);
+        return;
+    }
+    if (static_cast<size_t>(par->extradata_size) == size && par->extradata &&
+        memcmp(par->extradata, side, size) == 0) {
+        return;
+    }
+    auto* buf = static_cast<uint8_t*>(av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE));
+    if (!buf) {
+        TG_LOGE("Muxer: 更新视频参数集失败（内存不足）");
+        return;
+    }
+    memcpy(buf, side, size);
+    av_freep(&par->extradata);
+    par->extradata = buf;
+    par->extradata_size = static_cast<int>(size);
+    TG_LOGI("Muxer: 视频参数集更新 fmt=%s size=%zu", m_format.c_str(), size);
+}
+
 int Muxer::WriteOne(core::AVPacketPtr packet, bool isVideo)
 {
     if (!m_fmt || !m_opened.load() || !packet) {
@@ -421,6 +455,9 @@ int Muxer::WriteOne(core::AVPacketPtr packet, bool isVideo)
     if (m_packets.load() < 3) {
         TG_LOGD("Muxer: 写包 stream=%d pts=%lld size=%d", stream->index,
                 static_cast<long long>(packet->pts), packet->size);
+    }
+    if (isVideo) {
+        ApplyNewExtradata(stream, packet.get());
     }
     const int64_t startUs = core::MonotonicClock::NowUs();
     BeginOp(m_ioTimeoutUs);

@@ -38,6 +38,10 @@ public:
     // 必须幂等，且 Close() 之后再 Open() 要能重新工作 —— Prepare 失败回滚与 Stop 都会调它。
     virtual void Close() {}
 
+    // 运行期改采集尺寸（已 Open，可在采集中调用）。返回 false = 本源按原生尺寸采集、不支持改尺寸，
+    // 由编码器缩放（Windows 桌面复制 / iOS ReplayKit 都是这种）。只有输出尺寸本来就由请求决定的源才覆写
+    virtual bool Resize(int /*width*/, int /*height*/) { return false; }
+
     // 与 StopCapture 对称：先开闸再起线程。
     // 开闸必须在起线程之前，否则刚产出的头几帧会被上一轮残留的关闸状态丢掉。
     bool StartCapture()

@@ -51,6 +51,8 @@ public final class TGCapturer {
     public static final int STATS_VIDEO = 5;
 
     // NotifyMsgType（TGCaptureListener.onNotify 的 type，完整列表见 TGCapturerInterface.h）
+    /** 运行期分辨率切换已生效：content = "宽x高"，data = 码率 bps */
+    public static final int NOTIFY_VIDEO_META_CHANGED = 1;
     /** 编码器回落：content = "video:h264_mediacodec->libopenh264"，data = 0 视频 / 1 音频 */
     public static final int NOTIFY_ENCODER_FALLBACK = 40;
     /** 运行期音频源增删：content = 音频源 id，data = 混流通道号 */
@@ -101,6 +103,31 @@ public final class TGCapturer {
     public static String[] getAvailableEncoders(boolean video) {
         String list = nativeGetAvailableEncoders(video);
         return list == null || list.isEmpty() ? new String[0] : list.split(",");
+    }
+
+    /** 内置分辨率档位名，按分辨率从低到高，例如 ["360p", "480p", ..., "1080p60"]。 */
+    public static String[] getResolutionPresets() {
+        String list = nativeGetResolutionPresets();
+        return list == null || list.isEmpty() ? new String[0] : list.split(",");
+    }
+
+    /**
+     * 按档位填写 width / height / fps / bitrate（其余字段不动）。portrait = true 时宽高互换。
+     * 档位名不认识返回 false，params 不变。
+     */
+    public static boolean applyResolutionPreset(String name, VideoEncoderParams params, boolean portrait) {
+        if (name == null || params == null) {
+            return false;
+        }
+        int[] v = nativeGetResolutionPreset(name, portrait);
+        if (v == null || v.length != 4) {
+            return false;
+        }
+        params.width = v[0];
+        params.height = v[1];
+        params.fps = v[2] / 1000f;
+        params.bitrate = v[3];
+        return true;
     }
 
     public static TGCapturer create() {
@@ -227,6 +254,21 @@ public final class TGCapturer {
         return nativeSetAVTimeout(handle(), audioTimeoutMs, videoTimeoutMs);
     }
 
+    /**
+     * 切换编码分辨率，推流不断（任意状态可调，需先 setupVideoEncoder）。
+     * 推流中：编码器按新尺寸重开、首帧 IDR，屏幕采集同步改 VirtualDisplay 尺寸（不重新授权）；
+     * 生效后 onNotify(NOTIFY_VIDEO_META_CHANGED)。未开播：下次 prepare 生效。
+     * bitrate = 0 保持当前码率；帧率不变。
+     */
+    public int setVideoResolution(int width, int height, int bitrate) {
+        return nativeSetVideoResolution(handle(), width, height, bitrate);
+    }
+
+    /** 按档位切换（分辨率与码率取档位值，帧率不变）。portrait = true 时宽高互换。 */
+    public int setResolutionPreset(String name, boolean portrait) {
+        return nativeSetResolutionPreset(handle(), name == null ? "" : name, portrait);
+    }
+
     /** 当前输出码率（bps）。 */
     public float getTrafficStats() {
         return nativeGetTrafficStats(handle());
@@ -301,6 +343,8 @@ public final class TGCapturer {
     private static native boolean nativeIsEncoderAvailable(String name);
 
     private static native String nativeGetAvailableEncoders(boolean video);
+    private static native String nativeGetResolutionPresets();
+    private static native int[] nativeGetResolutionPreset(String name, boolean portrait);
 
     private static native long nativeCreate();
 
@@ -359,6 +403,8 @@ public final class TGCapturer {
     private static native boolean nativeMuteVideo(long handle, boolean mute);
 
     private static native int nativeSetAVTimeout(long handle, long audioMs, long videoMs);
+    private static native int nativeSetVideoResolution(long handle, int width, int height, int bitrate);
+    private static native int nativeSetResolutionPreset(long handle, String name, boolean portrait);
 
     private static native float nativeGetTrafficStats(long handle);
 

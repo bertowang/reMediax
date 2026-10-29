@@ -75,6 +75,8 @@ public:
     int SetPauseInfo(const PauseParams& params) override;
     int SetupWatermarkInfo(const WatermarkParams& params) override;
     int SetAVTimeout(int64_t audioTimeoutMs, int64_t videoTimeoutMs) override;
+    int SetVideoResolution(int width, int height, int vBitrate = 0) override;
+    int SetResolutionPreset(const std::string& name, bool portrait = false) override;
 
     std::string GetStatsInfo(StatsInfoType type) override;
     float GetTrafficStats() override;
@@ -92,6 +94,9 @@ public:
                              int channels, int64_t ptsUs) override;
 
 private:
+    // SetVideoResolution / SetResolutionPreset 的公共实现（width / height 已校验并偶数化）
+    int ApplyVideoResolution(int width, int height, int vBitrate, const std::string& presetName);
+
     enum class State
     {
         Idle,
@@ -236,6 +241,8 @@ private:
     // 预览开关（持 m_lifecycleMutex 读写；IsPreviewing 无锁读用 atomic）与主画面源是否已打开
     std::atomic_bool m_previewOn{false};
     bool m_videoSourceOpened = false;
+    // 本轮编码器走 GPU 硬件帧直通（Prepare 时确定，持 m_lifecycleMutex 读写）
+    bool m_encoderGpuPath = false;
 
     // 宿主回调：设置与调用可能在不同线程，用互斥保护。调用时先拷贝出来再在锁外执行
     std::mutex m_callbackMutex;

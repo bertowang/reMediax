@@ -66,18 +66,55 @@ FramePtr RotateNv12(const FramePtr& src, int rotate)
 }
 }  // namespace
 
-void PauseFrame::Clear()
+PauseFrame::~PauseFrame()
 {
+    ClearLocked();
+}
+
+void PauseFrame::ClearLocked()
+{
+    if (m_src) {
+        av_frame_free(&m_src);
+    }
+    m_rotate = 0;
     m_frame.reset();
     m_width = 0;
     m_height = 0;
 }
 
+void PauseFrame::Clear()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    ClearLocked();
+}
+
+bool PauseFrame::Valid() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_frame != nullptr;
+}
+
+int PauseFrame::Width() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_width;
+}
+
+int PauseFrame::Height() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_height;
+}
+
 bool PauseFrame::Load(const std::string& path, int dstWidth, int dstHeight, int rotate)
 {
-    Clear();
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        ClearLocked();
+    }
     if (path.empty() || dstWidth <= 0 || dstHeight <= 0) return false;
 
+    // 解码不持锁：图片可能较大，避免合成线程（ApplyTo）在这期间卡住
     AVFormatContext* fmt = nullptr;
     if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0 || !fmt) {
         TG_LOGW("PauseFrame: 打开 %s 失败", path.c_str());
@@ -126,26 +163,39 @@ bool PauseFrame::Load(const std::string& path, int dstWidth, int dstHeight, int 
         av_packet_unref(pkt);
     }
     av_packet_free(&pkt);
+    avcodec_free_context(&ctx);
+    avformat_close_input(&fmt);
 
     if (!got) {
         av_frame_free(&frame);
-        avcodec_free_context(&ctx);
-        avformat_close_input(&fmt);
         TG_LOGW("PauseFrame: %s 解码未产出帧", path.c_str());
         return false;
     }
 
+    std::lock_guard<std::mutex> lock(m_mutex);
+    ClearLocked();
+    m_src = frame;
+    m_rotate = rotate;
+    if (!RebuildLocked(dstWidth, dstHeight)) {
+        ClearLocked();
+        return false;
+    }
+    TG_LOGI("PauseFrame: 已加载 %s → NV12 %dx%d（rotate=%d）", path.c_str(), m_width, m_height, rotate);
+    return true;
+}
+
+bool PauseFrame::RebuildLocked(int dstWidth, int dstHeight)
+{
+    if (!m_src || dstWidth <= 0 || dstHeight <= 0) return false;
     // 先缩放到目标尺寸的 NV12（没有旋转），再按需做一次整帧旋转。
-    const int targetW = (rotate == 90 || rotate == 270) ? dstHeight : dstWidth;
-    const int targetH = (rotate == 90 || rotate == 270) ? dstWidth : dstHeight;
-    SwsContext* sws = sws_getContext(frame->width, frame->height,
-                                     static_cast<AVPixelFormat>(frame->format),
+    const bool swap = m_rotate == 90 || m_rotate == 270;
+    const int targetW = swap ? dstHeight : dstWidth;
+    const int targetH = swap ? dstWidth : dstHeight;
+    SwsContext* sws = sws_getContext(m_src->width, m_src->height,
+                                     static_cast<AVPixelFormat>(m_src->format),
                                      targetW, targetH, AV_PIX_FMT_NV12,
                                      SWS_BILINEAR, nullptr, nullptr, nullptr);
     if (!sws) {
-        av_frame_free(&frame);
-        avcodec_free_context(&ctx);
-        avformat_close_input(&fmt);
         return false;
     }
 
@@ -156,7 +206,7 @@ bool PauseFrame::Load(const std::string& path, int dstWidth, int dstHeight, int 
     uint8_t* uvDst = buffer.get() + ySize;
     uint8_t* dstPlanes[4] = {yDst, uvDst, nullptr, nullptr};
     int dstLines[4] = {targetW, targetW, 0, 0};
-    sws_scale(sws, frame->data, frame->linesize, 0, frame->height, dstPlanes, dstLines);
+    sws_scale(sws, m_src->data, m_src->linesize, 0, m_src->height, dstPlanes, dstLines);
     sws_freeContext(sws);
 
     auto nv12 = MakeVideoFrame();
@@ -168,41 +218,36 @@ bool PauseFrame::Load(const std::string& path, int dstWidth, int dstHeight, int 
     nv12->planes[1] = std::shared_ptr<uint8_t>(buffer, uvDst);
     nv12->strides[1] = targetW;
 
-    m_frame = RotateNv12(nv12, rotate);
+    m_frame = RotateNv12(nv12, m_rotate);
     m_width = m_frame->width;
     m_height = m_frame->height;
-
-    av_frame_free(&frame);
-    avcodec_free_context(&ctx);
-    avformat_close_input(&fmt);
-    TG_LOGI("PauseFrame: 已加载 %s → NV12 %dx%d（rotate=%d）", path.c_str(), m_width, m_height, rotate);
     return true;
 }
 
-bool PauseFrame::ApplyTo(Frame& target) const
+bool PauseFrame::ApplyTo(Frame& target)
 {
-    if (!m_frame || target.pixFmt != AV_PIX_FMT_NV12) return false;
-    if (target.width != m_width || target.height != m_height) return false;
-    if (!target.planes[0] || !target.planes[1]) return false;
-    const size_t ySize = static_cast<size_t>(target.strides[0]) * target.height;
-    const size_t uvSize = static_cast<size_t>(target.strides[1]) * (target.height / 2);
-    const int srcY = m_frame->strides[0], srcUV = m_frame->strides[1];
-    // 一致 stride → 单次 memcpy；否则逐行拷贝
-    if (srcY == target.strides[0]) {
-        memcpy(target.planes[0].get(), m_frame->planes[0].get(), ySize);
-    } else {
-        for (int y = 0; y < target.height; ++y) {
-            memcpy(target.planes[0].get() + static_cast<size_t>(y) * target.strides[0],
-                   m_frame->planes[0].get() + static_cast<size_t>(y) * srcY, m_width);
+    if (target.pixFmt != AV_PIX_FMT_NV12) return false;
+    if (!target.planes[0] || !target.planes[1] || target.width <= 0 || target.height <= 0) return false;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_frame) return false;
+    if (target.width != m_width || target.height != m_height) {
+        // 帧尺寸变了（运行期切分辨率 / 采集改尺寸）：按新尺寸重缩放一次，之后同尺寸直接复用
+        const int oldW = m_width, oldH = m_height;
+        if (!RebuildLocked(target.width, target.height) || m_width != target.width ||
+            m_height != target.height) {
+            TG_LOGW_THROTTLED(3000000, "PauseFrame: 按 %dx%d 重新缩放失败", target.width, target.height);
+            return false;
         }
+        TG_LOGI("PauseFrame: 帧尺寸变化 %dx%d -> %dx%d，已重新缩放", oldW, oldH, m_width, m_height);
     }
-    if (srcUV == target.strides[1]) {
-        memcpy(target.planes[1].get(), m_frame->planes[1].get(), uvSize);
-    } else {
-        for (int y = 0; y < target.height / 2; ++y) {
-            memcpy(target.planes[1].get() + static_cast<size_t>(y) * target.strides[1],
-                   m_frame->planes[1].get() + static_cast<size_t>(y) * srcUV, m_width);
-        }
+    const int srcY = m_frame->strides[0], srcUV = m_frame->strides[1];
+    for (int y = 0; y < target.height; ++y) {
+        memcpy(target.planes[0].get() + static_cast<size_t>(y) * target.strides[0],
+               m_frame->planes[0].get() + static_cast<size_t>(y) * srcY, m_width);
+    }
+    for (int y = 0; y < target.height / 2; ++y) {
+        memcpy(target.planes[1].get() + static_cast<size_t>(y) * target.strides[1],
+               m_frame->planes[1].get() + static_cast<size_t>(y) * srcUV, m_width);
     }
     return true;
 }

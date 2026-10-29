@@ -38,6 +38,11 @@ public:
     // 不在这里切断，Stop 之后 Java 侧仍会继续回调进来。
     void Close() override;
 
+    // 运行期改尺寸：VirtualDisplay.resize + 换一个新尺寸的 ImageReader（setSurface）。
+    // 不重建 VirtualDisplay —— Android 14+ 同一个 MediaProjection token 只能 createVirtualDisplay 一次。
+    // 编码器 Surface 直连模式下不支持（返回 false，由编码器缩放）
+    bool Resize(int width, int height) override;
+
     // 由 Java 侧回调（TGCaptureSystemCapture.nativeOnVideoFrame，YUV 三平面/半平面）
     void OnFrame(const uint8_t* y, int yStride,
                  const uint8_t* u, int uStride,

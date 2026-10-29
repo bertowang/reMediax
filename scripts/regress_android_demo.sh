@@ -11,6 +11,7 @@
 #   --res 540|720|1080 分辨率档位（横屏），默认 720
 #   --codec <name>     视频编码器，默认 h264_mediacodec（模拟器不支持时内核会回退 libopenh264）
 #   --mic              同时开麦克风（原生采集源，自动 pm grant RECORD_AUDIO）
+#   --switch-res R     开播到一半时运行期切分辨率（R = 档位名如 360p，或 宽x高），校验录像前后两段分辨率
 #   --no-build         不重新编译 / 安装 demo
 #   --keep             保留拉回的录像（默认也保留，路径打印在最后）
 #
@@ -26,6 +27,7 @@ res="720"
 codec="h264_mediacodec"
 build=1
 mic=false
+switch_res=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -35,6 +37,7 @@ while [[ $# -gt 0 ]]; do
         --codec)   codec="$2"; shift ;;
         --no-build) build=0 ;;
         --mic)     mic=true ;;
+        --switch-res) switch_res="$2"; shift ;;
         --keep)    ;;
         -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
         *) echo "未知参数: $1" >&2; exit 2 ;;
@@ -117,7 +120,17 @@ if ! wait_state LIVE 20; then
     adb logcat -d -s TGDemo:I | tail -30
     die "20s 内没有进入 LIVE"
 fi
-sleep "$seconds"
+if [[ -n "$switch_res" ]]; then
+    half=$(( seconds / 2 ))
+    rest=$(( seconds - half ))
+    sleep "$half"
+    log "运行期切分辨率 -> $switch_res"
+    adb shell am start -n "$pkg/.MainActivity" --es tg_cmd "res:$switch_res" >/dev/null 2>&1
+    sleep "$rest"
+    adb logcat -d -s TGDemo:I TGCapture:I 2>/dev/null | grep -E "switchResolution|运行期切换|VideoMetaChanged|参数集更新" | sed 's/^/  /' || true
+else
+    sleep "$seconds"
+fi
 
 adb logcat -c
 log "停播"
@@ -154,6 +167,14 @@ ok=1
 python3 -c "import sys; sys.exit(0 if float('${dur:-0}') >= $seconds - 2 else 1)" \
     || { echo "  时长应 ≥ $((seconds - 2))s"; ok=0; }
 [[ -z "$dec_err" ]] || { echo "  解码报错: $dec_err"; ok=0; }
+if [[ -n "$switch_res" ]]; then
+    # 按帧解码出的分辨率序列（去重）：应恰好两段，前一段为开播分辨率
+    sizes="$(ffprobe -v error -select_streams v:0 -show_entries frame=width,height -of csv=p=0 "$local_file" | uniq -c | awk '{print $2"("$1")"}' | tr '\n' ' ')"
+    log "分辨率序列 $sizes"
+    n_seg="$(echo "$sizes" | wc -w | tr -d ' ')"
+    [[ "$n_seg" == "2" ]] || { echo "  切换后应恰好两段分辨率"; ok=0; }
+    [[ "$sizes" == "${want_w},${want_h}("* ]] || { echo "  第一段应为 ${want_w}x${want_h}"; ok=0; }
+fi
 
 elapsed=$(( $(date +%s) - t_start ))
 if [[ $ok -eq 1 ]]; then
